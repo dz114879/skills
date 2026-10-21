@@ -16,6 +16,5 @@ engineering/
 
 `implement-orchestrated` requires the following skills to be installed and callable:
 
-- `writing-for-agents`
 - `tdd`
 - `code-review`
