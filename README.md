@@ -6,6 +6,13 @@ A collection of personal agent skills.
 
 ```
 engineering/
+├── code-review-lean/
+│   ├── SKILL.md            # Three-axis review: Standards, Spec, and Lean (anti-over-defense)
+│   ├── agents/
+│   │   └── openai.yaml     # Interface metadata
+│   └── references/
+│       ├── lean-python.md  # Python-specific anti-over-defense patterns (loaded on demand)
+│       └── lean-sql.md     # SQL/database anti-over-defense patterns (loaded on demand)
 └── implement-orchestrated/
     ├── SKILL.md            # Orchestrator: single-ticket implementation + two-axis review
     └── agents/

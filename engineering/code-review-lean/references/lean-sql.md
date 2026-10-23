@@ -1,0 +1,22 @@
+# Lean Axis: SQL & Database Diagnostic Patterns
+
+Load this reference only when the reviewed diff (or its directly affected callers/tests) touches SQL queries, database access, transactions, schema/migrations, or backup/restore in any host language. Apply these patterns under the first-principles gates and grading rules in `SKILL.md`.
+
+## 1. Query Guarantees & Row Ownership
+
+- **Over-defending guaranteed aggregate scalars (`#23a`)**: Wrapping an ungrouped `SELECT COUNT(*)` or integer-column `SELECT COALESCE(MAX(int_col), 0)` (which guarantees a single non-null integer row) in triple null/empty fallbacks such as `int((row[0] if row and row[0] is not None else 0) or 0)`. → Verify the query has no `GROUP BY` and the column domain is integer, then read the scalar directly.
+- **Double-copying mapped rows (`#23b`)**: Copying every row again (`[dict(row) for row in rows]` or `.clone()`) immediately after a repository helper that already materializes fresh owned row structs/maps. → Consume the fresh collection directly.
+
+## 2. Same-Transaction Redundancy & N+1 Probes
+
+- **Two-step probe-then-fetch & repeated in-transaction checks (`#15`)**: Querying a primary table for an ID (`find_by_key`) and immediately issuing a second query (`get_status(id)`) on the same entity in the same transaction; re-running quota or schema checks inside a write transaction that just ran them; or calling `table_exists` repeatedly on the same table within one read snapshot. → Merge same-entity probe and fetch into one query (`JOIN` / projected columns) and reuse verified results within the transaction scope.
+- **Repeated schema/metadata queries (`#23c`)**: Firing `PRAGMA table_info(t)`, `PRAGMA index_list(t)`, or `SELECT sql FROM sqlite_master` 3–5 times on the same table inside one migration or schema verification function. → Query table metadata once and pass it to downstream checks.
+- **Nested transactions in batch loops (`#25b`)**: Opening a batch transaction and validating the batch at entry, then calling a single-item update method inside a loop that opens nested transactions/savepoints, re-instantiates repositories, and repeats per-item validation. → Validate once at the batch entry and call low-level write primitives inside the single transaction.
+- **Caller-side chunking around SQL/batch limits (`#31a`)**: Hardcoding a batch limit in a callee while callers slice inputs in a manual loop and duplicate (or break) cross-batch deduplication/validation. → Centralize batching or parameterize the limit at the owning repository/service boundary so validation happens once across the full input before chunked execution.
+
+## 3. Lock Discipline, Backup/Restore & Dead SQL Helpers
+
+- **Unconsumed disk/external I/O inside write locks (`#7`)**: Reading external files or performing unguarded I/O before precondition checks (wasting I/O on not-found errors and escaping storage error boundaries) or inside a database write lock (`BEGIN IMMEDIATE` / exclusive transaction) solely to populate a receipt field no consumer reads. → Move I/O after precondition checks inside the error boundary, and keep write-lock critical sections free of unconsumed external I/O.
+- **Restore/verification falling into first-boot schema initialization (`#24a`)**: Treating `PRAGMA integrity_check == 'ok'` as sufficient proof of a valid backup (SQLite also returns `'ok'` on a 0-byte empty file or empty database) and letting `ensure_schema(full_data=True)` fall through into `executescript(schema.sql)` first-boot table creation—silently turning an empty/corrupt backup into an empty initialized database. → Verify both physical integrity and required schema/metadata contracts during restore, and never fall back to first-boot initialization on restore/validation paths.
+- **Asserting total counts against paginated slices (`#24b`)**: Asserting full record counts against a default paginated `response.items` slice instead of the authoritative total count field (`pagination.totals`). → Assert against the authoritative total count.
+- **Extracting shared SQL helpers for dead methods (`#26`, `#34`)**: Extracting a new shared helper or repository method to deduplicate SQL across methods that have zero production callers, or deleting an upper service while leaving its lower repository methods/models orphaned at zero production calls. → Trace production call graphs first; delete zero-production-caller repository methods and orphaned models instead of refactoring them.
