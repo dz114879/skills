@@ -1,5 +1,5 @@
 interface:
   display_name: "Implement Orchestrated"
-  short_description: "Implement one ticket with two-axis review"
+  short_description: "Implement one ticket with three-axis review"
 policy:
   allow_implicit_invocation: false
