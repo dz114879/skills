@@ -1,43 +1,47 @@
 ---
 name: code-review-lean
-description: "Three-axis code review (Standards, Spec, and Lean anti-over-defense) of changes since a fixed point. Use when reviewing a branch, PR, commit range, or work-in-progress diff for spec compliance, coding standards, and AI defensive slop."
+description: "Three-axis code review (Standards, Spec, and Lean anti-over-defense) of changes from a baseline. Use when reviewing a branch/PR, commit range, or working-tree diff."
 ---
 
-Three-axis review of the diff between `HEAD` and a fixed point the user supplies:
+Three-axis, read-only review of changes since a baseline:
 
 - **Standards**: does the code conform to this repo's documented coding standards and design baseline?
-- **Spec**: does the code faithfully implement the originating issue / spec?
-- **Lean**: does every guard, fallback, parameter, abstraction, and test earn its place against real trust boundaries and production callers?
+- **Spec**: does the code faithfully implement the originating issue or spec?
+- **Lean**: does new complexity, defensive code, indirection, or test scaffolding earn its place against real trust boundaries and callers?
 
-All three axes run as **parallel sub-agents** so they don't pollute each other's context, then this skill aggregates their findings.
+Run the applicable axes as **parallel sub-agents** so they don't pollute each other's context, then aggregate their findings.
 
 ## Process
 
-### 1. Pin the fixed point
+### 1. Pin the scope
 
-Whatever the user said is the fixed point (a commit SHA, branch name, tag, `main`, `HEAD~5`, etc.). If they didn't specify one, ask for it.
+Use the baseline supplied by the user or caller (a commit SHA, branch, tag, or recorded starting `HEAD`). Ask only when the baseline is unknown or ambiguous.
 
-Capture the diff command once: `git diff <fixed-point>...HEAD` (three-dot, against merge-base), or `git diff <fixed-point>` (plus any untracked files in `git status --short`) when the user explicitly asks to review uncommitted work-in-progress changes. Also note the commit list via `git log <fixed-point>..HEAD`.
+Match the diff command to the requested endpoint:
 
-Before going further, confirm the fixed point resolves (`git rev-parse --verify <fixed-point>^{commit}`) and the diff is non-empty. A bad ref or empty diff should fail here, not inside three parallel sub-agents.
+- **Branch/PR since divergence**: `git diff <base>...<tip>` and `git log <base>..<tip> --oneline` (`<tip>` defaults to `HEAD`).
+- **Exact commit range**: `git diff <base>..<tip>` and `git log <base>..<tip> --oneline` (`<tip>` defaults to `HEAD`).
+- **Worktree / uncommitted changes**: `git diff <base>` plus in-scope untracked files from `git status --short`, excluding unrelated pre-existing edits when known.
+
+Confirm the baseline resolves (`git rev-parse --verify <base>^{commit}`) and the selected scope contains changes before spawning sub-agents.
 
 ### 2. Identify the spec source
 
-Look for the originating spec, in this order:
+Find the originating requirements, in order:
 
-1. A path or ticket/spec reference the user passed as an argument.
-2. Issue references in the commit messages (`#123`, `Closes #45`, GitLab `!67`, etc.), fetched via the workflow in the repo's tracker doc (e.g. `docs/agents/issue-tracker.md`; if needed and missing, tell the user to run `/setup-matt-pocock-skills` or pass the spec path).
-3. A spec file under `docs/`, `specs/`, or `.scratch/` matching the branch name or feature.
-4. If nothing is found, ask the user where the spec is. If they say there isn't one, the **Spec** sub-agent will skip and report "no spec available".
+1. A ticket, spec path, or explicit requirements passed by the user or caller.
+2. Issue references in commit messages (`#123`, `Closes #45`, etc.), resolved via the repo's tracker doc (e.g. `docs/agents/issue-tracker.md`) when present.
+3. A matching spec file under `docs/`, `specs/`, or `.scratch/`.
+4. If none is found and the user's request does not state the requirements, ask the user or skip the **Spec** sub-agent and report **Spec not assessed — no spec available**.
 
 ### 3. Identify the standards sources
 
-Search the repo for every file that documents how code should be written. When `CODING_STANDARDS.md` or `CONTRIBUTING.md` exists, it must be on the list.
+Load the repository's documented rules that apply to the changed paths (such as `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md`, `CODING_STANDARDS.md`, or area-specific guides the diff crosses).
 
-On top of whatever the repo documents, the Standards axis always carries the **smell baseline** below: a fixed set of Fowler code smells (_Refactoring_, ch.3) that applies even when a repo documents nothing. Two rules bind it:
+Alongside documented rules, the Standards axis carries the **smell baseline** below—Fowler code smells (_Refactoring_, ch.3) that apply even when a repo documents nothing:
 
 - **The repo overrides.** A documented repo standard always wins; where it endorses something the baseline would flag, suppress the smell.
-- **Always a judgement call.** Each smell is a labelled heuristic ("possible Feature Envy"), never a hard violation. Like any standard here, skip anything tooling already enforces.
+- **Always a judgement call.** Each smell is a labelled heuristic ("possible Feature Envy"), never a hard violation. Skip issues already established by tooling, without assuming unrun checks passed.
 
 Each smell reads *what it is* → *how to fix*; match it against the diff:
 
@@ -56,58 +60,47 @@ Each smell reads *what it is* → *how to fix*; match it against the diff:
 
 ### 4. Prepare the Lean baseline
 
-The **Lean** axis hunts AI over-defensive coding, silent error washing, contract smuggling, redundant churn, and dead-code preservation. Apply these gates to every candidate, including novel variants absent from the clusters below:
+The **Lean** axis checks whether new guards, fallbacks, indirection, state, and tests earn their complexity:
 
-1. **Boundary**: Parse untrusted input once at its owning external boundary (user input, network, disk, wire, raw storage) into a representation that preserves checked invariants (*Parse, don't validate*); narrow sum types/discriminants before accessing variant-specific data. Trust only guarantees the producer or type actually establishes. Propagate expected failures; fail fast with context on invariant breaches.
-2. **Ownership**: One owner per rule/state, one computation per validity scope. Reuse established results while mutation, time, concurrency, or authority has not invalidated them. Converge equivalent paths at their source instead of adding downstream observers (`compensation`) or mirror state (`second-truth`). Reuse existing repo helpers and stdlib before introducing new helpers.
-3. **Consumer & effect**: Judge every guard by what it detects and how its rejection, recovery, or diagnosis changes the outcome. Every branch, default, parameter, wrapper, re-export shim, state field, and test must serve a reachable **production** consumer (or a public export, framework/config registration, or required trait/interface/callback signature). Tests or quality ledgers alone never justify production scaffolding.
-4. **Counterweight (never cut)**: Keep validation at genuine external trust boundaries, precise recovery/error handling that prevents data loss, security/authorization checks, accessibility, hardware/resource constraints, ownership/lifetime/synchronization guarantees, and compatibility paths backed by a live consumer or documented public contract.
+1. **Boundary**: Parse untrusted input once at its owning external boundary (user input, network, disk, wire, raw storage) into a representation that preserves invariants (*Parse, don't validate*). Propagate expected failures; fail fast with context on internal invariant breaches.
+2. **Ownership**: One owner per rule and state. Converge shared semantics at their source instead of adding downstream observers (`compensation`) or mirror state (`second-truth`). Reuse existing repo helpers and stdlib before introducing new ones.
+3. **Consumer & effect**: Every guard, branch, fallback, parameter, wrapper, and test should serve a reachable caller or contract and change the outcome when triggered.
+4. **Counterweight**: Preserve validation at external trust boundaries, recovery that prevents data loss, security/authorization checks, resource/concurrency guarantees, and compatibility paths backed by a live consumer or public contract.
 
-**Grading**: `[Hard]` requires a demonstrated contract/correctness/safety failure, masked error/false success, failure at supported load, or proven dead production scaffolding without an external obligation. `[Simplify]` requires evidenced redundancy or avoidable design cost without such a failure. Cluster tags below indicate typical defaults; verified evidence decides.
+**Grading**: Distinguish **`[Hard]`** defects (masked errors, false success, broken contracts, or correctness/safety failures) from **`[Simplify]`** judgement calls (redundant checks, avoidable indirection, or dead scaffolding).
 
-Each cluster reads *what it is* → *how to fix*:
+Each pattern reads *what it is* → *how to fix*; match it against the diff:
 
-- **Revalidation** `[Simplify]`: re-checking guarantees already established by types, construction, or upstream validation, including defensive field probes on owned types, unpacked-arg self-reconciliation, and runtime self-checks on static literals. → preserve invariants in the representation, initialize required fields at the source, and remove repeated checks.
-- **Error washing** `[Hard]`: broad catches, `.ok()`, `.unwrap_or_default()`, or fallback values that turn bugs, failed reads, unknown variants, or duplicates into valid-looking results; defaults applied on line 1 that make line 2's required check unreachable; restore/import paths silently falling back to empty initialization; deleted upstream error suppression migrated into downstream callees. → reject before lossy normalization, propagate or fail fast on internal errors, separate validation/recovery/initialization, and handle only exact expected failures at external boundaries.
-- **Dead plumbing & linter evasion** `[Hard]`: unreachable fallbacks, constant boolean flags, ignored pass-through parameters, unread collectors, and write-only state kept alive via `_ = param`, `#[allow(dead_code)]`, immediate entry overwrite (`param = prepared.x`), or passing both a parent container and an extracted slice with an unreachable fallback. → remove the dead parameter or state across the full call chain; retain only positions required by external trait/callback signatures.
-- **Split paths & dual-mode flags** `[Hard]/[Simplify]`: boolean mode flags (`prevalidated`, `strict`) that split one operation into two rules or discard sibling arguments; caller-side chunking to bypass a callee's hardcoded limit; downstream observers/sync glue (`compensation`) or mirror flags (`second-truth`) compensating for upstream writer disagreement. → converge shared semantics, batching/limits, and state under one owning mechanism.
-- **Hidden flow & contract smuggling** `[Hard]`: smuggling services or state through data maps, callable attributes, or transient scope mutation instead of explicit signatures; pure calculation layers secretly performing I/O; mixing distinct timing responsibilities into one tuple helper and working around it at call sites. → pass explicit typed inputs and outputs; separate distinct phases and keep effects at their owning boundary.
-- **Half-moves & zombie scaffolding** `[Hard]`: zero-production-caller functions/methods, test-only monolithic entry points, pure re-export shells, single-line alias wrappers, unoverridden hook stubs, runtime test-monkeypatch hooks, or transitive helper islands kept alive solely by tests or ledgers; extracting shared helpers for dead methods. → trace transitive production reachability, complete the caller cutover, and delete the abandoned chain with its dead helpers.
-- **Corruption & zombie tests** `[Hard]/[Simplify]`: tests that manufacture impossible internal states to justify a defensive branch (`[Hard]`), call dead or private legacy paths directly to keep them alive (`[Hard]`), duplicate assertions across layers (`[Simplify]`), or pin raw source/doc prose literals (`[Hard]`). → repair fixtures, test observable behavior and real boundaries through public seams, and delete tests that only justify dead or defensive scaffolding.
-- **Copy, conversion & loop churn** `[Simplify]`: copying/cloning fresh or unaliased values unnecessarily, taking serialize-deserialize or collection round-trips across layers, allocating temporary wrapper containers/closures in hot loops to feed an obsolete signature, recomputing loop invariants, or eagerly building heavy structures before a fast-return branch. → pass typed values directly, borrow/move/copy according to actual ownership needs, hoist invariants, and short-circuit before expensive work.
-- **Repeated work, bleed & reinvention** `[Simplify]/[Hard]`: duplicate in-scope scans, queries, or layered caches/write-backs; unguarded I/O before precondition checks or unconsumed I/O inside critical locks (`[Hard]`); stacked duplicate confirmation/transaction guards across caller and callee (`[Hard]`); custom helpers duplicating existing repo utilities or stdlib. → reuse within the validity scope, keep critical sections tight, assign each guard to one owner, and reuse existing repo/stdlib capabilities.
+- **Revalidation**: re-checking guarantees already established by types, construction, or an upstream boundary. → trust the established invariant and remove the duplicate check.
+- **Error Washing**: broad catches, lossy fallbacks, or premature defaults that turn bugs or invalid input into valid-looking state. → fail fast on internal errors and handle only expected failures at external boundaries.
+- **Dead Plumbing**: unused parameters, constant mode flags, unreachable fallbacks, or write-only state kept alive via linter suppression. → remove the dead parameter or branch across its callers.
+- **Split Paths & Compensation**: boolean mode flags, parallel pipelines, or downstream sync/observer glue compensating for upstream writer disagreement. → converge shared semantics and state at the source.
+- **Hidden Flow**: smuggling services, dependencies, or transient state through data maps, callable attributes, or pure calculation layers. → pass explicit typed inputs and keep effects at their boundary.
+- **Half-Moves & Zombie Scaffolding**: legacy entry points, single-line shims, or helper chains left behind after a migration or kept alive solely by tests. → complete the caller cutover and delete the old path.
+- **Implementation-Coupled Tests**: tests that manufacture impossible internal states, pin source text, duplicate assertions across layers, or exist only to cover dead/defensive branches. → test observable behavior through public seams and delete tautological tests.
+- **Redundant Churn**: unnecessary copies, round-trip conversions, repeated in-scope queries or scans, or custom helpers duplicating stdlib/repo utilities. → reuse established values and existing helpers within their validity scope.
 
-**Stack disclosure — diff first**: Read only catalogues whose branches match the changed code or its affected callers/tests. Repository language lists and unused dependencies do not trigger a read; if neither branch matches, the inline baseline above is complete.
+### 5. Spawn the reviewers in parallel
 
-- **Python** — Changed Python code or Python-facing contracts: read [`references/lean-python.md`](references/lean-python.md).
-- **SQL/databases** — Changed queries, database access, transactions, schema/migrations, or backup/restore in any host language: read [`references/lean-sql.md`](references/lean-sql.md).
+Spawn the applicable sub-agents in parallel with the shared scope packet (diff command, commit or untracked-file list, and any excluded pre-existing edits). Point each sub-agent to the relevant section of this `SKILL.md` file (or inline the section only if the sub-agent cannot read files).
 
-### 5. Spawn all three sub-agents in parallel
+**Standards sub-agent prompt**:
 
-Issue all three sub-agent calls together, in the foreground, and aggregate the reports they return.
+- Scope packet, applicable standards-source paths, and a pointer to Step 3 of this skill.
+- Brief: "Read-only review: do not modify files or spawn sub-agents. Review the diff against the supplied standards files and Step 3's smell baseline. Report (a) documented-standard violations, citing the file and rule; and (b) baseline smells with `file:line`. Keep hard violations separate from judgement-call smells; documented repo standards override baseline smells."
 
-**Standards sub-agent prompt** should include:
+**Spec sub-agent prompt** (skip if no spec is available):
 
-- The full diff command and commit list.
-- The list of standards-source files you found in step 3, **plus the smell baseline from step 3** pasted in full (the sub-agent has no other access to it).
-- The brief: "Read-only review: do not modify any files. Report, per file/hunk where relevant, (a) every place the diff violates a documented standard: cite the standard (file + the rule); and (b) any baseline smell you spot: name it and quote the hunk. Distinguish hard violations from judgement calls: documented-standard breaches can be hard, but baseline smells are always judgement calls, and a documented repo standard overrides the baseline. Skip anything tooling enforces. Do not invoke `code-review-lean` or `code-review`, and do not spawn sub-agents; perform this review directly. Under 400 words."
+- Scope packet and the spec/ticket path or contents.
+- Brief: "Read-only review: do not modify files or spawn sub-agents. Compare the diff against the spec and report: (a) missing or partial requirements; (b) unrequested behavior or scope creep; (c) requirements implemented incorrectly. Cite the spec requirement and `file:line` for each finding."
 
-**Spec sub-agent prompt** should include:
+**Lean sub-agent prompt**:
 
-- The diff command and commit list.
-- The path or fetched contents of the spec.
-- The brief: "Read-only review: do not modify any files. Report: (a) requirements the spec asked for that are missing or partial; (b) behaviour in the diff that wasn't asked for (scope creep); (c) requirements that look implemented but where the implementation looks wrong. Quote the spec line for each finding. Do not invoke `code-review-lean` or `code-review`, and do not spawn sub-agents; perform this review directly. Under 400 words."
-
-If the spec is missing, skip the Spec sub-agent and note this in the final report.
-
-**Lean sub-agent prompt** should include:
-
-- The diff command, commit list, and any identified spec/standards paths (so Lean respects documented contracts).
-- Step 4 pasted in full (gates, counterweight, grading, clusters, and stack-disclosure pointers resolved to paths in this skill directory).
-- The brief: "Read-only review: do not modify any files. Read the diff first, then read only the stack-disclosure references from Step 4 that match the changed code. Report only issues introduced, worsened, moved, or newly orphaned by this change, reassessing moved defenses under the same gates. Before reporting, verify contracts and reachability outside the diff hunk: check upstream producers/types/schemas for existing guarantees, trace production callers vs test-only callers (respecting public exports, registrations, and required trait/interface signatures), establish what a defense detects and how its rejection/recovery/diagnosis changes the outcome, and audit `tests/` diffs for corruption or zombie-resurrection tests. Every finding requires a concrete proof case ('upstream X already guarantees Y' or '0 production reachability outside tests/Z'). For each finding, give `file:line`, `[Hard]` or `[Simplify]`, the pattern name, verified evidence, and the exact deletion, cutover, or repair in 2–3 sentences. If none qualify, report 'No Lean findings.' Do not invoke `code-review-lean` or `code-review`, and do not spawn sub-agents; perform this review directly."
+- Scope packet, any identified spec/standards sources (paths or contents, so Lean respects documented contracts), and a pointer to Step 4 of this skill.
+- Brief: "Read-only review: do not modify files or spawn sub-agents. Review the diff against Step 4's Lean baseline, focusing on issues introduced, worsened, or left orphaned by this change. When a hunk looks suspicious, inspect its immediate caller or producer contract to confirm before reporting; do not run exhaustive repo-wide call-graph sweeps. For each confirmed finding, report `file:line`, `[Hard]` or `[Simplify]`, the pattern name, the evidence, and the suggested cleanup."
 
 ### 6. Aggregate
 
-Present the three reports under `## Standards`, `## Spec`, and `## Lean` headings, verbatim or lightly cleaned. Do **not** merge or rerank findings across axes.
+Present the results under `## Standards`, `## Spec`, and `## Lean` headings (marking any unassessed axis explicitly).
 
-End with a one-line summary: total findings per axis, the worst issue _within each axis_ (if any), and any direct conflict where two axes recommend opposite actions on the same hunk. Don't pick a single winner across axes.
+Preserve each axis's perspective, deduplicating findings where multiple axes flag the same underlying issue and calling out any direct conflict where two axes recommend opposite actions on the same code. End with a brief summary distinguishing substantive issues (`[Hard]` / spec gaps / standard breaches) from optional simplifications.

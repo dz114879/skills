@@ -8,20 +8,17 @@ A collection of personal agent skills.
 engineering/
 ├── code-review-lean/
 │   ├── SKILL.md            # Three-axis review: Standards, Spec, and Lean (anti-over-defense)
-│   ├── agents/
-│   │   └── openai.yaml     # Interface metadata
-│   └── references/
-│       ├── lean-python.md  # Python-specific anti-over-defense patterns (loaded on demand)
-│       └── lean-sql.md     # SQL/database anti-over-defense patterns (loaded on demand)
+│   └── agents/
+│       └── openai.yaml     # Interface metadata
 └── implement-orchestrated/
-    ├── SKILL.md            # Orchestrator: single-ticket implementation + three-axis review
+    ├── SKILL.md            # Orchestrator: ticket/spec implementation + three-axis review
     └── agents/
         └── openai.yaml     # Interface metadata (display name, implicit invocation)
 ```
 
 ## Dependencies
 
-`implement-orchestrated` requires the following skills to be installed and callable:
+`implement-orchestrated` requires `code-review-lean`, and uses `tdd` or `diagnosing-bugs` when applicable:
 
-- `tdd`
 - `code-review-lean`
+- `tdd` / `diagnosing-bugs` (when applicable)

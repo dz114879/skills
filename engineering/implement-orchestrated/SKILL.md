@@ -1,47 +1,45 @@
 ---
 name: implement-orchestrated
-description: "Implement one ticket through a dedicated implementer and three-axis review."
+description: "Implement a ticket or spec through a dedicated implementer and three-axis review."
 disable-model-invocation: true
 ---
 
 ## 1. Settle the work
 
-Act as the orchestrator for one ticket; the implementer owns all code changes.
+Act as the orchestrator; the implementer owns code changes. Modification scope, branch creation, tracker transitions, and commits follow the user's actual authorization.
 
-Read the ticket and its parent spec via `docs/agents/issue-tracker.md` or the supplied source path. Record the starting `HEAD` SHA (`git rev-parse HEAD`) as the review fixed point.
+Read the ticket or spec (via `docs/agents/issue-tracker.md` when applicable, or the supplied source). Record the starting `HEAD` SHA and any pre-existing worktree changes as the baseline so review covers only this task's changes.
 
-Reuse the seams in the spec/ticket's `## Testing Decisions` as pre-agreed seams for `tdd`. Ask the user to confirm seams only when none are defined or they ask to revisit them.
-
-Resolve genuine requirement ambiguities with the user before dispatch.
+Resolve choices that materially change requirements or scope with the user before dispatch.
 
 ## 2. Dispatch the implementer
 
-Spawn one implementer subagent and retain its session id for follow-ups. Pass the ticket/spec and pre-agreed seams, with instructions to:
+Spawn an implementer subagent with the ticket/spec, baseline, and scope boundaries, instructing it to:
 
-- Call the Skill tool with "tdd", treating the supplied seams as already confirmed.
-- Run typechecking, linting, and single-file tests while iterating; run the full test suite once at the end.
-- Commit the work to the current branch and return the commit SHA and check commands with results.
+- Choose the method that fits the work: follow `tdd` for test-first work at agreed seams (reusing any seams in the ticket/spec and asking only when a new seam choice materially alters interfaces or scope), `diagnosing-bugs` for unexplained failures, or direct implementation for straightforward changes.
+- Run the checks that provide evidence for the touched scope and required outcomes.
+- Leave changes in the worktree unless the user authorized a commit. Return the changed files, check commands with results, and the commit SHA if committed.
 
 ## 3. Run the three-axis review
 
-Confirm the commit landed with `git log <fixed-point>..HEAD --oneline` and `git diff <fixed-point>...HEAD --stat`, and confirm the returned checks passed.
+Confirm the implementer's changes are present against the baseline and the reported checks passed.
 
-Call the Skill tool with "code-review-lean", passing the pinned fixed-point SHA and spec/ticket source. Capture the **Standards**, **Spec**, and **Lean** reviewer session ids and separate reports. Keep findings and priorities within their own axis throughout triage and reporting.
+Run `code-review-lean` against the baseline (covering the current worktree and in-scope untracked files, excluding unrelated pre-existing edits) and the spec/ticket source to obtain the **Standards**, **Spec**, and **Lean** reports.
 
-## 4. Triage by reading code
+## 4. Triage findings
 
-For every finding, personally read the flagged source file and surrounding code alongside the cited standard, spec passage, or upstream contract/caller proof before deciding whether a fix is warranted. Include whether a flagged baseline smell or `[Simplify]` item is worth fixing here, and resolve any cross-axis conflict on the same hunk.
+Evaluate findings against the code, spec, and repo rules; read the flagged source and surrounding context directly when a finding is contested, ambiguous, high-impact, or conflicts across axes.
 
-Record an accept/decline decision with a one-line reason for each finding. Ask the user before fixes that change the spec's meaning or expand scope.
+Prioritize substantive issues: missing or broken spec requirements, documented-standard violations, and `[Hard]` Lean defects. Treat baseline smells and `[Simplify]` items as judgement calls—accept them only when the cleanup clearly pays off within scope, and decline low-value or churning suggestions without blocking closeout. Ask the user before any fix that changes the spec's meaning or expands scope.
 
-## 5. Fix and focused re-review
+## 5. Fix and verify
 
-If no findings are accepted, close out. Otherwise record the pre-fix `HEAD` SHA and send accepted findings to the **same implementer session** to create a new commit (not an amend) and run the affected checks.
+If no findings warrant changes, close out.
 
-Resume the **same Standards, Spec, and Lean reviewer sessions**, each with the incremental fix delta (`git diff <pre-fix-SHA>..HEAD`) and its own prior findings, marking accepted items. Omit the implementer's rationale; ask each reviewer to verify fixes and check for regressions.
+Otherwise send accepted fixes to the implementer (reusing the session when practical), preserving the commit policy from step 1, and rerun affected checks.
 
-Return to step 4 with all three reports.
+Verify straightforward, localized fixes directly. Re-run only the affected reviewer axis (or axes) when a fix reshapes logic, contracts, or cross-cutting structure; if re-review surfaces a new substantive issue or regression, return to step 4. Stop rather than looping on stylistic or oscillating (`[Simplify]`) feedback.
 
 ## 6. Close out
 
-Report commit SHA(s), separate **Standards**, **Spec**, and **Lean** results, accepted and declined findings with one-line reasons, and the checks run with results.
+Report the changes made (and commit SHA if committed), **Standards**, **Spec**, and **Lean** outcomes, key accepted fixes and notable declined trade-offs, checks run with results, and any remaining limitations.
