@@ -70,6 +70,62 @@ class ScanPythonTests(unittest.TestCase):
         self.git("commit", "-qm", "fixture")
         return self.git("rev-parse", "HEAD")
 
+    def test_default_shadow_rebinding_respects_current_scope(self):
+        for intervening, expected in [
+            ("from external import value", False),
+            ("def value():\n    pass", False),
+            ("def helper():\n    value = None", True),
+        ]:
+            with self.subTest(intervening=intervening):
+                self.put(
+                    "defaults.py",
+                    "def load(raw):\n    value = raw or 1\n"
+                    + textwrap.indent(intervening, "    ")
+                    + "\n    if value is None:\n        return None\n",
+                )
+                candidates = self.scan("--paths", "defaults.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected))
+                if expected:
+                    self.assertEqual(
+                        candidates[0]["rule"], "PY03_default_shadows_check"
+                    )
+
+    def test_typed_parameter_rhs_check_precedes_assignment_binding(self):
+        for assignment in [
+            "item = item if item is not None else make_widget()",
+            "item: Widget = item if item is not None else make_widget()",
+            "item += item if item is not None else make_widget()",
+            "(item := item if item is not None else make_widget())",
+        ]:
+            with self.subTest(assignment=assignment):
+                self.put(
+                    "typed.py",
+                    f"def load(item: Widget):\n    {assignment}\n"
+                    "    return item is None\n",
+                )
+                candidates = self.scan("--paths", "typed.py")["candidates"]
+                self.assertEqual(len(candidates), 1)
+                self.assertEqual(candidates[0]["rule"], "PY06_revalidated_typed_param")
+                self.assertEqual(candidates[0]["span"], [2, 2])
+                self.assertEqual(candidates[0]["code"], "item is not None")
+
+    def test_error_washing_in_exception_group_handler(self):
+        self.put(
+            "groups.py",
+            """
+            def load():
+                try:
+                    work()
+                except* Exception:
+                    pass
+            """,
+        )
+        candidates = self.scan("--paths", "groups.py")["candidates"]
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["rule"], "PY02_error_washing")
+        self.assertEqual(candidates[0]["span"], [4, 5])
+        self.assertIn("Exception", candidates[0]["evidence"])
+
     def test_relative_non_git_paths_schema_and_non_execution(self):
         self.put(
             "src/model.py",
@@ -169,6 +225,680 @@ class ScanPythonTests(unittest.TestCase):
         self.assertIn("'other' at line 11", second["evidence"])
         self.assertEqual(third["symbol"], "<module>")
         self.assertIn("No same-file", third["evidence"])
+
+    def test_error_washing_broad_handlers_follow_control_flow(self):
+        cases = [
+            ("Exception", "logger.error('failed')\nreturn {}", True),
+            ("BaseException", "fallback = {}", True),
+            ("", "pass", True),
+            ("(KeyError, errors.TypeError)", "return None", True),
+            ("(KeyError, Exception)", "pass", True),
+            ("ValueError", "return None", False),
+            ("(KeyError, KeyError)", "pass", False),
+            (
+                "Exception",
+                "if retry:\n    raise\nelse:\n    raise DomainError()",
+                False,
+            ),
+            ("Exception", "if retry:\n    return {}\nraise", True),
+            ("Exception", "def nested():\n    return {}\nraise", False),
+            (
+                "Exception",
+                "class Nested:\n    def run(self):\n        return {}\nraise",
+                False,
+            ),
+            ("Exception", "for item in items:\n    raise", True),
+            ("Exception", "for item in items:\n    return {}\nraise", True),
+            ("Exception", "try:\n    recover()\nfinally:\n    raise", False),
+            ("Exception", "try:\n    raise\nfinally:\n    return {}", True),
+            (
+                "Exception",
+                "try:\n    recover()\nexcept ValueError:\n    return {}\nelse:\n    raise",
+                True,
+            ),
+            (
+                "Exception",
+                "try:\n    recover()\nexcept ValueError:\n    raise\nelse:\n    raise",
+                False,
+            ),
+            (
+                "Exception",
+                "try:\n    recover()\nexcept* ValueError:\n    log()\nelse:\n    raise",
+                True,
+            ),
+            (
+                "Exception",
+                "try:\n    recover()\nexcept* ValueError:\n    raise\nelse:\n    raise",
+                False,
+            ),
+            ("Exception", "with context():\n    return {}\nraise", True),
+            ("Exception", "with context():\n    raise", True),
+            ("Exception", "with context():\n    log()\nraise", False),
+            (
+                "Exception",
+                "match error:\n    case 1:\n        raise\n    case _:\n        raise",
+                False,
+            ),
+            ("Exception", "match error:\n    case 1:\n        raise", True),
+            ("Exception", "match error:\n    case _ if ready:\n        raise", True),
+        ]
+        for caught, body, expected in cases:
+            with self.subTest(caught=caught, body=body):
+                header = f"except {caught}:" if caught else "except:"
+                self.put(
+                    "errors.py",
+                    "def load():\n    try:\n        work()\n    "
+                    + header
+                    + "\n"
+                    + textwrap.indent(body, "        ")
+                    + "\n",
+                )
+                candidates = self.scan("--paths", "errors.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected))
+                if expected:
+                    candidate = candidates[0]
+                    self.assertEqual(candidate["rule"], "PY02_error_washing")
+                    self.assertEqual(candidate["symbol"], "load")
+                    self.assertEqual(candidate["span"], [4, 4 + len(body.splitlines())])
+                    self.assertIn(caught or "bare except", candidate["evidence"])
+                    self.assertIn("line 4", candidate["evidence"])
+                    self.assertIn("Counterweight", candidate["verify"])
+
+    def test_error_washing_json_hook_preserves_only_all_path_bare_reraises(self):
+        cases = [
+            ("ValueError", "raise DomainError('invalid') from error", True),
+            ("(KeyError, ValueError)", "return {}", True),
+            ("BaseException", "raise DomainError()", True),
+            ("Exception", "return {}", True),
+            ("", "raise DomainError()", True),
+            ("ValueError", "if retry:\n    raise\nelse:\n    raise", False),
+            ("Exception", "def nested():\n    return {}\nraise", False),
+            ("json.JSONDecodeError", "raise DomainError()", False),
+            ("JSONDecodeError", "return {}", False),
+            ("TypeError", "return {}", False),
+        ]
+        for caught, body, expected in cases:
+            with self.subTest(caught=caught, body=body):
+                header = f"except {caught} as error:" if caught else "except:"
+                self.put(
+                    "hook.py",
+                    "def load(raw):\n    try:\n"
+                    "        return json.loads(raw, object_pairs_hook=unique)\n    "
+                    + header
+                    + "\n"
+                    + textwrap.indent(body, "        ")
+                    + "\n",
+                )
+                candidates = self.scan("--paths", "hook.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected))
+                if expected:
+                    candidate = candidates[0]
+                    self.assertEqual(candidate["rule"], "PY02_error_washing")
+                    self.assertIn("object_pairs_hook", candidate["evidence"])
+                    self.assertIn("line 3", candidate["evidence"])
+                    self.assertIn("diagnostic", candidate["verify"])
+                    if caught == "Exception":
+                        self.assertIn("non-raising", candidate["evidence"])
+        for body in [
+            "return json.loads(raw)",
+            "def nested():\n    return json.loads(raw, object_pairs_hook=unique)",
+            "reader = lambda: json.loads(raw, object_pairs_hook=unique)",
+        ]:
+            with self.subTest(try_body=body):
+                self.put(
+                    "hook.py",
+                    "def load(raw):\n    try:\n"
+                    + textwrap.indent(body, "        ")
+                    + "\n    except ValueError:\n        raise DomainError()\n",
+                )
+                self.assertEqual(self.scan("--paths", "hook.py")["candidates"], [])
+
+    def test_error_washing_diff_uses_handler_span_not_try_body(self):
+        self.init_repo()
+        self.put(
+            "errors.py",
+            """
+            def load():
+                try:
+                    work()
+                except Exception:
+                    log()
+            """,
+        )
+        base = self.commit()
+        with (self.root / "errors.py").open("a") as source:
+            source.write("        return {}\n")
+        candidates = self.scan("--base", base)["candidates"]
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["rule"], "PY02_error_washing")
+        self.assertEqual(candidates[0]["span"], [4, 6])
+        self.assertEqual(candidates[0]["change_tag"], "changed")
+        self.put(
+            "errors.py",
+            """
+            def load():
+                try:
+                    changed_work()
+                except Exception:
+                    log()
+            """,
+        )
+        self.assertEqual(self.scan("--base", base)["candidates"], [])
+
+    def test_default_shadows_required_guard_within_five_siblings(self):
+        cases = [
+            ("raw or 0", "value is None", "", True),
+            ("raw or 'default'", "not value", "", True),
+            ("raw or [1]", "not value", "", True),
+            ("raw or {}", "value is None", "", True),
+            ("raw or 0", "not value", "", False),
+            ("raw or []", "not value", "", False),
+            ("raw or None", "value is None", "", False),
+            ("raw or fallback", "value is None", "", False),
+            ("raw or 1", "value is None", "value = raw\n", False),
+            ("raw or 1", "value is None", "if ready:\n    value = raw\n", False),
+            ("raw or 1", "value is None", "value, other = values\n", False),
+            ("raw or 1", "value is None", "one()\ntwo()\nthree()\nfour()\n", True),
+            (
+                "raw or 1",
+                "value is None",
+                "one()\ntwo()\nthree()\nfour()\nfive()\n",
+                False,
+            ),
+        ]
+        for default, guard, intervening, expected in cases:
+            with self.subTest(default=default, guard=guard, intervening=intervening):
+                self.put(
+                    "defaults.py",
+                    "def load(raw):\n    value = "
+                    + default
+                    + "\n"
+                    + textwrap.indent(intervening, "    ")
+                    + f"    if {guard}:\n        raise ValueError('required')\n"
+                    + "    return value\n",
+                )
+                candidates = self.scan("--paths", "defaults.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected))
+                if expected:
+                    candidate = candidates[0]
+                    self.assertEqual(candidate["rule"], "PY03_default_shadows_check")
+                    self.assertEqual(
+                        candidate["span"], [2, 4 + len(intervening.splitlines())]
+                    )
+                    self.assertIn("line 2", candidate["evidence"])
+                    self.assertIn(
+                        f"line {3 + len(intervening.splitlines())}",
+                        candidate["evidence"],
+                    )
+                    self.assertIn("Counterweight", candidate["verify"])
+        self.put(
+            "defaults.py",
+            """
+            def load(raw):
+                value = raw or 1
+                if value is None:
+                    log()
+                if ready:
+                    other = raw or 1
+                if other is None:
+                    return None
+            """,
+        )
+        self.assertEqual(self.scan("--paths", "defaults.py")["candidates"], [])
+
+    def test_get_default_shadows_only_none_guard(self):
+        for expression, guard, expected in [
+            ("data.get('key', 0)", "value is None", True),
+            ("data.get('key', '')", "value is None", True),
+            ("data.get('key', [])", "value is None", True),
+            ("data.get('key', 1)", "not value", False),
+            ("data.get('key')", "value is None", False),
+            ("data.get('key', None)", "value is None", False),
+            ("data.get('key', default)", "value is None", False),
+        ]:
+            with self.subTest(expression=expression, guard=guard):
+                self.put(
+                    "defaults.py",
+                    f"def load(data):\n    value: int = {expression}\n"
+                    f"    if {guard}:\n        return None\n    return value\n",
+                )
+                candidates = self.scan("--paths", "defaults.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected))
+                if expected:
+                    self.assertEqual(
+                        candidates[0]["rule"], "PY03_default_shadows_check"
+                    )
+                    self.assertIn("missing keys", candidates[0]["verify"])
+                    self.assertIn("None", candidates[0]["verify"])
+                    self.assertIn("explicitly stored", candidates[0]["verify"])
+
+    def test_shadow_diff_ignores_unrelated_intervening_sibling(self):
+        self.init_repo()
+        self.put(
+            "defaults.py",
+            """
+            def load(raw):
+                value = raw or 1
+                log('before')
+                if value is None:
+                    return None
+            """,
+        )
+        base = self.commit()
+        self.put(
+            "defaults.py",
+            """
+            def load(raw):
+                value = raw or 1
+                log('after')
+                if value is None:
+                    return None
+            """,
+        )
+        self.assertEqual(self.scan("--base", base)["candidates"], [])
+        self.put(
+            "defaults.py",
+            """
+            def load(raw):
+                value = raw or 1
+                log('before')
+                if value is None:
+                    raise ValueError('required')
+            """,
+        )
+        candidates = self.scan("--base", base)["candidates"]
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["span"], [2, 5])
+        self.assertEqual(candidates[0]["change_tag"], "changed")
+        self.assertEqual(
+            set(candidates[0]),
+            {
+                "id",
+                "rule",
+                "path",
+                "span",
+                "symbol",
+                "change_tag",
+                "code",
+                "evidence",
+                "verify",
+            },
+        )
+
+    def test_lossy_coalesce_distinguishes_value_loss_from_empty_state_washing(self):
+        for lookup in [
+            "data['limit']",
+            "config.limit",
+            "data.get('limit')",
+            "raw or data.get('limit')",
+        ]:
+            for fallback in [
+                "30",
+                "'default'",
+                "True",
+                "-1",
+                "0",
+                "0.0",
+                "''",
+                "False",
+                "[]",
+                "{}",
+                "()",
+                "dict()",
+                "list()",
+                "set()",
+            ]:
+                with self.subTest(lookup=lookup, fallback=fallback):
+                    self.put(
+                        "coalesce.py",
+                        f"def load():\n    return {lookup} or {fallback}\n",
+                    )
+                    candidates = self.scan("--paths", "coalesce.py")["candidates"]
+                    self.assertEqual(len(candidates), 1)
+                    candidate = candidates[0]
+                    self.assertEqual(candidate["rule"], "PY04_lossy_falsy_coalesce")
+                    self.assertEqual(candidate["span"], [2, 2])
+                    self.assertIn(fallback, candidate["evidence"])
+                    self.assertIn("line 2", candidate["evidence"])
+                    self.assertIn("Counterweight", candidate["verify"])
+                    if fallback in {"30", "'default'", "True", "-1"}:
+                        self.assertIn("Semantic Fidelity", candidate["verify"])
+                        self.assertIn('0/""/False', candidate["verify"])
+                    else:
+                        self.assertIn("missing/None", candidate["verify"])
+                        self.assertIn("zero/empty", candidate["verify"])
+                        self.assertNotIn("Semantic Fidelity", candidate["verify"])
+        for expression in [
+            "value or 30",
+            "value or []",
+            "data['limit'] or default",
+            "data['limit'] or make_default()",
+            "data['limit'] or [1]",
+            "data['limit'] or {'x': 1}",
+            "data['limit'] or None",
+            "data['limit'] and 30",
+        ]:
+            with self.subTest(expression=expression):
+                self.put("coalesce.py", f"def load():\n    return {expression}\n")
+                self.assertEqual(self.scan("--paths", "coalesce.py")["candidates"], [])
+
+    def test_dead_parameter_discard_requires_no_other_loads_anywhere(self):
+        for body, expected in [
+            ("_ = old\nreturn 1", True),
+            ("log(old)\n_ = old\nreturn 1", False),
+            ("_ = old\nreturn old", False),
+            ("_ = old\ndef closure():\n    return old\nreturn closure", False),
+            ("_ = old\nreader = lambda: old\nreturn reader", False),
+            ("_ = old\nvalues = [old for item in items]\nreturn values", False),
+            ("_ = old\n_ = old\nreturn 1", False),
+            ("return 1", False),
+        ]:
+            with self.subTest(body=body):
+                self.put(
+                    "params.py",
+                    'def load(old):\n    """Load."""\n'
+                    + textwrap.indent(body, "    ")
+                    + "\n",
+                )
+                candidates = self.scan("--paths", "params.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected))
+                if expected:
+                    self.assertEqual(candidates[0]["rule"], "PY05_dead_param_evasion")
+                    self.assertEqual(candidates[0]["span"], [3, 3])
+                    self.assertIn("discard", candidates[0]["evidence"])
+                    self.assertIn("'old'", candidates[0]["evidence"])
+                    self.assertIn("line 3", candidates[0]["evidence"])
+                    self.assertIn("caller", candidates[0]["verify"])
+                    self.assertIn("Counterweight", candidates[0]["verify"])
+        self.put(
+            "params.py",
+            """
+            class Model:
+                def load(self, cls):
+                    _ = self
+                    _ = cls
+                    return 1
+            """,
+        )
+        self.assertEqual(self.scan("--paths", "params.py")["candidates"], [])
+
+    def test_dead_parameter_entry_overwrite_stops_at_reads_and_control_flow(self):
+        for body, expected in [
+            ("old = 1\nreturn old", True),
+            ("log()\nold: int = 1\nreturn old", True),
+            ("old, other = (1, 2)\nreturn old", True),
+            ("old = normalize(old)\nreturn old", False),
+            ("log(old)\nold = 1\nreturn old", False),
+            ("reader = lambda: old\nold = 1\nreturn reader", False),
+            ("import module as old\nold = 1\nreturn old", False),
+            ("def old():\n    pass\nold = 1\nreturn old", False),
+            ("if ready:\n    log()\nold = 1\nreturn old", False),
+            ("for item in items:\n    log()\nold = 1\nreturn old", False),
+            ("with context():\n    log()\nold = 1\nreturn old", False),
+            (
+                "try:\n    work()\nexcept* ValueError:\n    raise\nold = 1\nreturn old",
+                False,
+            ),
+            ("yield 1\nold = 1\nreturn old", False),
+            ("old = yield 1\nreturn old", False),
+            ("return 1\nold = 1", False),
+            ("pass", False),
+            ("...", False),
+            ('"""Protocol."""\npass\n...\nraise NotImplementedError', False),
+            ("raise NotImplementedError('abstract')", False),
+        ]:
+            with self.subTest(body=body):
+                self.put(
+                    "params.py",
+                    "def load(old):\n" + textwrap.indent(body, "    ") + "\n",
+                )
+                candidates = self.scan("--paths", "params.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected))
+                if expected:
+                    self.assertEqual(candidates[0]["rule"], "PY05_dead_param_evasion")
+                    self.assertIn("entry overwrite", candidates[0]["evidence"])
+                    self.assertIn("'old'", candidates[0]["evidence"])
+                    self.assertEqual(
+                        candidates[0]["span"][0], 3 if body.startswith("log()") else 2
+                    )
+        self.put(
+            "params.py",
+            """
+            class Model:
+                async def load(self, old, /, *, option):
+                    old = 1
+                    option = 2
+                    return old + option
+                def protocol(self, arg):
+                    ...
+            """,
+        )
+        candidates = self.scan("--paths", "params.py")["candidates"]
+        self.assertEqual(
+            [c["symbol"] for c in candidates], ["Model.load", "Model.load"]
+        )
+
+    def test_dead_parameter_dual_fallback_in_entry_prefix(self):
+        for signature, before, rhs, after, expected in [
+            ("old, new=None", "", "old", "", True),
+            ("old, *, new=None", "log()\n", "normalize(old)", "", True),
+            ("old, /, new=None", "", "combine(old, old)", "", True),
+            ("old, new=1", "", "old", "", False),
+            ("old, new=None", "log(old)\n", "old", "", False),
+            ("old, new=None", "", "old", "log(old)\n", False),
+            ("old, new=None", "", "old", "reader = lambda: old\n", False),
+            ("old, new=None", "if ready:\n    log()\n", "old", "", False),
+            ("old, new=None", "return 1\n", "old", "", False),
+        ]:
+            with self.subTest(signature=signature, before=before, after=after):
+                self.put(
+                    "params.py",
+                    f"def load({signature}):\n"
+                    + textwrap.indent(before, "    ")
+                    + f"    if new is None:\n        new = {rhs}\n"
+                    + textwrap.indent(after, "    ")
+                    + "    return new\n",
+                )
+                candidates = self.scan("--paths", "params.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected))
+                if expected:
+                    candidate = candidates[0]
+                    self.assertEqual(candidate["rule"], "PY05_dead_param_evasion")
+                    self.assertIn("dual-parameter", candidate["evidence"])
+                    self.assertIn("'old'", candidate["evidence"])
+                    self.assertIn("'new'", candidate["evidence"])
+                    self.assertIn("default None at line 1", candidate["evidence"])
+                    self.assertEqual(
+                        candidate["span"],
+                        [2 + len(before.splitlines()), 3 + len(before.splitlines())],
+                    )
+
+    def test_typed_parameter_revalidation_respects_annotations_and_rebinding(self):
+        for annotation, default, before, check, expected in [
+            ("Widget", "", "", "item is None", True),
+            ("pkg.Widget", "", "", "item is not None", True),
+            ("Widget", "", "", "isinstance(item, Widget)", True),
+            ("pkg.Widget", "", "", "isinstance(item, (str, other.Widget))", True),
+            ("list[int]", "", "", "isinstance(item, list)", True),
+            ("ManyObjects", "", "", "item is None", True),
+            ("OptionalThing", "", "", "item is None", True),
+            ("UnionMember", "", "", "item is None", True),
+            ("object_record", "", "", "item is None", True),
+            ("Optional[Widget]", "", "", "item is None", False),
+            ("typing.Optional[Widget]", "", "", "item is None", False),
+            ("Widget | None", "", "", "item is None", False),
+            ("Union[Widget, str]", "", "", "item is None", False),
+            ("Widget", "=None", "", "item is None", False),
+            ("Any", "", "", "item is None", False),
+            ("typing.Any", "", "", "item is None", False),
+            ("object", "", "", "item is None", False),
+            ("list[Any]", "", "", "item is None", False),
+            ("None", "", "", "item is None", False),
+            ("Widget", "", "item = normalize(item)\n", "item is None", False),
+            (
+                "Widget",
+                "",
+                "if ready:\n    item = normalize(item)\n",
+                "item is None",
+                False,
+            ),
+            ("Widget", "", "", "isinstance(item, Other)", False),
+            ("Widget", "", "", "isinstance(other, Widget)", False),
+        ]:
+            with self.subTest(
+                annotation=annotation, default=default, before=before, check=check
+            ):
+                self.put(
+                    "typed.py",
+                    f"def load(item: {annotation}{default}):\n"
+                    + textwrap.indent(before, "    ")
+                    + f"    if {check}:\n        return 1\n    return item\n",
+                )
+                candidates = self.scan("--paths", "typed.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected))
+                if expected:
+                    candidate = candidates[0]
+                    self.assertEqual(candidate["rule"], "PY06_revalidated_typed_param")
+                    self.assertEqual(candidate["span"], [2, 2])
+                    self.assertIn(annotation, candidate["evidence"])
+                    self.assertIn("line 1", candidate["evidence"])
+                    self.assertIn("line 2", candidate["evidence"])
+                    self.assertIn("Counterweight", candidate["verify"])
+        self.put(
+            "typed.py",
+            """
+            class Model:
+                async def load(self, item: Widget, /, *, option: list[int]):
+                    if item is None:
+                        return 1
+                    if isinstance(option, list):
+                        return 2
+                    item = normalize(item)
+                    if item is None:
+                        return 3
+                def outer(self, item: Widget, *args: Widget, **kwargs: Widget):
+                    def nested():
+                        return item is None
+                    reader = lambda: item is None
+                    class Inner:
+                        value = item is None
+                    return args is None or kwargs is None
+            """,
+        )
+        candidates = self.scan("--paths", "typed.py")["candidates"]
+        self.assertEqual(
+            [c["symbol"] for c in candidates], ["Model.load", "Model.load"]
+        )
+
+    def test_string_annotations_use_tokens_and_skip_unparseable_types(self):
+        for annotation, check, expected in [
+            ("pkg.Widget", "isinstance(item, Widget)", True),
+            ("list[int]", "isinstance(item, (tuple, list))", True),
+            ("ManyObjects", "item is None", True),
+            ("OptionalThing", "item is not None", True),
+            ("Widget", "isinstance(item, Other)", False),
+            ("typing.Optional[Widget]", "item is None", False),
+            ("Widget | None", "item is None", False),
+            ("list[Any]", "item is None", False),
+            ("Union[Widget, str]", "item is None", False),
+            ("object", "item is None", False),
+            ("None", "item is None", False),
+            ("Widget[", "item is None", False),
+            ("", "item is None", False),
+        ]:
+            with self.subTest(annotation=annotation, check=check):
+                self.put(
+                    "typed.py",
+                    f"def load(item: {annotation!r}):\n    return {check}\n",
+                )
+                candidates = self.scan("--paths", "typed.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected))
+                if expected:
+                    self.assertEqual(
+                        candidates[0]["rule"], "PY06_revalidated_typed_param"
+                    )
+                    self.assertIn(annotation, candidates[0]["evidence"])
+                    self.assertEqual(candidates[0]["span"], [2, 2])
+
+    def test_diff_eligibility_excludes_noncontributing_else_branches(self):
+        self.init_repo()
+        original = textwrap.dedent("""
+            def required(raw):
+                value = raw or 1
+                if value is None:
+                    return None
+                else:
+                    log('before')
+            def migrated(old, new=None):
+                if new is None:
+                    new = old
+                else:
+                    log('before')
+                return new
+        """).lstrip("\n")
+        self.put("branches.py", original)
+        base = self.commit()
+        self.put("branches.py", original.replace("'before'", "'after'"))
+        self.assertEqual(self.scan("--base", base)["candidates"], [])
+
+    def test_new_probes_share_schema_compact_output_and_production_role_gate(self):
+        source = """
+            def washed():
+                try:
+                    work()
+                except Exception:
+                    return {}
+            def shadow(raw):
+                value = raw or 1
+                if value is None:
+                    return 0
+            def coalesced(data):
+                return data.get('count') or 0
+            def discarded(old):
+                _ = old
+                return 1
+            def typed(item: Widget):
+                return item is None
+        """
+        self.put("app.py", source)
+        self.put("tests/helpers.py", source)
+        result = self.scan("--paths", ".")
+        self.assertEqual(result["summary"]["files_scanned"], 2)
+        self.assertEqual(result["summary"]["candidate_count"], 5)
+        self.assertEqual(
+            [c["rule"] for c in result["candidates"]],
+            [
+                "PY02_error_washing",
+                "PY03_default_shadows_check",
+                "PY04_lossy_falsy_coalesce",
+                "PY05_dead_param_evasion",
+                "PY06_revalidated_typed_param",
+            ],
+        )
+        for candidate in result["candidates"]:
+            self.assertEqual(candidate["path"], "app.py")
+            self.assertEqual(
+                set(candidate),
+                {
+                    "id",
+                    "rule",
+                    "path",
+                    "span",
+                    "symbol",
+                    "change_tag",
+                    "code",
+                    "evidence",
+                    "verify",
+                },
+            )
+            self.assertEqual(candidate["change_tag"], "path-audit")
+        compact = self.cli("--paths", ".", "--format", "compact")
+        self.assertIn(
+            "Scanned 2 files (0 cross-checked); 5 candidates, 0 parse errors", compact
+        )
+        for candidate in result["candidates"]:
+            self.assertIn(f"— {candidate['rule']} [path-audit]", compact)
+            self.assertIn(f"  Verify: {candidate['verify']}", compact)
 
     def test_mixed_parse_failures_keep_valid_candidates_in_both_formats(self):
         self.put("good.py", 'hasattr(item, "value")\n')

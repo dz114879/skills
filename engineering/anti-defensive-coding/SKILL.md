@@ -44,7 +44,7 @@ When Python is in scope, run the extractor once using the matching scope:
 | Branch/PR since divergence | `python3 <skill-dir>/scripts/scan_python.py --base <base> --merge-base` (append `--tip <tip>` when the tip is not `HEAD`) |
 | File/directory audit | `python3 <skill-dir>/scripts/scan_python.py --paths <path>...` |
 
-Use `--help` for root, filtering, classification, and output controls. Capture the summary, candidates, and parse errors. Current extraction covers `PY01_reflect_default`; review the other families manually. A declaration clue does not prove the receiver's type, and an empty extraction does not establish a clean review.
+Use `--help` for root, filtering, classification, and output controls. Capture the summary, candidates, and parse errors. Current extraction covers `PY01`–`PY06`; review the other families manually. A declaration clue does not prove the receiver's type, and an empty extraction does not establish a clean review.
 
 **Completion criterion:** Full file inventory and `scan_python.py` output (when Python is in scope) are captured, and all in-scope diff hunks or target files have been read.
 
