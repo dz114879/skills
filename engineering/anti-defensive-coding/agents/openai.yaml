@@ -1,0 +1,3 @@
+interface:
+  display_name: "Anti-Defensive Coding"
+  short_description: "Read-only over-defense review of diffs or paths"

@@ -6,6 +6,18 @@ A collection of personal agent skills.
 
 ```
 engineering/
+├── anti-defensive-coding/
+│   ├── SKILL.md            # Read-only Lean anti-over-defense workflow and rubric
+│   ├── agents/
+│   │   └── openai.yaml     # Interface metadata
+│   ├── references/
+│   │   ├── python.md      # Python recognition patterns and Counterweights
+│   │   ├── sql.md         # SQL/storage recognition patterns and Counterweights
+│   │   └── tests.md       # Corruption Test patterns and Counterweights
+│   ├── scripts/
+│   │   └── scan_python.py # Stateless Python AST Candidate Extractor
+│   └── tests/
+│       └── test_scan_python.py
 ├── code-review-lean/
 │   ├── SKILL.md            # Three-axis review: Standards, Spec, and Lean (anti-over-defense)
 │   └── agents/
