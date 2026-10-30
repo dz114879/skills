@@ -503,11 +503,149 @@ def binding_names(node):
     return set()
 
 
+def import_bindings(nodes):
+    return {
+        name
+        for node in nodes
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+        for name in binding_names(alias)
+    }
+
+
+def identifier_tokens(text):
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", "_", text)
+    return [token.lower() for token in re.split(r"[\W_]+", separated) if token]
+
+
+def name_path(node):
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return f"{name_path(node.value)}.{node.attr}"
+    return ""
+
+
+def write_targets(node):
+    if isinstance(node, ast.Assign):
+        return node.targets
+    if (
+        isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr))
+        and node.value is not None
+    ):
+        return [node.target]
+    return []
+
+
+def constructed_here(node):
+    if not isinstance(node, ast.Call):
+        return False
+    name = terminal_name(node.func)
+    return name is not None and (
+        name[:1].isupper()
+        or name_path(node.func)
+        in {"cls", "copy", "deepcopy", "copy.copy", "copy.deepcopy"}
+        or (isinstance(node.func, ast.Attribute) and name in {"__new__", "__class__"})
+    )
+
+
+def self_state_writes(body, *, reset):
+    writes = {}
+    for statement in body:
+        for child in local_walk(statement):
+            if not isinstance(child, (ast.Assign, ast.AnnAssign)):
+                continue
+            if child.value is None or is_none(child.value) != reset:
+                continue
+            for target in write_targets(child):
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                ):
+                    writes.setdefault(target.attr, []).append(child)
+    return writes
+
+
+def context_tokens(node):
+    return set(
+        identifier_tokens(name_path(node.func if isinstance(node, ast.Call) else node))
+    )
+
+
+def lock_context_parts(node):
+    if not isinstance(node, (ast.With, ast.AsyncWith)):
+        return
+    for index, item in enumerate(node.items):
+        if context_tokens(item.context_expr) & {
+            "transaction",
+            "immediate",
+            "savepoint",
+            "lock",
+        }:
+            yield (
+                item.context_expr,
+                [
+                    *node.body,
+                    *(later.context_expr for later in node.items[index + 1 :]),
+                ],
+            )
+
+
+def io_or_hash_call(node):
+    path = name_path(node.func)
+    return (
+        terminal_name(node.func)
+        in {"open", "read_text", "write_text", "read_bytes", "write_bytes"}
+        or path.startswith(("shutil.", "hashlib."))
+        or path in {"os.remove", "os.unlink", "os.replace", "sha256"}
+    )
+
+
+def iteration_parts(node):
+    if isinstance(node, (ast.For, ast.AsyncFor)):
+        return [node.target, *node.body], [node.target, node.iter]
+    if isinstance(node, ast.While):
+        return [node.test, *node.body], [node.test]
+    if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+        repeated = (
+            [node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt]
+        )
+        headers = []
+        for index, generator in enumerate(node.generators):
+            repeated.extend([generator.target, *generator.ifs])
+            if index:
+                repeated.append(generator.iter)
+            headers.extend([generator.target, generator.iter])
+        return repeated, headers
+    return [], []
+
+
+def predicate_tests(node):
+    if isinstance(node, (ast.If, ast.While, ast.IfExp, ast.Assert)):
+        return [node.test]
+    if isinstance(node, ast.comprehension):
+        return node.ifs
+    if isinstance(node, ast.match_case):
+        return [node.guard] if node.guard is not None else []
+    if (
+        isinstance(node, (ast.Compare, ast.BoolOp))
+        or (isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not))
+        or (isinstance(node, ast.Call) and name_path(node.func) == "bool")
+    ):
+        return [node]
+    return []
+
+
 class CandidateProbes(ast.NodeVisitor):
     def __init__(self, source, tree):
         self.source = source
         self.attributes = declarations(tree)
         self.imported = set()
+        self.module_imported = import_bindings(local_walk(tree))
+        self.iterations = {}
+        self.lock_contexts = {}
+        self.transaction_contexts = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 self.imported.update(
@@ -515,6 +653,22 @@ class CandidateProbes(ast.NodeVisitor):
                 )
             elif isinstance(node, ast.ImportFrom):
                 self.imported.update(alias.asname or alias.name for alias in node.names)
+            if isinstance(node, (ast.With, ast.AsyncWith)):
+                self.transaction_contexts.update(
+                    item.context_expr
+                    for item in node.items
+                    if context_tokens(item.context_expr) & {"transaction", "savepoint"}
+                )
+            repeated, headers = iteration_parts(node)
+            for part in repeated:
+                for child in local_walk(part):
+                    if isinstance(child, ast.Call):
+                        self.iterations.setdefault(child, []).append((node, headers))
+            for context, parts in lock_context_parts(node):
+                for part in parts:
+                    for child in local_walk(part):
+                        if isinstance(child, ast.expr):
+                            self.lock_contexts.setdefault(child, []).append(context)
         self.symbols = []
         self.candidates = []
 
@@ -636,10 +790,154 @@ class CandidateProbes(ast.NodeVisitor):
         self.symbols.append(node.name)
         self.dead_parameters(node)
         self.typed_parameters(node)
+        self.state_smuggling(node)
+        self.transaction_checks(node)
         self.generic_visit(node)
         self.symbols.pop()
 
     visit_AsyncFunctionDef = visit_FunctionDef
+
+    def transaction_checks(self, node):
+        nodes = [child for statement in node.body for child in local_walk(statement)]
+        contexts = [child for child in nodes if child in self.transaction_contexts]
+        if not contexts:
+            return
+        checks = []
+        covered = set()
+        for child in nodes:
+            for test in predicate_tests(child):
+                if test in covered:
+                    continue
+                parts = list(local_walk(test))
+                covered.update(parts)
+                if any(
+                    isinstance(part, ast.Attribute)
+                    and part.attr == "in_transaction"
+                    and isinstance(part.ctx, ast.Load)
+                    for part in parts
+                ):
+                    checks.append(test)
+        if checks:
+            self.add(
+                "PY09_io_or_tx_in_lock",
+                checks[0],
+                "in_transaction checked at "
+                + ", ".join(f"line {check.lineno}" for check in checks)
+                + "; same function enters "
+                + ", ".join(
+                    f"with {ast.unparse(context)} at line {context.lineno}"
+                    for context in contexts
+                ),
+                "Does the immediate caller already own the transaction, making another "
+                "savepoint redundant; is independent rollback or required isolation "
+                "a Counterweight?",
+                related=(*checks[1:], *contexts),
+            )
+
+    def state_smuggling(self, node):
+        nodes = [child for statement in node.body for child in local_walk(statement)]
+        external_bindings = {
+            name
+            for child in nodes
+            if isinstance(child, (ast.Global, ast.Nonlocal))
+            for name in child.names
+        }
+        bindings = {
+            param.arg: param.lineno
+            for param in [*parameters(node), node.args.vararg, node.args.kwarg]
+            if param is not None
+        }
+        owned = set()
+        for child in nodes:
+            for name in binding_names(child):
+                bindings.setdefault(name, child.lineno)
+            for target in write_targets(child):
+                if (
+                    isinstance(target, ast.Name)
+                    and target.id not in external_bindings
+                    and not isinstance(child, ast.AugAssign)
+                    and constructed_here(child.value)
+                ):
+                    owned.add(target.id)
+        imported = import_bindings(nodes) | (self.module_imported - bindings.keys())
+        for child in nodes:
+            if isinstance(child, ast.Dict):
+                for key, value in zip(child.keys, child.values):
+                    self.dict_dependency(key, value)
+            if isinstance(child, (ast.Try, ast.TryStar)) and child.finalbody:
+                active = self_state_writes(child.body, reset=False)
+                resets = self_state_writes(child.finalbody, reset=True)
+                for attr in sorted(active.keys() & resets.keys()):
+                    first, *related = [*active[attr], *resets[attr]]
+                    self.add(
+                        "PY07_state_smuggling",
+                        first,
+                        f"self.{attr} set at line {first.lineno} in try at line "
+                        f"{child.lineno}, reset to None in finally at line "
+                        f"{resets[attr][0].lineno}",
+                        f"Does the immediate consumer require transient 'self.{attr}', "
+                        "or can it receive an explicit argument; is a documented "
+                        "lifecycle/reentrancy guarantee a Counterweight?",
+                        related=related,
+                    )
+            for assignment in write_targets(child):
+                for target in bound_targets(assignment):
+                    if isinstance(child, (ast.Assign, ast.AnnAssign)) and isinstance(
+                        target, ast.Subscript
+                    ):
+                        self.dict_dependency(target.slice, child.value, child)
+                    if (
+                        isinstance(target, ast.Attribute)
+                        and target.attr.startswith("_")
+                        and not target.attr.startswith("__")
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id not in {"self", "cls"} | imported | owned
+                    ):
+                        name = target.value.id
+                        binding = (
+                            f"bound at line {bindings[name]}"
+                            if name in bindings
+                            else "has no binding in this function"
+                        )
+                        self.add(
+                            "PY07_state_smuggling",
+                            child,
+                            f"Foreign '{name}' ({binding}) receives '{target.attr}' "
+                            f"at line {target.lineno}",
+                            f"Does the immediate producer own '{name}' and require this "
+                            "private mutation, or can state be passed explicitly; is a "
+                            "documented extension/lifecycle protocol a Counterweight?",
+                        )
+
+    def dict_dependency(self, key, value, assignment=None):
+        if not (
+            isinstance(key, ast.Constant)
+            and isinstance(key.value, str)
+            and isinstance(value, (ast.Name, ast.Attribute))
+        ):
+            return
+        tokens = identifier_tokens(key.value)
+        if not tokens or tokens[-1] not in {
+            "service",
+            "repo",
+            "repository",
+            "reader",
+            "writer",
+            "conn",
+            "connection",
+            "session",
+        }:
+            return
+        self.add(
+            "PY07_state_smuggling",
+            assignment if assignment is not None else key,
+            f"Dependency-shaped key {key.value!r} stores {ast.unparse(value)} "
+            f"at line {key.lineno}",
+            "Does the immediate dictionary consumer expect data only, so this dependency "
+            "should be explicit; is a documented dependency registry or boundary adapter "
+            "a Counterweight?",
+            related=() if assignment is not None else (value,),
+        )
 
     def typed_parameters(self, node):
         defaults = parameter_defaults(node)
@@ -661,22 +959,13 @@ class CandidateProbes(ast.NodeVisitor):
         }
         deferred_bindings = {}
         for child in nodes:
-            if (
-                isinstance(
-                    child, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)
-                )
-                and child.value is not None
-            ):
-                targets = (
-                    child.targets if isinstance(child, ast.Assign) else [child.target]
-                )
-                for target in targets:
-                    for bound in bound_targets(target):
-                        # RHS checks still observe the parameter before the store.
-                        deferred_bindings[bound] = (
-                            child.end_lineno,
-                            child.end_col_offset,
-                        )
+            for target in write_targets(child):
+                for bound in bound_targets(target):
+                    # RHS checks still observe the parameter before the store.
+                    deferred_bindings[bound] = (
+                        child.end_lineno,
+                        child.end_col_offset,
+                    )
         first_bind = {}
         for child in nodes:
             if child in unbound_annotations:
@@ -813,7 +1102,114 @@ class CandidateProbes(ast.NodeVisitor):
             related=related,
         )
 
+    def visit_ListComp(self, node):
+        element = node.elt
+        if (
+            isinstance(element, ast.Call)
+            and name_path(element.func) == "dict"
+            and len(element.args) == 1
+            and not element.keywords
+            and isinstance(element.args[0], ast.Name)
+        ):
+            for generator in node.generators:
+                if (
+                    isinstance(generator.target, ast.Name)
+                    and generator.target.id == element.args[0].id
+                ):
+                    self.add(
+                        "PY08_roundtrip_and_copy",
+                        element,
+                        f"Comprehension at line {node.lineno} rewraps its target "
+                        f"'{generator.target.id}' in dict at line {element.lineno}",
+                        "Does the immediate row producer already return suitable mappings, "
+                        "or is independent mutation/ownership of each copy a Counterweight?",
+                        related=(generator.target,),
+                    )
+                    break
+        self.generic_visit(node)
+
+    def roundtrip(self, node):
+        if len(node.args) != 1 or not isinstance(node.args[0], ast.Call):
+            return
+        inner = node.args[0]
+        pair = name_path(node.func), name_path(inner.func)
+        matches = pair in {("json.loads", "json.dumps"), ("int", "float")}
+        matches |= (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "fromisoformat"
+            and isinstance(inner.func, ast.Attribute)
+            and inner.func.attr == "isoformat"
+        )
+        matches |= (
+            pair == ("set", "list")
+            and len(inner.args) == 1
+            and isinstance(inner.args[0], ast.Call)
+            and name_path(inner.args[0].func) == "set"
+        )
+        if matches:
+            self.add(
+                "PY08_roundtrip_and_copy",
+                node,
+                f"{ast.unparse(node.func)} wraps {ast.unparse(inner.func)} "
+                f"at line {node.lineno}",
+                "Does the immediate consumer need this representation round-trip, "
+                "or can the original value preserve Semantic Fidelity; is documented "
+                "wire normalization or isolation a Counterweight?",
+            )
+
+    def lock_candidate(self, node, fact):
+        contexts = self.lock_contexts[node]
+        self.add(
+            "PY09_io_or_tx_in_lock",
+            node,
+            f"{fact} at line {node.lineno} inside "
+            + ", ".join(
+                f"with {ast.unparse(context)} at line {context.lineno}"
+                for context in contexts
+            ),
+            "Does the immediate lock/transaction owner require this work in the protected "
+            "region, or can it move outside; is atomicity, isolation, or data-loss "
+            "prevention a Counterweight?",
+            related=tuple(contexts),
+        )
+
+    def visit_With(self, node):
+        for item in node.items:
+            context = item.context_expr
+            if context in self.transaction_contexts and context in self.lock_contexts:
+                self.lock_candidate(context, "Nested transaction/savepoint")
+        self.generic_visit(node)
+
+    visit_AsyncWith = visit_With
+
     def visit_Call(self, node):
+        self.roundtrip(node)
+        if (
+            node in self.lock_contexts
+            and node not in self.transaction_contexts
+            and io_or_hash_call(node)
+        ):
+            self.lock_candidate(node, f"I/O or hashing call {ast.unparse(node.func)}")
+        contexts = self.iterations.get(node, [])
+        if contexts and name_path(node.func) in {
+            "deepcopy",
+            "copy.deepcopy",
+            "asdict",
+            "dataclasses.asdict",
+        }:
+            self.add(
+                "PY08_roundtrip_and_copy",
+                node,
+                f"{ast.unparse(node.func)} at line {node.lineno} runs per iteration of "
+                + ", ".join(
+                    f"{type(loop).__name__} at line {loop.lineno}"
+                    for loop, _ in contexts
+                ),
+                "Does the immediate consumer mutate or retain an independent snapshot "
+                "each iteration, or can copying be removed/hoisted; is isolation or "
+                "required wire serialization a Counterweight?",
+                related=tuple(header for _, headers in contexts for header in headers),
+            )
         if (
             isinstance(node.func, ast.Name)
             and (

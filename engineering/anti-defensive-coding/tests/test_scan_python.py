@@ -70,6 +70,580 @@ class ScanPythonTests(unittest.TestCase):
         self.git("commit", "-qm", "fixture")
         return self.git("rev-parse", "HEAD")
 
+    def test_foreign_private_writes_exclude_locally_owned_objects(self):
+        for binding, target, expected in [
+            ("", "item._cache", True),
+            ("item = receive()", "item._cache", True),
+            ("item: Record = receive()", "item._cache", True),
+            ("", "item._cache_", True),
+            ("item = Record()", "item._cache", False),
+            ("item = models.Record()", "item._cache", False),
+            ("item = cls()", "item._cache", False),
+            ("item = Record.__new__(Record)", "item._cache", False),
+            ("item = original.__class__()", "item._cache", False),
+            ("item = copy(original)", "item._cache", False),
+            ("item = deepcopy(original)", "item._cache", False),
+            ("item = copy.copy(original)", "item._cache", False),
+            ("item = copy.deepcopy(original)", "item._cache", False),
+            ("item = other.copy(original)", "item._cache", True),
+            ("def helper():\n    item = Record()", "item._cache", True),
+            ("", "self._cache", False),
+            ("", "cls._cache", False),
+            ("from external import item", "item._cache", False),
+            ("", "item.__cache", False),
+            ("", "item.__cache__", False),
+            ("", "item.cache", False),
+            ("", "owner.item._cache", False),
+        ]:
+            with self.subTest(binding=binding, target=target):
+                self.put(
+                    "state.py",
+                    "def attach(item, self, cls, owner):\n"
+                    + textwrap.indent(binding + "\n" if binding else "", "    ")
+                    + f"    {target} = payload\n",
+                )
+                candidates = [
+                    c
+                    for c in self.scan("--paths", "state.py")["candidates"]
+                    if c["rule"] == "PY07_state_smuggling"
+                ]
+                self.assertEqual(len(candidates), int(expected))
+                if expected:
+                    self.assertEqual(candidates[0]["symbol"], "attach")
+                    self.assertIn("item", candidates[0]["evidence"])
+                    self.assertIn("line", candidates[0]["evidence"])
+                    self.assertIn("Counterweight", candidates[0]["verify"])
+        self.put("state.py", "item._cache = payload\n")
+        self.assertEqual(self.scan("--paths", "state.py")["candidates"], [])
+
+    def test_private_write_import_exclusion_respects_function_bindings(self):
+        for source, expected in [
+            (
+                "def unrelated():\n    import item\n"
+                "def attach(item):\n    item._cache = payload\n",
+                True,
+            ),
+            (
+                "import item\ndef attach(item):\n    item._cache = payload\n",
+                True,
+            ),
+            (
+                "import item\n"
+                "def attach():\n    item = receive()\n    item._cache = payload\n",
+                True,
+            ),
+            (
+                "class Unrelated:\n    import item\n"
+                "def attach(item):\n    item._cache = payload\n",
+                True,
+            ),
+            (
+                "def attach():\n    from external import receiver as item\n"
+                "    item._cache = payload\n",
+                False,
+            ),
+            (
+                "from external import receiver as item\n"
+                "def attach():\n    item._cache = payload\n",
+                False,
+            ),
+        ]:
+            with self.subTest(source=source):
+                self.put("state.py", source)
+                candidates = self.scan("--paths", "state.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected))
+                if expected:
+                    self.assertEqual(candidates[0]["rule"], "PY07_state_smuggling")
+                    self.assertEqual(candidates[0]["symbol"], "attach")
+
+    def test_private_write_constructor_exclusion_requires_a_function_local_binding(
+        self,
+    ):
+        for source, symbol in [
+            (
+                "shared = Record()\ndef attach():\n    global shared\n"
+                "    shared = Record()\n    shared._cache = payload\n",
+                "attach",
+            ),
+            (
+                "def outer():\n    shared = Record()\n    def attach():\n"
+                "        nonlocal shared\n        shared = Record()\n"
+                "        shared._cache = payload\n",
+                "outer.attach",
+            ),
+        ]:
+            with self.subTest(symbol=symbol):
+                self.put("state.py", source)
+                candidates = self.scan("--paths", "state.py")["candidates"]
+                self.assertEqual(len(candidates), 1)
+                self.assertEqual(candidates[0]["rule"], "PY07_state_smuggling")
+                self.assertEqual(candidates[0]["symbol"], symbol)
+
+    def test_transient_self_state_requires_matching_try_and_finally_writes(self):
+        for body, cleanup, handler, expected in [
+            ("self.context = active", "self.context = None", "", True),
+            ("self.context: Context = active", "self.context = None", "", True),
+            (
+                "self.context = active",
+                "self.context = None",
+                "except* RuntimeError:\n    raise\n",
+                True,
+            ),
+            ("self.context = None", "self.context = None", "", False),
+            ("self.context = active", "self.context = previous", "", False),
+            ("self.context = active", "self.other = None", "", False),
+            ("other.context = active", "self.context = None", "", False),
+            ("self.context = active", "other.context = None", "", False),
+            (
+                "def callback():\n    self.context = active",
+                "self.context = None",
+                "",
+                False,
+            ),
+            (
+                "self.context = active",
+                "class Cleanup:\n    self.context = None",
+                "",
+                False,
+            ),
+        ]:
+            with self.subTest(body=body, cleanup=cleanup, handler=handler):
+                self.put(
+                    "state.py",
+                    "class Runner:\n    def run(self):\n        try:\n"
+                    + textwrap.indent(body, "            ")
+                    + "\n"
+                    + textwrap.indent(handler, "        ")
+                    + "        finally:\n"
+                    + textwrap.indent(cleanup, "            ")
+                    + "\n",
+                )
+                candidates = self.scan("--paths", "state.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected))
+                if expected:
+                    candidate = candidates[0]
+                    self.assertEqual(candidate["rule"], "PY07_state_smuggling")
+                    self.assertEqual(candidate["symbol"], "Runner.run")
+                    self.assertIn("self.context", candidate["evidence"])
+                    self.assertIn("finally", candidate["evidence"])
+                    self.assertIn("Counterweight", candidate["verify"])
+
+    def test_dict_dependency_smuggling_requires_final_key_token_and_object_value(self):
+        for key, expected in [
+            ("service", True),
+            ("user_service", True),
+            ("orderRepo", True),
+            ("db.repository", True),
+            ("Reader", True),
+            ("cache-writer", True),
+            ("db_conn", True),
+            ("dbConnection", True),
+            ("SESSION", True),
+            ("session_id", False),
+            ("repo_url", False),
+            ("reader_name", False),
+            ("connection_string", False),
+            ("microservice", False),
+            ("", False),
+        ]:
+            for expression in [
+                f"data[{key!r}] = dep",
+                f"return {{{key!r}: owner.dep}}",
+            ]:
+                with self.subTest(key=key, expression=expression):
+                    self.put(
+                        "state.py", "def pack(data, dep, owner):\n    " + expression
+                    )
+                    candidates = self.scan("--paths", "state.py")["candidates"]
+                    self.assertEqual(len(candidates), int(expected))
+                    if expected:
+                        candidate = candidates[0]
+                        self.assertEqual(candidate["rule"], "PY07_state_smuggling")
+                        self.assertIn(key, candidate["evidence"])
+                        self.assertIn("line 2", candidate["evidence"])
+                        self.assertIn("Counterweight", candidate["verify"])
+        for expression in [
+            'data["session"] = None',
+            'data["service"] = make_service()',
+            'return {"repo": "url"}',
+            'return {"reader": deps[0]}',
+            'return {"conn": lambda: dep}',
+            "return {key: dep}",
+        ]:
+            with self.subTest(expression=expression):
+                self.put("state.py", "def pack(data, dep):\n    " + expression)
+                self.assertEqual(self.scan("--paths", "state.py")["candidates"], [])
+        self.put("state.py", 'data = {"session": dep}\n')
+        self.assertEqual(self.scan("--paths", "state.py")["candidates"], [])
+
+    def test_roundtrip_conversions_require_the_complete_nested_chain(self):
+        for expression, expected in [
+            ("json.loads(json.dumps(value))", True),
+            ("json.loads(json.dumps(value, sort_keys=True))", True),
+            ("int(float(value))", True),
+            ("datetime.fromisoformat(value.isoformat())", True),
+            ("date.fromisoformat(value.isoformat(timespec='seconds'))", True),
+            ("set(list(set(values)))", True),
+            ("int(value)", False),
+            ("float(value)", False),
+            ("json.dumps(value)", False),
+            ("json.loads(value)", False),
+            ("json.loads(other.dumps(value))", False),
+            ("date.fromisoformat(value)", False),
+            ("value.isoformat()", False),
+            ("date.fromisoformat(value.format())", False),
+            ("set(list(values))", False),
+            ("list(set(values))", False),
+        ]:
+            with self.subTest(expression=expression):
+                self.put("churn.py", "result = " + expression + "\n")
+                candidates = self.scan("--paths", "churn.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected))
+                if expected:
+                    self.assertEqual(candidates[0]["rule"], "PY08_roundtrip_and_copy")
+                    self.assertEqual(candidates[0]["code"], expression)
+                    self.assertIn("line 1", candidates[0]["evidence"])
+                    self.assertIn("Counterweight", candidates[0]["verify"])
+
+    def test_dict_comprehension_rewrap_requires_exact_target_argument(self):
+        for expression, expected in [
+            ("[dict(row) for row in rows]", True),
+            ("[dict(row) for group in groups for row in group]", True),
+            ("[dict(other) for row in rows]", False),
+            ("[dict(row, extra=1) for row in rows]", False),
+            ("[dict(**row) for row in rows]", False),
+            ("[dict(row.items()) for row in rows]", False),
+            ("[dict(row) for key, row in pairs]", False),
+            ("[dict(row) for obj.row in rows]", False),
+            ("(dict(row) for row in rows)", False),
+        ]:
+            with self.subTest(expression=expression):
+                self.put("churn.py", "result = " + expression + "\n")
+                candidates = self.scan("--paths", "churn.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected))
+                if expected:
+                    self.assertEqual(candidates[0]["rule"], "PY08_roundtrip_and_copy")
+                    self.assertIn("row", candidates[0]["evidence"])
+                    self.assertIn("line 1", candidates[0]["evidence"])
+                    self.assertIn("Counterweight", candidates[0]["verify"])
+
+    def test_copy_churn_requires_per_iteration_execution_without_nested_scopes(self):
+        for body, expected in [
+            ("for item in items:\n    deepcopy(item)", 1),
+            ("async for item in items:\n    copy.deepcopy(item)", 1),
+            ("while ready():\n    asdict(item)", 1),
+            ("while dataclasses.asdict(item):\n    consume(item)", 1),
+            ("[deepcopy(item) for item in items]", 1),
+            ("{key: dataclasses.asdict(item) for key, item in items}", 1),
+            ("{asdict(item) for item in items}", 1),
+            ("(copy.deepcopy(item) for item in items)", 1),
+            ("[item for item in items if asdict(item)]", 1),
+            ("[part for item in items for part in deepcopy(item)]", 1),
+            ("for group in groups:\n    for item in group:\n        deepcopy(item)", 1),
+            ("asdict(item)", 0),
+            ("deepcopy(item)", 0),
+            ("for item in deepcopy(items):\n    consume(item)", 0),
+            ("async for item in asdict(items):\n    consume(item)", 0),
+            ("for item in items:\n    consume(item)\nelse:\n    deepcopy(item)", 0),
+            ("while ready():\n    consume(item)\nelse:\n    asdict(item)", 0),
+            ("[item for item in deepcopy(items)]", 0),
+            ("(item for item in asdict(items))", 0),
+            ("for item in items:\n    def callback():\n        deepcopy(item)", 0),
+            ("for item in items:\n    async def callback():\n        asdict(item)", 0),
+            (
+                "for item in items:\n    class Callback:\n        value = asdict(item)",
+                0,
+            ),
+            ("for item in items:\n    callback = lambda: deepcopy(item)", 0),
+            ("for item in items:\n    other.deepcopy(item)", 0),
+            ("for item in items:\n    other.asdict(item)", 0),
+            (
+                "for item in items:\n    def callback():\n"
+                "        for part in item:\n            deepcopy(part)",
+                1,
+            ),
+        ]:
+            with self.subTest(body=body):
+                self.put(
+                    "churn.py", "async def run():\n" + textwrap.indent(body, "    ")
+                )
+                candidates = self.scan("--paths", "churn.py")["candidates"]
+                self.assertEqual(len(candidates), expected)
+                if expected:
+                    candidate = candidates[0]
+                    self.assertEqual(candidate["rule"], "PY08_roundtrip_and_copy")
+                    self.assertIn("iteration", candidate["evidence"])
+                    self.assertIn("line", candidate["evidence"])
+                    self.assertIn("Counterweight", candidate["verify"])
+
+    def test_lock_io_and_hashing_use_context_tokens_and_stop_at_nested_scopes(self):
+        for context, expected in [
+            ("lock", True),
+            ("self._lock", True),
+            ("conn.transaction()", True),
+            ("db.begin_immediate()", True),
+            ("db.savepoint()", True),
+            ("write_lock", True),
+            ("threading.RLock()", True),
+            ("FileLock(path)", True),
+            ("clock()", False),
+            ("self.block_writer()", False),
+            ("open(lock_path)", False),
+            ("manager(transaction=lock)", False),
+        ]:
+            for keyword in ["with", "async with"]:
+                with self.subTest(context=context, keyword=keyword):
+                    self.put(
+                        "locking.py",
+                        f"async def run():\n    {keyword} {context}:\n"
+                        "        path.read_text()\n",
+                    )
+                    candidates = self.scan("--paths", "locking.py")["candidates"]
+                    self.assertEqual(len(candidates), int(expected))
+                    if expected:
+                        candidate = candidates[0]
+                        self.assertEqual(candidate["rule"], "PY09_io_or_tx_in_lock")
+                        self.assertEqual(candidate["span"], [2, 3])
+                        self.assertIn("line 2", candidate["evidence"])
+                        self.assertIn(context, candidate["evidence"])
+                        self.assertIn("Counterweight", candidate["verify"])
+        for expression, expected in [
+            ("open(path)", True),
+            ("path.open()", True),
+            ("path.read_text()", True),
+            ("path.write_text(text)", True),
+            ("path.read_bytes()", True),
+            ("path.write_bytes(data)", True),
+            ("read_text(path)", True),
+            ("write_text(path, text)", True),
+            ("read_bytes(path)", True),
+            ("write_bytes(path, data)", True),
+            ("shutil.copy(source, target)", True),
+            ("os.remove(path)", True),
+            ("os.unlink(path)", True),
+            ("os.replace(source, target)", True),
+            ("hashlib.sha256(data).hexdigest()", True),
+            ("sha256(data)", True),
+            ("hashlib.blake2b(data)", True),
+            ("os.fspath(path)", False),
+            ("path.exists()", False),
+            ("consume(data)", False),
+        ]:
+            with self.subTest(expression=expression):
+                self.put(
+                    "locking.py",
+                    "with outer_lock:\n    with inner_lock:\n        " + expression,
+                )
+                candidates = self.scan("--paths", "locking.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected))
+                if expected:
+                    self.assertEqual(candidates[0]["rule"], "PY09_io_or_tx_in_lock")
+                    self.assertIn("outer_lock", candidates[0]["evidence"])
+                    self.assertIn("inner_lock", candidates[0]["evidence"])
+        for body in [
+            "def callback():\n    open(path)",
+            "async def callback():\n    path.write_text(text)",
+            "class Callback:\n    data = path.read_bytes()",
+            "callback = lambda: sha256(data)",
+        ]:
+            with self.subTest(body=body):
+                self.put("locking.py", "with lock:\n" + textwrap.indent(body, "    "))
+                self.assertEqual(self.scan("--paths", "locking.py")["candidates"], [])
+        self.put("locking.py", "open(path)\nhashlib.sha256(data)\n")
+        self.assertEqual(self.scan("--paths", "locking.py")["candidates"], [])
+
+    def test_nested_transaction_contexts_are_reported_once_in_acquisition_order(self):
+        for body, expected in [
+            ("with lock:\n    with conn.transaction():\n        work()", 1),
+            ("with lock:\n    with transaction.open(path):\n        work()", 1),
+            (
+                "with db.begin_immediate():\n    with conn.savepoint():\n        work()",
+                1,
+            ),
+            ("async with lock:\n    async with conn.savepoint():\n        work()", 1),
+            (
+                "with outer_lock:\n    with inner_lock:\n        with transaction:\n            work()",
+                1,
+            ),
+            ("with lock, conn.transaction():\n    work()", 1),
+            ("with conn.transaction(), lock:\n    work()", 0),
+            ("with lock, open(path):\n    work()", 1),
+            ("with open(path), lock:\n    work()", 0),
+            ("with lock:\n    with conn.begin_immediate():\n        work()", 0),
+            ("with lock:\n    with transactionless():\n        work()", 0),
+            ("with lock:\n    with manager(savepoint):\n        work()", 0),
+            ("with clock():\n    with conn.transaction():\n        work()", 0),
+            (
+                "with lock:\n    def callback():\n        with conn.transaction():\n            work()",
+                0,
+            ),
+            ("with conn.savepoint():\n    work()", 0),
+        ]:
+            with self.subTest(body=body):
+                self.put(
+                    "locking.py", "async def run():\n" + textwrap.indent(body, "    ")
+                )
+                candidates = self.scan("--paths", "locking.py")["candidates"]
+                self.assertEqual(len(candidates), expected)
+                if expected:
+                    self.assertEqual(candidates[0]["rule"], "PY09_io_or_tx_in_lock")
+                    self.assertIn("with", candidates[0]["evidence"])
+                    self.assertIn("Counterweight", candidates[0]["verify"])
+
+    def test_transaction_entry_requires_a_check_in_the_same_function_scope(self):
+        for check, context, expected in [
+            ("assert conn.in_transaction", "conn.transaction()", True),
+            ("if conn.in_transaction:\n    work()", "conn.savepoint()", True),
+            ("if not conn.in_transaction:\n    return", "db.savepoint", True),
+            ("while conn.in_transaction:\n    work()", "db.transaction()", True),
+            ("work() if conn.in_transaction else wait()", "db.transaction()", True),
+            ("assert conn.in_transaction is True", "db.transaction()", True),
+            ("assert conn.in_transaction", "write_lock", False),
+            ("assert conn.in_transaction", "db.begin_immediate()", False),
+            ("assert conn.in_transaction", "transactionless()", False),
+            ("assert conn.in_transaction", "manager(savepoint)", False),
+            ("assert conn.ready", "conn.transaction()", False),
+            ("log(conn.in_transaction)", "conn.transaction()", False),
+            ("snapshot = conn.in_transaction", "conn.transaction()", False),
+            (
+                "def callback():\n    assert conn.in_transaction",
+                "conn.transaction()",
+                False,
+            ),
+            (
+                "class Callback:\n    assert conn.in_transaction",
+                "conn.transaction()",
+                False,
+            ),
+            (
+                "callback = lambda: bool(conn.in_transaction)",
+                "conn.transaction()",
+                False,
+            ),
+        ]:
+            with self.subTest(check=check, context=context):
+                self.put(
+                    "locking.py",
+                    "async def run():\n"
+                    + textwrap.indent(check, "    ")
+                    + f"\n    async with {context}:\n        work()\n",
+                )
+                candidates = self.scan("--paths", "locking.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected))
+                if expected:
+                    candidate = candidates[0]
+                    self.assertEqual(candidate["rule"], "PY09_io_or_tx_in_lock")
+                    self.assertEqual(candidate["symbol"], "run")
+                    self.assertIn("in_transaction", candidate["evidence"])
+                    self.assertIn("line 2", candidate["evidence"])
+                    self.assertIn(context, candidate["evidence"])
+                    self.assertIn("Counterweight", candidate["verify"])
+        self.put(
+            "locking.py",
+            """
+            def outer():
+                assert conn.in_transaction
+                def callback():
+                    with conn.transaction():
+                        work()
+            def other():
+                with conn.savepoint():
+                    work()
+            """,
+        )
+        self.assertEqual(self.scan("--paths", "locking.py")["candidates"], [])
+
+    def test_transaction_checks_include_boolean_expressions_and_filter_guards(self):
+        for check, line in [
+            ("ready = conn.in_transaction is True", 2),
+            ("ready = not conn.in_transaction", 2),
+            ("ready = conn.in_transaction and enabled", 2),
+            ("ready = bool(conn.in_transaction)", 2),
+            ("selected = [row for row in rows if conn.in_transaction]", 2),
+            ("match value:\n    case _ if conn.in_transaction:\n        work()", 3),
+        ]:
+            with self.subTest(check=check):
+                self.put(
+                    "locking.py",
+                    "def run():\n"
+                    + textwrap.indent(check, "    ")
+                    + "\n    with conn.transaction():\n        work()\n",
+                )
+                candidates = self.scan("--paths", "locking.py")["candidates"]
+                self.assertEqual(len(candidates), 1)
+                self.assertEqual(candidates[0]["rule"], "PY09_io_or_tx_in_lock")
+                self.assertIn(f"line {line}", candidates[0]["evidence"])
+
+    def test_lock_header_added_around_unchanged_io_is_diff_eligible(self):
+        self.init_repo()
+        self.put("locking.py", "def run():\n        path.read_text()\n")
+        base = self.commit()
+        self.put("locking.py", "def run():\n    with lock:\n        path.read_text()\n")
+        candidates = self.scan("--base", base)["candidates"]
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["rule"], "PY09_io_or_tx_in_lock")
+        self.assertEqual(candidates[0]["change_tag"], "changed")
+        self.assertEqual(candidates[0]["span"], [2, 3])
+        self.assertIn("with lock at line 2", candidates[0]["evidence"])
+
+    def test_state_and_lock_diff_eligibility_uses_only_contributing_children(self):
+        self.init_repo()
+        original = textwrap.dedent("""
+            def transient(self):
+                try:
+                    self.context = active
+                    unrelated_try()
+                finally:
+                    self.context = None
+                    unrelated_finally()
+            def locked():
+                with lock:
+                    path.read_text()
+                    unrelated_lock()
+                    with db.savepoint():
+                        unrelated_nested()
+            def contract():
+                assert conn.in_transaction
+                unrelated_between()
+                with conn.transaction():
+                    unrelated_transaction()
+        """)
+        self.put("scope.py", original)
+        base = self.commit()
+        for before, after, expected in [
+            (
+                "self.context = active",
+                "self.context = replacement",
+                "PY07_state_smuggling",
+            ),
+            (
+                "self.context = None",
+                "self.context: Context = None",
+                "PY07_state_smuggling",
+            ),
+            ("unrelated_try()", "new_try_work()", None),
+            ("unrelated_finally()", "new_finally_work()", None),
+            ("path.read_text()", "path.read_bytes()", "PY09_io_or_tx_in_lock"),
+            ("unrelated_lock()", "new_lock_work()", None),
+            ("db.savepoint()", "db.transaction()", "PY09_io_or_tx_in_lock"),
+            ("unrelated_nested()", "new_nested_work()", None),
+            (
+                "assert conn.in_transaction",
+                "assert not conn.in_transaction",
+                "PY09_io_or_tx_in_lock",
+            ),
+            ("unrelated_between()", "new_between_work()", None),
+            ("conn.transaction()", "conn.savepoint()", "PY09_io_or_tx_in_lock"),
+            ("unrelated_transaction()", "new_transaction_work()", None),
+        ]:
+            with self.subTest(before=before):
+                self.put("scope.py", original.replace(before, after))
+                candidates = self.scan("--base", base)["candidates"]
+                self.assertEqual(len(candidates), int(expected is not None))
+                if expected:
+                    self.assertEqual(candidates[0]["rule"], expected)
+                    self.assertEqual(candidates[0]["change_tag"], "changed")
+
     def test_default_shadow_rebinding_respects_current_scope(self):
         for intervening, expected in [
             ("from external import value", False),
@@ -841,7 +1415,7 @@ class ScanPythonTests(unittest.TestCase):
         self.put("branches.py", original.replace("'before'", "'after'"))
         self.assertEqual(self.scan("--base", base)["candidates"], [])
 
-    def test_new_probes_share_schema_compact_output_and_production_role_gate(self):
+    def test_candidates_share_schema_compact_output_and_production_role_gate(self):
         source = """
             def washed():
                 try:
@@ -859,12 +1433,19 @@ class ScanPythonTests(unittest.TestCase):
                 return 1
             def typed(item: Widget):
                 return item is None
+            def smuggled(item):
+                item._context = state
+            def converted(item):
+                return int(float(item))
+            def locked():
+                with lock:
+                    open(path)
         """
         self.put("app.py", source)
         self.put("tests/helpers.py", source)
         result = self.scan("--paths", ".")
         self.assertEqual(result["summary"]["files_scanned"], 2)
-        self.assertEqual(result["summary"]["candidate_count"], 5)
+        self.assertEqual(result["summary"]["candidate_count"], 8)
         self.assertEqual(
             [c["rule"] for c in result["candidates"]],
             [
@@ -873,6 +1454,9 @@ class ScanPythonTests(unittest.TestCase):
                 "PY04_lossy_falsy_coalesce",
                 "PY05_dead_param_evasion",
                 "PY06_revalidated_typed_param",
+                "PY07_state_smuggling",
+                "PY08_roundtrip_and_copy",
+                "PY09_io_or_tx_in_lock",
             ],
         )
         for candidate in result["candidates"]:
@@ -892,12 +1476,15 @@ class ScanPythonTests(unittest.TestCase):
                 },
             )
             self.assertEqual(candidate["change_tag"], "path-audit")
+            self.assertLessEqual(len(candidate["code"]), 200)
+            self.assertIn("Counterweight", candidate["verify"])
         compact = self.cli("--paths", ".", "--format", "compact")
         self.assertIn(
-            "Scanned 2 files (0 cross-checked); 5 candidates, 0 parse errors", compact
+            "Scanned 2 files (0 cross-checked); 8 candidates, 0 parse errors", compact
         )
         for candidate in result["candidates"]:
             self.assertIn(f"— {candidate['rule']} [path-audit]", compact)
+            self.assertIn(f"  Evidence: {candidate['evidence']}", compact)
             self.assertIn(f"  Verify: {candidate['verify']}", compact)
 
     def test_mixed_parse_failures_keep_valid_candidates_in_both_formats(self):
