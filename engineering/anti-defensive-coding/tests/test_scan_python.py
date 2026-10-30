@@ -1,12 +1,18 @@
+import ast
+from collections import Counter
+from contextlib import chdir, redirect_stdout
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
+import runpy
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "scan_python.py"
@@ -69,6 +75,841 @@ class ScanPythonTests(unittest.TestCase):
         self.git("add", ".")
         self.git("commit", "-qm", "fixture")
         return self.git("rev-parse", "HEAD")
+
+    def test_moved_defenses_use_full_trees_and_surviving_function_identities(self):
+        self.init_repo()
+        defenses = {
+            "reflect": 'return getattr(item, "value", None)',
+            "handler": "try:\n    return item.value\nexcept (TypeError, KeyError):\n    return None",
+            "coalesce": 'return item.get("value") or 30',
+        }
+        for name, defense in defenses.items():
+            self.put(
+                f"{name}.py",
+                "def original(item):\n"
+                + textwrap.indent(defense, "    ")
+                + "\n\ndef destination(item):\n    return item.value\n",
+            )
+        self.put(
+            "rename.py", 'def original(item):\n    return getattr(item, "name", None)\n'
+        )
+        self.put(
+            "move.py", 'def relocate(item):\n    return getattr(item, "other", None)\n'
+        )
+        base = self.commit()
+        for name, defense in defenses.items():
+            self.put(
+                f"{name}.py",
+                "def original(item):\n    return item.value\n\ndef destination(item):\n"
+                + textwrap.indent(defense, "    ")
+                + "\n",
+            )
+        self.put(
+            "rename.py", 'def renamed(item):\n    return getattr(item, "name", None)\n'
+        )
+        self.git("mv", "move.py", "relocated.py")
+        result = self.scan("--base", base)
+        moved = [c for c in result["candidates"] if c["rule"] == "PY10a_moved_defense"]
+        self.assertEqual(
+            {c["path"] for c in moved}, {f"{name}.py" for name in defenses}
+        )
+        for candidate in moved:
+            self.assertEqual(candidate["symbol"], "destination")
+            self.assertEqual(candidate["change_tag"], "moved-defense")
+            self.assertIn("original", candidate["evidence"])
+            self.assertIn(candidate["path"], candidate["evidence"])
+            self.assertIn("line", candidate["evidence"])
+            self.assertIn("Counterweight", candidate["verify"])
+        self.assertEqual(
+            {c["rule"] for c in result["candidates"] if c["change_tag"] == "changed"},
+            {"PY01_reflect_default", "PY04_lossy_falsy_coalesce"},
+        )
+
+    def test_moved_defense_maps_git_rename_and_requires_signature_loss(self):
+        self.init_repo()
+        padding = "\n".join(f"# unchanged context {i}" for i in range(40)) + "\n"
+        self.put(
+            "old.py",
+            padding
+            + 'class Owner:\n    def original(self, item):\n        return getattr(item, "value", None)\n\n    def destination(self, item):\n        return item.value\n',
+        )
+        base = self.commit()
+        self.git("mv", "old.py", "new.py")
+        self.put(
+            "new.py",
+            padding
+            + 'class Owner:\n    def original(self, item):\n        return item.value\n\n    def destination(self, item):\n        return hasattr(item, "value")\n',
+        )
+        self.assertIn("R", self.git("diff", "-M", "--name-status", base))
+        moved = [
+            c
+            for c in self.scan("--base", base)["candidates"]
+            if c["rule"] == "PY10a_moved_defense"
+        ]
+        self.assertEqual(len(moved), 1)
+        self.assertEqual(moved[0]["symbol"], "Owner.destination")
+        self.assertEqual(moved[0]["path"], "new.py")
+        self.assertIn("new.py", moved[0]["evidence"])
+        self.put(
+            "new.py",
+            padding
+            + 'class Owner:\n    def original(self, item):\n        return getattr(item, "value", None)\n\n    def destination(self, item):\n        return hasattr(item, "value")\n',
+        )
+        self.assertFalse(
+            [
+                c
+                for c in self.scan("--base", base)["candidates"]
+                if c["rule"] == "PY10a_moved_defense"
+            ]
+        )
+
+    def test_moved_defense_normalizes_signatures_across_files(self):
+        self.init_repo()
+        pairs = [
+            ('return hasattr(item, "field")', 'return getattr(item, "field", 0)'),
+            (
+                "try:\n    return item.field\nexcept (KeyError, TypeError):\n    return None",
+                "try:\n    return item.field\nexcept (errors.TypeError, errors.KeyError):\n    return {}",
+            ),
+            ("return item.field or 30", 'return item.get("field") or 40'),
+        ]
+        for index, (before, _) in enumerate(pairs):
+            self.put(
+                f"old{index}.py",
+                "def original(item):\n" + textwrap.indent(before, "    ") + "\n",
+            )
+            self.put(
+                f"new{index}.py", "def destination(item):\n    return item.field\n"
+            )
+        base = self.commit()
+        for index, (_, after) in enumerate(pairs):
+            self.put(f"old{index}.py", "def original(item):\n    return item.field\n")
+            self.put(
+                f"new{index}.py",
+                "def destination(item):\n" + textwrap.indent(after, "    ") + "\n",
+            )
+        moved = [
+            c
+            for c in self.scan("--base", base)["candidates"]
+            if c["rule"] == "PY10a_moved_defense"
+        ]
+        self.assertEqual({c["path"] for c in moved}, {"new0.py", "new1.py", "new2.py"})
+        for index, (_, after) in enumerate(pairs):
+            self.put(
+                f"new{index}.py",
+                "def destination(item):\n"
+                + textwrap.indent(
+                    after.replace("field", "other").replace("KeyError", "ValueError"),
+                    "    ",
+                )
+                + "\n",
+            )
+        self.assertFalse(
+            [
+                c
+                for c in self.scan("--base", base)["candidates"]
+                if c["rule"] == "PY10a_moved_defense"
+            ]
+        )
+
+    def test_test_smells_legacy_raw_text_getter_mutation_and_self_patch(self):
+        cases = [
+            ("legacy", "obj._legacy_read()", True),
+            ("public", "obj.read()", False),
+            (
+                "source",
+                'text = Path("app.py").read_text()\nassert "class" in text',
+                True,
+            ),
+            (
+                "document",
+                'path = Path("README.md")\ntext = path.read_text()\nself.assertTrue(text.startswith("Title"))',
+                True,
+            ),
+            (
+                "open",
+                'text = open("app.py").read()\nassert text.find("class") >= 0',
+                True,
+            ),
+            ("assert_in", 'self.assertIn("class", open("app.py").read())', True),
+            (
+                "path_chain",
+                'assert "class" in Path(__file__).with_name("app.py").read_text()',
+                True,
+            ),
+            (
+                "open_handle",
+                'with open("app.py") as handle:\n    assert "class" in handle.read()',
+                True,
+            ),
+            (
+                "rebound",
+                'text = Path("app.py").read_text()\ntext = render()\nassert "class" in text',
+                False,
+            ),
+            (
+                "find_data",
+                'text = Path("data.txt").read_text()\nassert text.find("class") >= 0',
+                False,
+            ),
+            (
+                "prefix_data",
+                'text = Path("data.txt").read_text()\nself.assertTrue(text.startswith("Title"))',
+                False,
+            ),
+            ("raw_read_without_path", 'assert "class" in response.read_text()', False),
+            (
+                "nested_scope",
+                'def helper():\n    text = Path("app.py").read_text()\nassert "class" in text',
+                False,
+            ),
+            (
+                "data",
+                'text = Path("data.txt").read_text()\nassert "class" in text',
+                False,
+            ),
+            ("behavior", 'text = render()\nassert "class" in text', False),
+            (
+                "not_assert",
+                'text = Path("app.py").read_text()\nfound = "class" in text',
+                False,
+            ),
+            ("getter", "r = obj.items()\nr.append(1)\nobj.items()", True),
+            ("item", "r = obj.items()\nr[0] = 1\nobj.items()", True),
+            ("extend", "r = obj.items()\nr.extend([1])\nobj.items()", True),
+            ("pop", "r = obj.items()\nr.pop()\nobj.items()", True),
+            ("clear", "r = obj.items()\nr.clear()\nobj.items()", True),
+            (
+                "rebound_getter",
+                "r = obj.items()\nr = []\nr.append(1)\nobj.items()",
+                False,
+            ),
+            ("no_mutation", "r = obj.items()\nobj.items()", False),
+            ("other_getter", "r = obj.items()\nr.clear()\nother.items()", False),
+            ("wrong_order", "r = obj.items()\nobj.items()\nr.pop()", False),
+            ("patch", 'with mock.patch("app.execute"):\n    execute()', True),
+            (
+                "patch_object",
+                'with patch.object(app, "execute"):\n    app.execute()',
+                True,
+            ),
+            (
+                "monkeypatch",
+                'monkeypatch.setattr(app, "execute", replacement)\napp.execute()',
+                True,
+            ),
+            (
+                "monkeypatch_string",
+                'monkeypatch.setattr("app.execute", replacement)\nexecute()',
+                True,
+            ),
+            ("other_patch", 'with patch("app.dependency"):\n    execute()', False),
+            ("inside_patch", 'patch("app.execute", execute())', False),
+            (
+                "patch_object_other",
+                'with patch.object(app, "other"):\n    app.execute()',
+                False,
+            ),
+            (
+                "monkeypatch_other",
+                'monkeypatch.setattr("app.other", replacement)\nexecute()',
+                False,
+            ),
+        ]
+        for label, body, expected in cases:
+            with self.subTest(label=label):
+                self.put(
+                    "tests/test_case.py",
+                    "def test_case(self, obj, other, monkeypatch):\n"
+                    + textwrap.indent(body, "    ")
+                    + "\n",
+                )
+                candidates = self.scan("--paths", "tests/test_case.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected), candidates)
+                if expected:
+                    self.assertEqual(candidates[0]["rule"], "PY10b_test_smell")
+                    self.assertEqual(candidates[0]["symbol"], "test_case")
+                    self.assertIn("Counterweight", candidates[0]["verify"])
+
+    def test_getter_recall_is_checked_before_rebinding_its_result(self):
+        for replacement, expected in [
+            ("result = obj.items()", True),
+            ("result: list = obj.items()", True),
+            ("result = list(obj.items())", True),
+            ("result = other.items()", False),
+            ("result = []", False),
+        ]:
+            with self.subTest(replacement=replacement):
+                self.put(
+                    "tests/test_items.py",
+                    "def test_items():\n"
+                    "    result = obj.items()\n"
+                    "    result.append(1)\n"
+                    f"    {replacement}\n",
+                )
+                candidates = self.scan("--paths", "tests/test_items.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected), candidates)
+                if expected:
+                    self.assertEqual(candidates[0]["rule"], "PY10b_test_smell")
+                    self.assertEqual(candidates[0]["symbol"], "test_items")
+                    self.assertEqual(candidates[0]["span"], [2, 4])
+
+    def test_default_hook_identity_checks_are_production_only(self):
+        for expression, expected in [
+            ("fn is not _DEFAULT_FN", True),
+            ("module._DEFAULT_FN != fn", True),
+            ("fn is _DEFAULT_FN", False),
+            ("fn == _DEFAULT_FN", False),
+            ("fn != DEFAULT_FN", False),
+            ("fn != _DEFAULT_FN != other", False),
+        ]:
+            with self.subTest(expression=expression):
+                self.put("app.py", f"if {expression}:\n    execute()\n")
+                self.put("tests/test_app.py", f"assert {expression}\n")
+                candidates = self.scan("--paths", ".")["candidates"]
+                self.assertEqual(len(candidates), int(expected))
+                if expected:
+                    self.assertEqual(candidates[0]["rule"], "PY10b_test_smell")
+                    self.assertEqual(candidates[0]["path"], "app.py")
+
+    def test_test_smells_scope_decorators_module_reads_and_diff_spans(self):
+        self.init_repo()
+        original = (
+            'TEXT = Path("app.py").read_text()\n'
+            '@patch("app.execute")\ndef test_patched():\n    execute()\n'
+            'def test_read():\n    assert "class" not in TEXT\n'
+            'def test_unrelated():\n    with patch("app.other"):\n        pass\n'
+            "def test_other():\n    other()\n"
+            "def test_getter():\n    r = obj.items()\n    r.extend([1])\n"
+        )
+        self.put("tests/test_app.py", original)
+        base = self.commit()
+        audit = self.scan("--paths", ".")["candidates"]
+        self.assertEqual({c["symbol"] for c in audit}, {"test_patched", "test_read"})
+        self.put("tests/test_app.py", original + "    obj.items()\n")
+        changed = self.scan("--base", base)["candidates"]
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(changed[0]["symbol"], "test_getter")
+        self.assertEqual(changed[0]["change_tag"], "changed")
+
+    def test_module_raw_text_bindings_follow_nested_statements_but_not_scopes(self):
+        for setup, expected in [
+            ('with open("app.py") as handle:\n    TEXT = handle.read()', True),
+            ('if enabled:\n    TEXT = Path("app.py").read_text()', True),
+            (
+                'try:\n    TEXT = Path("app.py").read_text()\nfinally:\n    close()',
+                True,
+            ),
+            ('def helper():\n    TEXT = Path("app.py").read_text()', False),
+            ('class Fixture:\n    TEXT = Path("app.py").read_text()', False),
+            ('with open("data.txt") as handle:\n    TEXT = handle.read()', False),
+            (
+                'if enabled:\n    TEXT = Path("app.py").read_text()\nTEXT = render()',
+                False,
+            ),
+        ]:
+            with self.subTest(setup=setup):
+                self.put(
+                    "tests/test_read.py",
+                    setup + '\ndef test_read():\n    assert "class" in TEXT\n',
+                )
+                candidates = self.scan("--paths", "tests/test_read.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected), candidates)
+                if expected:
+                    self.assertEqual(candidates[0]["rule"], "PY10b_test_smell")
+                    self.assertEqual(candidates[0]["symbol"], "test_read")
+                    self.assertIn(
+                        "raw source/documentation text", candidates[0]["evidence"]
+                    )
+
+    def test_cross_test_references_aliases_ambiguity_and_production_escape(self):
+        self.init_repo()
+        self.put(
+            "app.py",
+            "def lonely():\n    return lonely()\ndef shared():\n    return 1\n",
+        )
+        self.put("other.py", "def shared():\n    return 2\n")
+        self.put(
+            "tests/test_app.py", "from app import lonely as local\nlocal()\nshared()\n"
+        )
+        result = self.scan("--paths", "app.py")
+        candidates = [
+            c
+            for c in result["candidates"]
+            if c["rule"] == "PY10c_cross_test_reachability"
+        ]
+        self.assertEqual(len(candidates), 3)
+        self.assertEqual({c["change_tag"] for c in candidates}, {"cross-test"})
+        self.assertEqual(result["summary"]["cross_checked_files"], 3)
+        for candidate in candidates:
+            self.assertIn("prod calls: 0", candidate["evidence"])
+            self.assertIn("test calls: 1", candidate["evidence"])
+            if candidate["symbol"] == "shared":
+                self.assertIn("ambiguous_defs: 2", candidate["evidence"])
+        for reference in (
+            "lonely()",
+            "callbacks = [lonely]",
+            "from app import lonely as local\nlocal()",
+        ):
+            with self.subTest(reference=reference):
+                self.put("caller.py", reference + "\nshared()\n")
+                self.assertFalse(
+                    [
+                        c
+                        for c in self.scan("--paths", "app.py")["candidates"]
+                        if c["rule"] == "PY10c_cross_test_reachability"
+                    ]
+                )
+
+    def test_rebound_import_aliases_are_escapes_instead_of_resolved_calls(self):
+        self.init_repo()
+        self.put("app.py", "def configure(flag=False):\n    return flag\n")
+        self.put("tests/test_app.py", "configure()\n")
+        for binding in ("from other import unrelated as local", "local = unrelated"):
+            for nested in (False, True):
+                with self.subTest(binding=binding, nested=nested):
+                    caller = (
+                        f"from app import configure as local\n{binding}\nlocal(True)\n"
+                    )
+                    if nested:
+                        caller = "def caller():\n" + textwrap.indent(caller, "    ")
+                    self.put("caller.py", caller)
+                    self.assertEqual(self.scan("--paths", "app.py")["candidates"], [])
+                    as_test = self.scan(
+                        "--paths", "app.py", "--test-glob", "caller.py"
+                    )["candidates"]
+                    self.assertEqual(len(as_test), 1)
+                    self.assertEqual(as_test[0]["change_tag"], "cross-test")
+                    self.assertIn(
+                        "test calls: 1, test non-call refs: 1", as_test[0]["evidence"]
+                    )
+        self.put("caller.py", "from app import configure as local\nlocal(True)\n")
+        resolved = self.scan("--paths", "app.py")["candidates"]
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(resolved[0]["change_tag"], "path-audit")
+        self.assertIn("uniform value: True", resolved[0]["evidence"])
+
+    def test_cross_default_effective_arguments_and_escape_suppression(self):
+        self.init_repo()
+        cases = [
+            (
+                "omitted",
+                "def configure(flag=False):\n    return flag\n",
+                "configure()\nconfigure()",
+                "<DEFAULT>",
+            ),
+            (
+                "constant",
+                "def configure(flag=False):\n    return flag\n",
+                "configure(True)\nconfigure(flag=True)",
+                "True",
+            ),
+            (
+                "mixed",
+                "def configure(flag=False):\n    return flag\n",
+                "configure()\nconfigure(False)",
+                None,
+            ),
+            (
+                "different",
+                "def configure(flag=False):\n    return flag\n",
+                "configure(True)\nconfigure(False)",
+                None,
+            ),
+            (
+                "dynamic",
+                "def configure(flag=False):\n    return flag\n",
+                "configure(value)",
+                None,
+            ),
+            (
+                "callback",
+                "def configure(flag=False):\n    return flag\n",
+                "configure()\ncallbacks = [configure]",
+                None,
+            ),
+            (
+                "star",
+                "def configure(flag=False):\n    return flag\n",
+                "configure()\nconfigure(*args)",
+                None,
+            ),
+            (
+                "kwargs",
+                "def configure(flag=False):\n    return flag\n",
+                "configure()\nconfigure(**options)",
+                None,
+            ),
+            (
+                "export",
+                '__all__ = ["configure"]\ndef configure(flag=False):\n    return flag\n',
+                "configure()",
+                None,
+            ),
+            (
+                "ambiguous",
+                "def configure(flag=False):\n    return flag\nclass Other:\n    def configure(self, flag=False):\n        return flag\n",
+                "configure()",
+                None,
+            ),
+            (
+                "method",
+                "class Runner:\n    def configure(self, value, flag=False):\n        return value, flag\n",
+                "obj.configure(data)\nother.configure(data)",
+                "<DEFAULT>",
+            ),
+            (
+                "method_constant",
+                "class Runner:\n    def configure(self, value, flag=False):\n        return value, flag\n",
+                "obj.configure(data, True)\nother.configure(data, flag=True)",
+                "True",
+            ),
+            (
+                "method_mixed",
+                "class Runner:\n    def configure(self, value, flag=False):\n        return value, flag\n",
+                "obj.configure(data)\nobj.configure(data, False)",
+                None,
+            ),
+            (
+                "class_method",
+                "class Runner:\n    @classmethod\n    def configure(cls, flag=False):\n        return flag\n",
+                "Runner.configure(True)",
+                "True",
+            ),
+            (
+                "static_method",
+                "class Runner:\n    @staticmethod\n    def configure(self=False):\n        return self\n",
+                "Runner.configure(True)",
+                "True",
+            ),
+            (
+                "bare_method",
+                "class Runner:\n    def configure(self, flag=False):\n        return flag\n",
+                "configure(receiver, True)",
+                "True",
+            ),
+            (
+                "keyword_only",
+                "def configure(value, /, *, flag=False):\n    return value, flag\n",
+                "configure(data, flag=True)",
+                "True",
+            ),
+            (
+                "alias",
+                "def configure(flag=False):\n    return flag\n",
+                "from app import configure as local\nlocal(True)",
+                "True",
+            ),
+            (
+                "local_alias",
+                "def configure(flag=False):\n    return flag\n",
+                "def caller():\n    from app import configure as local\n    local(True)",
+                "True",
+            ),
+            (
+                "local_alias_callback",
+                "def configure(flag=False):\n    return flag\n",
+                "def caller():\n    from app import configure as local\n    local(True)\n    callbacks = [local]",
+                None,
+            ),
+            (
+                "annotated_export",
+                "__all__: list[str]\ndef configure(flag=False):\n    return flag\n",
+                "configure()",
+                "<DEFAULT>",
+            ),
+            (
+                "unresolved",
+                "def configure(required, flag=False):\n    return required, flag\n",
+                "configure()",
+                None,
+            ),
+            (
+                "import_only",
+                "def configure(flag=False):\n    return flag\n",
+                "from app import configure",
+                None,
+            ),
+        ]
+        for label, source, calls, uniform in cases:
+            with self.subTest(label=label):
+                self.put("app.py", source)
+                self.put("caller.py", calls + "\n")
+                candidates = [
+                    c
+                    for c in self.scan("--paths", "app.py")["candidates"]
+                    if c["rule"] == "PY10c_cross_test_reachability"
+                ]
+                self.assertEqual(len(candidates), int(uniform is not None), candidates)
+                if uniform is not None:
+                    self.assertEqual(candidates[0]["change_tag"], "path-audit")
+                    self.assertIn(
+                        f"uniform value: {uniform}", candidates[0]["evidence"]
+                    )
+                    self.assertIn("prod call sites", candidates[0]["evidence"])
+                    self.assertEqual(candidates[0]["code"], "False")
+                    self.assertIn("Counterweight", candidates[0]["verify"])
+
+    def test_module_all_mutations_suppress_constant_default_candidates(self):
+        self.init_repo()
+        self.put("app.py", "def configure(flag=False):\n    return flag\n")
+        self.put("caller.py", "configure(True)\n")
+        for exports, expected in [
+            ('__all__.append("configure")', False),
+            ('__all__.extend(["configure"])', False),
+            ('__all__[0] = "configure"', False),
+            ('if exporting:\n    __all__.append("configure")', False),
+            ('declare(__all__, "configure")', False),
+            ('__all__.append("other")', True),
+            ('__all__ = []\nPUBLIC = ["configure"]', True),
+            ('def local_exports():\n    __all__.append("configure")', True),
+            ('class Fixture:\n    __all__.append("configure")', True),
+        ]:
+            with self.subTest(exports=exports):
+                self.put("exports.py", exports + "\n")
+                candidates = self.scan("--paths", "app.py")["candidates"]
+                self.assertEqual(len(candidates), int(expected), candidates)
+                if expected:
+                    self.assertIn("uniform value: True", candidates[0]["evidence"])
+
+    def test_cross_orphaned_deleted_calls_and_deleted_file_inventory(self):
+        self.init_repo()
+        self.put(
+            "app.py", "def orphan():\n    return 1\ndef untouched():\n    return 2\n"
+        )
+        self.put("caller.py", "orphan()\n")
+        base = self.commit()
+        for remaining, expected in [
+            ("orphan()\n", []),
+            ("callbacks = [orphan]\n", []),
+            ("", ["orphan"]),
+        ]:
+            with self.subTest(remaining=remaining):
+                self.put("caller.py", remaining)
+                result = self.scan("--base", base)
+                candidates = [
+                    c
+                    for c in result["candidates"]
+                    if c["rule"] == "PY10c_cross_test_reachability"
+                ]
+                self.assertEqual([c["symbol"] for c in candidates], expected)
+                if expected:
+                    self.assertEqual(candidates[0]["change_tag"], "orphaned")
+                    self.assertEqual(candidates[0]["path"], "app.py")
+        (self.root / "caller.py").unlink()
+        deleted = self.scan("--base", base)
+        self.assertEqual(deleted["summary"]["files_scanned"], 1)
+        self.assertEqual(deleted["summary"]["cross_checked_files"], 1)
+        self.assertEqual(deleted["candidates"][0]["change_tag"], "orphaned")
+        self.put("tests/test_app.py", "orphan()\n")
+        self.assertEqual(
+            self.scan("--base", base)["candidates"][0]["change_tag"], "cross-test"
+        )
+
+    def test_cross_snapshot_isolation_exact_tip_and_default_merge_base(self):
+        self.init_repo()
+        self.put("app.py", "def reachable():\n    return 1\n")
+        self.put("caller.py", "value = 0\n")
+        self.put("tests/test_app.py", "reachable()\n")
+        base = self.commit()
+        self.put("app.py", "def reachable():\n    return 2\n")
+        tip = self.commit()
+        for flags in [("--tip", tip), ("--merge-base",)]:
+            with self.subTest(flags=flags):
+                self.put("caller.py", "value = 0\n")
+                committed = self.scan("--base", base, *flags)
+                self.put("caller.py", "reachable()\n")
+                isolated = self.scan("--base", base, *flags)
+                self.assertEqual(isolated, committed)
+                candidates = isolated["candidates"]
+                self.assertEqual(len(candidates), 1)
+                self.assertEqual(candidates[0]["change_tag"], "cross-test")
+                self.assertIn("prod calls: 0", candidates[0]["evidence"])
+        self.assertEqual(self.scan("--base", base)["candidates"], [])
+
+    def test_cross_cli_parses_each_active_file_at_most_once(self):
+        self.init_repo()
+        self.put("app.py", "def reachable():\n    return 1\n")
+        self.put("caller.py", "from app import reachable as local\nlocal()\n")
+        self.put("unrelated.py", "value = 1\n")
+        self.put("broken.py", "reachable(\n")
+        base = self.commit()
+        self.put("app.py", "def reachable():\n    return 2\n")
+        self.put("broken.py", "reachable((\n")
+        tip = self.commit()
+        stdout = io.StringIO()
+        with (
+            chdir(self.root),
+            redirect_stdout(stdout),
+            patch.object(
+                sys,
+                "argv",
+                [str(SCRIPT), "--base", base, "--tip", tip, "--format", "json"],
+            ),
+            patch("ast.parse", wraps=ast.parse) as parse,
+        ):
+            with self.assertRaises(SystemExit) as exit_:
+                runpy.run_path(str(SCRIPT), run_name="__main__")
+        self.assertEqual(exit_.exception.code, 0)
+        counts = Counter(call.kwargs.get("filename") for call in parse.call_args_list)
+        self.assertEqual(counts["base:app.py"], 1)
+        self.assertEqual(counts["app.py"], 1)
+        self.assertEqual(counts["caller.py"], 1)
+        self.assertEqual(counts["broken.py"], 1)
+        self.assertEqual(counts["unrelated.py"], 0)
+        self.assertTrue(
+            all(
+                count <= 1
+                for filename, count in counts.items()
+                if filename and not filename.startswith("base:")
+            )
+        )
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(result["summary"]["cross_checked_files"], 4)
+        self.assertEqual(result["summary"]["parse_error_count"], 2)
+        self.assertEqual(
+            sum(e["error"].startswith("base: ") for e in result["parse_errors"]), 1
+        )
+
+    def test_cross_target_filters_decorators_diff_scope_and_no_targets(self):
+        self.init_repo()
+        source = "def ordinary():\n    return 1\n"
+        for decorator in (
+            "app.get",
+            "app.route('/x')",
+            "pytest.fixture",
+            "functools.cached_property",
+            "abc.abstractmethod",
+            "registry.register",
+            "onHook",
+            "contextmanager",
+        ):
+            source += f"@{decorator}\ndef routed_{len(source)}():\n    return 1\n"
+        source += "def run():\n    return 1\ndef __magic__():\n    return 1\n"
+        self.put("app.py", source)
+        names = ["ordinary"] + [
+            line.split("(")[0].removeprefix("def ")
+            for line in source.splitlines()
+            if line.startswith("def routed")
+        ]
+        self.put(
+            "tests/test_app.py",
+            "\n".join(f"{name}()" for name in names + ["run", "__magic__"]) + "\n",
+        )
+        result = self.scan("--paths", "app.py")
+        self.assertEqual([c["symbol"] for c in result["candidates"]], ["ordinary"])
+        base = self.commit()
+        self.put("app.py", source + "value = 1\n")
+        self.assertEqual(self.scan("--base", base)["summary"]["cross_checked_files"], 0)
+        self.put("app.py", source.replace("return 1", "return 2", 1))
+        self.assertEqual(
+            self.scan("--base", base)["candidates"][0]["symbol"], "ordinary"
+        )
+        self.put("filtered.py", "@app.getaway\ndef viable():\n    return 1\n")
+        self.put("tests/test_filtered.py", "viable()\n")
+        self.assertEqual(
+            self.scan("--paths", "filtered.py")["candidates"][0]["symbol"], "viable"
+        )
+
+    def test_cross_universe_exclusions_and_test_roles(self):
+        self.init_repo()
+        self.put("app.py", "def reachable():\n    return 1\n")
+        self.put(".gitignore", "ignored/\n")
+        for name in ("ignored/caller.py", "build/caller.py", "omit/caller.py"):
+            self.put(name, "reachable()\n")
+        self.put("checks/case.py", "reachable()\n")
+        (self.root / "binary.py").write_bytes(b"reachable()\x00")
+        (self.root / "link.py").symlink_to(self.root / "ignored/caller.py")
+        self.put("absent.py", "reachable()\n")
+        self.put("redirect/caller.py", "reachable()\n")
+        self.commit()
+        (self.root / "absent.py").unlink()
+        (self.root / "redirect/caller.py").unlink()
+        (self.root / "redirect").rmdir()
+        (self.root / "redirect").symlink_to(
+            self.root / "ignored", target_is_directory=True
+        )
+        result = self.scan(
+            "--paths", "app.py", "--exclude", "omit/*", "--test-glob", "checks/*"
+        )
+        self.assertEqual(result["summary"]["cross_checked_files"], 2)
+        self.assertEqual(result["candidates"][0]["change_tag"], "cross-test")
+        self.assertEqual(
+            self.scan("--paths", "app.py", "--exclude", "omit/*")["candidates"], []
+        )
+
+    def test_base_decode_failure_is_reported_without_disabling_post_analysis(self):
+        self.init_repo()
+        (self.root / "app.py").write_bytes(b"# coding: utf-8\nvalue = '\xff'\n")
+        self.put("deleted.py", "def broken(:\n")
+        base = self.commit()
+        self.put("app.py", 'hasattr(item, "value")\n')
+        (self.root / "deleted.py").unlink()
+        result = self.scan("--base", base)
+        self.assertEqual(result["summary"]["files_scanned"], 2)
+        self.assertEqual(result["summary"]["parse_error_count"], 2)
+        self.assertTrue(
+            all(error["error"].startswith("base: ") for error in result["parse_errors"])
+        )
+        self.assertEqual(result["candidates"][0]["rule"], "PY01_reflect_default")
+
+    def test_cross_non_call_counts_deleted_test_calls_and_default_diff_tags(self):
+        self.init_repo()
+        self.put(
+            "app.py",
+            "async def callback():\n    return 1\n"
+            "def configure(flag=False, *, mode=None):\n    return flag, mode\n"
+            "def idle():\n    return 1\n",
+        )
+        self.put("caller.py", "configure(mode=None)\n")
+        self.put("tests/test_app.py", "callbacks = [callback]\nidle()\n")
+        base = self.commit()
+        self.put("tests/test_app.py", "callbacks = [callback]\n")
+        orphaned = self.scan("--base", base)["candidates"]
+        self.assertEqual(
+            [(c["symbol"], c["change_tag"]) for c in orphaned], [("idle", "orphaned")]
+        )
+        self.put(
+            "app.py",
+            "async def callback():\n    return 2\n"
+            "def configure(flag=False, *, mode=None):\n    return flag, mode, 2\n"
+            "def idle():\n    return 1\n",
+        )
+        candidates = self.scan("--base", base)["candidates"]
+        callback = next(c for c in candidates if c["symbol"] == "callback")
+        self.assertEqual(callback["change_tag"], "cross-test")
+        self.assertIn("test calls: 0, test non-call refs: 1", callback["evidence"])
+        defaults = [c for c in candidates if c["symbol"] == "configure"]
+        self.assertEqual(len(defaults), 2)
+        self.assertEqual({c["change_tag"] for c in defaults}, {"changed"})
+        self.assertEqual({c["code"] for c in defaults}, {"False", "None"})
+        self.put("exports.py", '__all__ = ["configure"]\n')
+        self.assertFalse(
+            [
+                c
+                for c in self.scan("--base", base)["candidates"]
+                if c["symbol"] == "configure"
+            ]
+        )
+
+    def test_moved_defense_handles_non_named_exception_types_without_crashing(self):
+        self.init_repo()
+        self.put(
+            "app.py",
+            "def original():\n    try:\n        action()\n    except (Exception, extra()):\n        return None\n\ndef destination():\n    action()\n",
+        )
+        base = self.commit()
+        self.put(
+            "app.py",
+            "def original():\n    action()\n\ndef destination():\n    try:\n        action()\n    except (extra(), Exception):\n        return None\n",
+        )
+        moved = [
+            c
+            for c in self.scan("--base", base)["candidates"]
+            if c["rule"] == "PY10a_moved_defense"
+        ]
+        self.assertEqual(len(moved), 1)
+        self.assertEqual(moved[0]["symbol"], "destination")
 
     def test_foreign_private_writes_exclude_locally_owned_objects(self):
         for binding, target, expected in [
@@ -718,7 +1559,7 @@ class ScanPythonTests(unittest.TestCase):
             {
                 "mode": "paths",
                 "files_scanned": 1,
-                "cross_checked_files": 0,
+                "cross_checked_files": 1,
                 "candidate_count": 1,
                 "parse_error_count": 0,
             },
@@ -1480,7 +2321,7 @@ class ScanPythonTests(unittest.TestCase):
             self.assertIn("Counterweight", candidate["verify"])
         compact = self.cli("--paths", ".", "--format", "compact")
         self.assertIn(
-            "Scanned 2 files (0 cross-checked); 8 candidates, 0 parse errors", compact
+            "Scanned 2 files (2 cross-checked); 8 candidates, 0 parse errors", compact
         )
         for candidate in result["candidates"]:
             self.assertIn(f"— {candidate['rule']} [path-audit]", compact)
@@ -1685,8 +2526,8 @@ class ScanPythonTests(unittest.TestCase):
             result["summary"],
             {
                 "mode": "diff",
-                "files_scanned": 2,
-                "cross_checked_files": 0,
+                "files_scanned": 3,
+                "cross_checked_files": 2,
                 "candidate_count": 3,
                 "parse_error_count": 0,
             },
@@ -1703,7 +2544,7 @@ class ScanPythonTests(unittest.TestCase):
         result = self.scan(
             "--base", base, "--exclude", "untracked.py", "--test-glob", "changed.py"
         )
-        self.assertEqual(result["summary"]["files_scanned"], 1)
+        self.assertEqual(result["summary"]["files_scanned"], 2)
         self.assertEqual(result["candidates"], [])
 
     def test_git_paths_use_worktree_root_and_bad_refs_exit_two(self):

@@ -3,7 +3,7 @@
 
 import argparse
 import ast
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import fnmatch
 import io
 import json
@@ -51,13 +51,17 @@ class ScanError(Exception):
 class FileChange:
     path: str
     added_lines: set[int] | None = None
+    old_path: str | None = None
+    deleted_lines: set[int] | None = None
+    deleted: bool = False
 
 
-def git(root, *args, allow_non_repo=False):
+def git(root, *args, allow_non_repo=False, input=None):
     result = subprocess.run(
         ["git", "--literal-pathspecs", "-C", str(root), *args],
         env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"},
         capture_output=True,
+        input=input,
     )
     if result.returncode:
         message = result.stderr.decode("utf-8", errors="replace").strip()
@@ -111,11 +115,17 @@ def diff_scope(args):
         status = status_bytes.decode()[0]
         old_path = os.fsdecode(next(names))
         path = os.fsdecode(next(names)) if status == "R" else old_path
-        if (
-            status == "D"
-            or Path(path).suffix != ".py"
-            or excluded(Path(path), args.exclude)
-        ):
+        pre_python = (
+            status in {"M", "R", "D"}
+            and Path(old_path).suffix == ".py"
+            and not excluded(Path(old_path), args.exclude)
+        )
+        post_python = (
+            status != "D"
+            and Path(path).suffix == ".py"
+            and not excluded(Path(path), args.exclude)
+        )
+        if not pre_python and not post_python:
             continue
         patch = git(
             root,
@@ -130,13 +140,22 @@ def diff_scope(args):
         if any(line.startswith(b"Binary files ") for line in patch.splitlines()):
             continue
         added = set()
+        deleted = set()
         for match in re.finditer(
-            rb"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", patch, re.MULTILINE
+            rb"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", patch, re.MULTILINE
         ):
-            start = int(match[1])
-            count = int(match[2]) if match[2] is not None else 1
-            added.update(range(start, start + count))
-        changes.append(FileChange(path, added))
+            for lines, start, count in (
+                (deleted, match[1], match[2]),
+                (added, match[3], match[4]),
+            ):
+                start = int(start)
+                count = int(count) if count is not None else 1
+                lines.update(range(start, start + count))
+        changes.append(
+            FileChange(
+                path, added, old_path if pre_python else None, deleted, not post_python
+            )
+        )
     if tip is None:
         for name in git(root, "ls-files", "--others", "--exclude-standard", "-z").split(
             b"\0"
@@ -144,7 +163,7 @@ def diff_scope(args):
             path = os.fsdecode(name)
             if Path(path).suffix == ".py" and not excluded(Path(path), args.exclude):
                 changes.append(FileChange(path))
-    return root, changes, tip
+    return root, changes, base, tip
 
 
 def matches(path, globs):
@@ -283,6 +302,16 @@ def local_walk(node):
     ):
         for child in ast.iter_child_nodes(node):
             yield from local_walk(child)
+
+
+def lexical_nodes(body):
+    return sorted(
+        (child for statement in body for child in local_walk(statement)),
+        key=lambda child: (
+            getattr(child, "lineno", 0),
+            getattr(child, "col_offset", 0),
+        ),
+    )
 
 
 def terminal_name(node):
@@ -637,9 +666,51 @@ def predicate_tests(node):
     return []
 
 
-class CandidateProbes(ast.NodeVisitor):
-    def __init__(self, source, tree):
+def lookup_signature(values):
+    keys = []
+    for value in values:
+        if isinstance(value, ast.Attribute):
+            keys.append(repr(value.attr))
+        elif isinstance(value, ast.Subscript) and isinstance(value.slice, ast.Constant):
+            keys.append(repr(value.slice.value))
+        elif get_call(value) and value.args and isinstance(value.args[0], ast.Constant):
+            keys.append(repr(value.args[0].value))
+    return tuple(keys) or None
+
+
+class CandidateRecords(ast.NodeVisitor):
+    def __init__(self, source):
         self.source = source
+        self.symbols = []
+        self.candidates = []
+        self.function_depth = 0
+        self.defenses = []
+
+    def add(self, rule, node, evidence, verify, related=(), signature=None):
+        nodes = (node, *related)
+        spans = [(item.lineno, item.end_lineno) for item in nodes]
+        code = "; ".join(ast.get_source_segment(self.source, item) for item in nodes)
+        self.candidates.append(
+            {
+                "rule": rule,
+                "span": [
+                    min(start for start, _ in spans),
+                    max(end for _, end in spans),
+                ],
+                "symbol": ".".join(self.symbols) or "<module>",
+                "code": " ".join(code.split())[:200],
+                "evidence": evidence,
+                "verify": verify,
+                "_spans": spans,
+            }
+        )
+        if signature is not None and self.function_depth:
+            self.defenses.append(((rule, signature), self.candidates[-1]))
+
+
+class CandidateProbes(CandidateRecords):
+    def __init__(self, source, tree):
+        super().__init__(source)
         self.attributes = declarations(tree)
         self.imported = set()
         self.module_imported = import_bindings(local_walk(tree))
@@ -669,27 +740,7 @@ class CandidateProbes(ast.NodeVisitor):
                     for child in local_walk(part):
                         if isinstance(child, ast.expr):
                             self.lock_contexts.setdefault(child, []).append(context)
-        self.symbols = []
-        self.candidates = []
-
-    def add(self, rule, node, evidence, verify, related=()):
-        nodes = (node, *related)
-        spans = [(item.lineno, item.end_lineno) for item in nodes]
-        code = "; ".join(ast.get_source_segment(self.source, item) for item in nodes)
-        self.candidates.append(
-            {
-                "rule": rule,
-                "span": [
-                    min(start for start, _ in spans),
-                    max(end for _, end in spans),
-                ],
-                "symbol": ".".join(self.symbols) or "<module>",
-                "code": " ".join(code.split())[:200],
-                "evidence": evidence,
-                "verify": verify,
-                "_spans": spans,
-            }
-        )
+        self.functions = set()
 
     def generic_visit(self, node):
         for _, value in ast.iter_fields(node):
@@ -750,6 +801,22 @@ class CandidateProbes(ast.NodeVisitor):
                 if any(name in binding_names(child) for child in local_walk(guard)):
                     break
 
+    def visit_Compare(self, node):
+        if len(node.ops) == 1 and isinstance(node.ops[0], (ast.IsNot, ast.NotEq)):
+            if any(
+                (terminal_name(operand) or "").startswith("_DEFAULT_")
+                for operand in (node.left, node.comparators[0])
+            ):
+                self.add(
+                    "PY10b_test_smell",
+                    node,
+                    "Production callable identity is compared with a _DEFAULT_* hook",
+                    "Does the immediate caller require a public replacement hook, or "
+                    "does this only accommodate test patching; is a live extension "
+                    "contract a Counterweight?",
+                )
+        self.generic_visit(node)
+
     def visit_BoolOp(self, node):
         fallback = node.values[-1]
         truth = literal_truth(fallback)
@@ -778,6 +845,7 @@ class CandidateProbes(ast.NodeVisitor):
                 node,
                 f"Lookup coalesces to {ast.unparse(fallback)} at line {node.lineno}",
                 verify,
+                signature=lookup_signature(node.values[:-1]),
             )
         self.generic_visit(node)
 
@@ -788,11 +856,14 @@ class CandidateProbes(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node):
         self.symbols.append(node.name)
+        self.functions.add(".".join(self.symbols))
+        self.function_depth += 1
         self.dead_parameters(node)
         self.typed_parameters(node)
         self.state_smuggling(node)
         self.transaction_checks(node)
         self.generic_visit(node)
+        self.function_depth -= 1
         self.symbols.pop()
 
     visit_AsyncFunctionDef = visit_FunctionDef
@@ -1237,6 +1308,7 @@ class CandidateProbes(ast.NodeVisitor):
                 f"Does the immediate producer or type definition prove the receiver "
                 f"is owned here and guaranteed to define '{attr}', or is it a "
                 "dynamic proxy/plugin/external object (Counterweight)?",
+                signature=attr,
             )
         self.generic_visit(node)
 
@@ -1295,10 +1367,234 @@ class CandidateProbes(ast.NodeVisitor):
                     f"Handler catches {label} at line {handler.lineno}; "
                     + "; ".join(facts),
                     verify,
+                    signature=tuple(sorted(names - {None}))
+                    if caught is not None
+                    else ("bare",),
                 )
         self.generic_visit(node)
 
     visit_TryStar = visit_Try
+
+
+def raw_text_origin(node, bindings):
+    if isinstance(node, ast.Name):
+        return bindings.get(node.id)
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return ("path", (node,)) if node.value.endswith((".py", ".md")) else None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        return raw_text_origin(node.right, bindings) or raw_text_origin(
+            node.left, bindings
+        )
+    if not isinstance(node, ast.Call):
+        return None
+    name = terminal_name(node.func)
+    if name in {"Path", "open"}:
+        for arg in node.args:
+            origin = raw_text_origin(arg, bindings)
+            if origin and origin[0] == "path":
+                return "path", (*origin[1], node)
+        if name == "Path":
+            return "unknown-path", (node,)
+    if isinstance(node.func, ast.Attribute):
+        origin = raw_text_origin(node.func.value, bindings)
+        if origin and origin[0] in {"path", "unknown-path"}:
+            if name in {"read", "read_text"}:
+                return ("text", (*origin[1], node)) if origin[0] == "path" else None
+            for arg in node.args:
+                suffix = raw_text_origin(arg, bindings)
+                if suffix and suffix[0] == "path":
+                    return "path", (*origin[1], *suffix[1], node)
+            return origin
+    return None
+
+
+def patch_symbol(node):
+    path = name_path(node.func)
+    index = None
+    if path in {"patch", "mock.patch", "unittest.mock.patch"}:
+        index = 0
+    elif path in {"patch.object", "mock.patch.object", "unittest.mock.patch.object"}:
+        index = 1
+    elif path == "monkeypatch.setattr":
+        index = 0 if len(node.args) == 2 else 1
+    if index is not None and len(node.args) > index:
+        target = node.args[index]
+        if isinstance(target, ast.Constant) and isinstance(target.value, str):
+            return target.value.rsplit(".", 1)[-1]
+    return None
+
+
+@dataclass
+class GetterReturn:
+    method: str
+    binding: ast.stmt
+    initial: ast.Call
+    mutations: list[ast.AST] = field(default_factory=list)
+
+
+class TestProbes(CandidateRecords):
+    def __init__(self, source, tree):
+        super().__init__(source)
+        self.module_bindings = {}
+        for statement in lexical_nodes(tree.body):
+            self.bind_raw_text(statement, self.module_bindings)
+
+    def smell(self, node, evidence, related=()):
+        self.add(
+            "PY10b_test_smell",
+            node,
+            evidence,
+            "Does the immediate production contract require this test mechanism, "
+            "or can the test exercise observable behavior; is a documented aliasing "
+            "or compatibility contract a Counterweight?",
+            related=related,
+        )
+
+    def bind_raw_text(self, node, bindings):
+        assignment = simple_assignment(node)
+        if assignment:
+            name, value = assignment
+            origin = raw_text_origin(value, bindings)
+            if origin:
+                bindings[name] = origin[0], (*origin[1], node)
+            else:
+                bindings.pop(name, None)
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if isinstance(item.optional_vars, ast.Name):
+                    origin = raw_text_origin(item.context_expr, bindings)
+                    if origin:
+                        bindings[item.optional_vars.id] = origin
+                    else:
+                        bindings.pop(item.optional_vars.id, None)
+
+    def visit_ClassDef(self, node):
+        self.symbols.append(node.name)
+        self.generic_visit(node)
+        self.symbols.pop()
+
+    def visit_Attribute(self, node):
+        if node.attr.startswith("_legacy"):
+            self.smell(
+                node, f"Test accesses private compatibility attribute '{node.attr}'"
+            )
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node):
+        self.symbols.append(node.name)
+        nodes = lexical_nodes(node.body)
+        bindings = self.module_bindings.copy()
+        for param in parameters(node):
+            bindings.pop(param.arg, None)
+        for child in nodes:
+            self.bind_raw_text(child, bindings)
+            expressions = []
+            if isinstance(child, ast.Assert):
+                expressions = [child.test]
+            elif isinstance(child, ast.Call) and name_path(child.func).startswith(
+                "self.assert"
+            ):
+                expressions = child.args
+                if (
+                    terminal_name(child.func) in {"assertIn", "assertNotIn"}
+                    and len(child.args) >= 2
+                ):
+                    self.raw_assertion(child, child.args[1], bindings)
+            for expression in expressions:
+                for check in local_walk(expression):
+                    if isinstance(check, ast.Compare):
+                        for op, right in zip(check.ops, check.comparators):
+                            if isinstance(op, (ast.In, ast.NotIn)):
+                                self.raw_assertion(check, right, bindings)
+                    elif (
+                        isinstance(check, ast.Call)
+                        and isinstance(check.func, ast.Attribute)
+                        and check.func.attr in {"find", "startswith"}
+                    ):
+                        self.raw_assertion(check, check.func.value, bindings)
+        self.getter_mutations(nodes)
+        calls = [child for child in nodes if isinstance(child, ast.Call)]
+        calls += [
+            child
+            for decorator in node.decorator_list
+            for child in ast.walk(decorator)
+            if isinstance(child, ast.Call)
+        ]
+        patches = [(call, patch_symbol(call)) for call in calls if patch_symbol(call)]
+        patch_contents = {child for call, _ in patches for child in ast.walk(call)}
+        for patch, symbol in patches:
+            invoked = next(
+                (
+                    call
+                    for call in calls
+                    if call not in patch_contents and terminal_name(call.func) == symbol
+                ),
+                None,
+            )
+            if invoked:
+                self.smell(
+                    patch,
+                    f"Patch targets directly invoked SUT symbol '{symbol}'",
+                    (invoked,),
+                )
+        self.generic_visit(node)
+        self.symbols.pop()
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def raw_assertion(self, node, operand, bindings):
+        origin = raw_text_origin(operand, bindings)
+        if origin and origin[0] == "text":
+            self.smell(
+                node,
+                "Assertion checks raw source/documentation text from a .py/.md path",
+                tuple(dict.fromkeys(origin[1])),
+            )
+
+    def getter_mutations(self, nodes):
+        getters = {}
+        for node in nodes:
+            assignment = simple_assignment(node)
+            if assignment:
+                name, value = assignment
+                for child in local_walk(value):
+                    if isinstance(child, ast.Call):
+                        self.getter_recall(child, getters)
+                getters.pop(name, None)
+                if isinstance(value, ast.Call) and isinstance(
+                    value.func, ast.Attribute
+                ):
+                    getters[name] = GetterReturn(name_path(value.func), node, value)
+            for target in write_targets(node):
+                if isinstance(target, ast.Subscript) and isinstance(
+                    target.value, ast.Name
+                ):
+                    if target.value.id in getters:
+                        getters[target.value.id].mutations.append(node)
+            if not isinstance(node, ast.Call):
+                continue
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in getters
+                and node.func.attr in {"append", "extend", "pop", "clear"}
+            ):
+                getters[node.func.value.id].mutations.append(node)
+            self.getter_recall(node, getters)
+
+    def getter_recall(self, node, getters):
+        for name, getter in getters.items():
+            if (
+                node is not getter.initial
+                and getter.mutations
+                and name_path(node.func) == getter.method
+            ):
+                self.smell(
+                    getter.binding,
+                    f"Getter '{getter.method}' return '{name}' is mutated before re-call",
+                    (*getter.mutations, node),
+                )
+                getter.mutations.clear()
 
 
 def has_conflict(source):
@@ -1337,60 +1633,514 @@ def render(result, output_format):
         print(f"  Verify: {candidate['verify']}")
 
 
-def scan(root, files, tip, args):
-    candidates = []
-    parse_errors = []
-    files_scanned = 0
-    for change in sorted(files, key=lambda item: item.path):
-        path = root / change.path
-        if tip is None and path.is_symlink():
+def intersects(node, lines):
+    return lines is None or any(
+        line in lines for line in range(node.lineno, node.end_lineno + 1)
+    )
+
+
+def parse_source(raw, path, errors, *, base=False, pattern=None):
+    try:
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
+        source = raw.decode(encoding)
+        if pattern is not None and not pattern.search(source):
+            return None
+        if has_conflict(source):
+            raise SyntaxError("Unresolved merge conflict markers")
+        tree = ast.parse(source, filename=f"base:{path}" if base else path)
+        return source, tree
+    except (SyntaxError, UnicodeError, LookupError) as error:
+        errors.add((path, ("base: " if base else "") + " ".join(str(error).split())))
+        return None
+
+
+def moved_defenses(before, after):
+    """Compare signature presence per function, rather than defense multiplicity."""
+
+    def index(snapshots):
+        return {
+            (path, candidate["symbol"], signature): candidate
+            for path, probes in snapshots.items()
+            for signature, candidate in probes.defenses
+        }
+
+    pre, post = index(before), index(after)
+    surviving = {
+        (path, symbol) for path, probes in after.items() for symbol in probes.functions
+    }
+    lost = {}
+    for (path, symbol, signature), candidate in pre.items():
+        if (path, symbol) in surviving and (path, symbol, signature) not in post:
+            lost.setdefault(signature, []).append((path, symbol, candidate["span"][0]))
+    for identity, candidate in post.items():
+        path, symbol, signature = identity
+        if identity in pre or signature not in lost:
             continue
-        raw = git(root, "show", f"{tip}:{change.path}") if tip else path.read_bytes()
+        origins = [
+            f"{old_path}:{line} ({old_symbol}, pre-change line {line})"
+            for old_path, old_symbol, line in lost[signature]
+            if (old_path, old_symbol) != (path, symbol)
+        ]
+        if origins:
+            yield {
+                **candidate,
+                "rule": "PY10a_moved_defense",
+                "path": path,
+                "change_tag": "moved-defense",
+                "evidence": "Equivalent defense removed from " + "; ".join(origins),
+                "verify": "Did the immediate callee become the owner of this validation, "
+                "or is this a relocated hedge; is the new location a genuine boundary "
+                "(Counterweight)?",
+            }
+
+
+def snapshot_sources(root, tip, excludes):
+    if tip:
+        entries = []
+        for entry in git(root, "ls-tree", "-r", "-z", tip).split(b"\0")[:-1]:
+            metadata, name = entry.split(b"\t", 1)
+            mode, kind, oid = metadata.split()
+            path = Path(os.fsdecode(name))
+            if (
+                kind == b"blob"
+                and mode != b"120000"
+                and path.suffix == ".py"
+                and not excluded(path, excludes)
+            ):
+                entries.append((path.as_posix(), oid))
+        if entries:
+            batch = io.BytesIO(
+                git(
+                    root,
+                    "cat-file",
+                    "--batch",
+                    input=b"".join(oid + b"\n" for _, oid in entries),
+                )
+            )
+            for path, _ in entries:
+                _, kind, size = batch.readline().split()
+                raw = batch.read(int(size))
+                batch.read(1)
+                if b"\x00" not in raw:
+                    yield path, raw
+        return
+    tracked = git(
+        root,
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        allow_non_repo=True,
+    )
+    if tracked is not None:
+        paths = {os.fsdecode(name) for name in tracked.split(b"\0")[:-1]}
+    else:
+        paths = set()
+        for directory, dirs, names in os.walk(root, onerror=raise_walk_error):
+            parent = Path(directory).relative_to(root)
+            dirs[:] = [
+                name
+                for name in dirs
+                if not excluded(parent / name, excludes)
+                and not (root / parent / name).is_symlink()
+            ]
+            paths.update((parent / name).as_posix() for name in names)
+    for name in sorted(paths):
+        path = Path(name)
+        target = root / path
+        if (
+            path.suffix != ".py"
+            or excluded(path, excludes)
+            or any((root / part).is_symlink() for part in (path, *path.parents))
+            or not target.is_file()
+        ):
+            continue
+        raw = target.read_bytes()
+        if b"\x00" not in raw:
+            yield name, raw
+
+
+def target_name(name):
+    return name is not None and len(name) >= 4 and not name.startswith("__")
+
+
+def framework_hook(node):
+    return any(
+        context_tokens(decorator)
+        & {
+            "route",
+            "get",
+            "post",
+            "put",
+            "delete",
+            "patch",
+            "fixture",
+            "property",
+            "abstractmethod",
+            "overload",
+            "contextmanager",
+            "register",
+            "hook",
+        }
+        for decorator in node.decorator_list
+    )
+
+
+@dataclass
+class ImportedAlias:
+    targets: set[str]
+    ambiguous: bool
+
+
+@dataclass
+class ReferenceCounts:
+    calls: list[ast.Call] = field(default_factory=list)
+    non_calls: int = 0
+
+
+class CrossReferences(ast.NodeVisitor):
+    def __init__(self, tree, targets):
+        self.targets = targets
+        self.symbols = []
+        self.own_bodies = []
+        self.aliases = {}
+        self.definitions = []
+        self.references = {name: ReferenceCounts() for name in targets}
+        self.call_funcs = {
+            node.func: node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        }
+        self.visit_scope(tree)
+
+    def visit_scope(self, node):
+        previous = self.aliases
+        self.aliases = previous.copy()
+        local = [child for statement in node.body for child in local_walk(statement)]
+        bindings = {}
+        for child in local:
+            for name in binding_names(child):
+                bindings.setdefault(name, set()).add(child)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for param in parameters(node):
+                bindings.setdefault(param.arg, set()).add(param)
+        for name in bindings:
+            self.aliases.pop(name, None)
+        imports = {}
+        for child in local:
+            if isinstance(child, ast.ImportFrom):
+                for alias in child.names:
+                    if alias.name in self.targets:
+                        imports.setdefault(alias.asname or alias.name, set()).add(
+                            alias.name
+                        )
+        for name, targets in imports.items():
+            self.aliases[name] = ImportedAlias(targets, len(bindings[name]) > 1)
+        for statement in node.body:
+            self.visit(statement)
+        self.aliases = previous
+
+    def visit_FunctionDef(self, node):
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        self.visit(node.args)
+        if node.returns:
+            self.visit(node.returns)
+        self.symbols.append(node.name)
+        if node.name in self.targets:
+            self.definitions.append((node, ".".join(self.symbols)))
+        self.own_bodies.append(node.name)
+        self.visit_scope(node)
+        self.own_bodies.pop()
+        self.symbols.pop()
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node):
+        for expr in (*node.decorator_list, *node.bases, *node.keywords):
+            self.visit(expr)
+        self.symbols.append(node.name)
+        self.visit_scope(node)
+        self.symbols.pop()
+
+    def reference(self, node, name, *, ambiguous=False):
+        if name in self.targets and name not in self.own_bodies:
+            refs = self.references[name]
+            if node in self.call_funcs and not ambiguous:
+                refs.calls.append(self.call_funcs[node])
+            else:
+                refs.non_calls += 1
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Load):
+            if node.id in self.aliases:
+                alias = self.aliases[node.id]
+                for name in alias.targets:
+                    self.reference(node, name, ambiguous=alias.ambiguous)
+            else:
+                self.reference(node, node.id)
+
+    def visit_Attribute(self, node):
+        self.reference(node, node.attr)
+        self.generic_visit(node)
+
+
+def effective_arguments(node, call):
+    positional = node.args.posonlyargs + node.args.args
+    defaults = parameter_defaults(node)
+    if any(isinstance(arg, ast.Starred) for arg in call.args) or any(
+        keyword.arg is None for keyword in call.keywords
+    ):
+        return None
+    offset = int(
+        isinstance(call.func, ast.Attribute)
+        and bool(positional)
+        and positional[0].arg in {"self", "cls"}
+        and not any(
+            terminal_name(dec.func if isinstance(dec, ast.Call) else dec)
+            == "staticmethod"
+            for dec in node.decorator_list
+        )
+    )
+    if len(call.args) > len(positional) - offset and node.args.vararg is None:
+        return None
+    bound = {param.arg: value for param, value in zip(positional[offset:], call.args)}
+    if offset:
+        bound[positional[0].arg] = call.func.value
+    positional_only = {param.arg for param in node.args.posonlyargs}
+    for keyword in call.keywords:
+        name = keyword.arg
+        if name in positional_only or name not in defaults:
+            if node.args.kwarg is None:
+                return None
+        elif name in bound:
+            return None
+        else:
+            bound[name] = keyword.value
+    if any(default is None and name not in bound for name, default in defaults.items()):
+        return None
+    return {
+        name: "<DEFAULT>"
+        if name not in bound
+        else repr(bound[name].value)
+        if isinstance(bound[name], ast.Constant)
+        else None
+        for name, default in defaults.items()
+        if default is not None
+    }
+
+
+def constant_defaults(definition, calls, change_tag):
+    path, source, node, symbol = definition
+    if framework_hook(node):
+        return []
+    bound = [effective_arguments(node, call) for call in calls]
+    if any(arguments is None for arguments in bound):
+        return []
+    record = CandidateRecords(source)
+    record.symbols = symbol.split(".")
+    for name, default in parameter_defaults(node).items():
+        if default is None:
+            continue
+        values = {arguments[name] for arguments in bound}
+        if len(values) == 1 and None not in values:
+            record.add(
+                "PY10c_cross_test_reachability",
+                default,
+                f"Parameter '{name}': {len(calls)} resolved prod call sites; uniform value: {values.pop()}",
+                "Can the immediate production callers remove or inline this parameter/branch, "
+                "or is it a public/external knob (Counterweight)?",
+            )
+    return [
+        {**candidate, "path": path, "change_tag": change_tag}
+        for candidate in record.candidates
+    ]
+
+
+def cross_reachability(root, tip, args, targets, deleted_calls, active_trees, errors):
+    if not targets:
+        return [], 0
+    pattern = re.compile(
+        r"\b(?:" + "|".join(re.escape(name) for name in sorted(targets)) + r")\b"
+    )
+    definitions = {name: [] for name in targets}
+    counts = {
+        name: {"prod": ReferenceCounts(), "test": ReferenceCounts()} for name in targets
+    }
+    checked = 0
+    exported = set()
+    for path, raw in snapshot_sources(root, tip, args.exclude):
+        checked += 1
+        if path in active_trees:
+            parsed = active_trees[path]
+            if parsed and not pattern.search(parsed[0]):
+                continue
+        else:
+            parsed = parse_source(raw, path, errors, pattern=pattern)
+        if not parsed:
+            continue
+        source, tree = parsed
+        file_role = role(Path(path), args.test_glob)
+        refs = CrossReferences(tree, targets)
+        for name in targets:
+            total = counts[name][file_role]
+            total.calls.extend(refs.references[name].calls)
+            total.non_calls += refs.references[name].non_calls
+        if file_role == "prod":
+            for statement in local_walk(tree):
+                if not isinstance(statement, ast.stmt):
+                    continue
+                parts = list(local_walk(statement))
+                if any(
+                    isinstance(child, ast.Name) and child.id == "__all__"
+                    for child in parts
+                ):
+                    exported.update(
+                        child.value
+                        for child in parts
+                        if isinstance(child, ast.Constant)
+                        and isinstance(child.value, str)
+                    )
+            for node, symbol in refs.definitions:
+                definitions[node.name].append((path, source, node, symbol))
+    candidates = []
+    for name, defs in definitions.items():
+        prod = counts[name]["prod"]
+        test = counts[name]["test"]
+        if (
+            len(defs) == 1
+            and name not in exported
+            and not prod.non_calls
+            and prod.calls
+        ):
+            candidates.extend(
+                constant_defaults(
+                    defs[0], prod.calls, "changed" if args.base else "path-audit"
+                )
+            )
+        if prod.calls or prod.non_calls:
+            continue
+        tag = (
+            "cross-test"
+            if test.calls or test.non_calls
+            else "orphaned"
+            if name in deleted_calls
+            else None
+        )
+        if tag is None:
+            continue
+        evidence = (
+            f"Observed prod calls: {len(prod.calls)}, prod non-call refs: {prod.non_calls}; "
+            f"test calls: {len(test.calls)}, test non-call refs: {test.non_calls}"
+        )
+        if len(defs) > 1:
+            evidence += f"; ambiguous_defs: {len(defs)}"
+        for path, source, node, symbol in defs:
+            if framework_hook(node):
+                continue
+            record = CandidateRecords(source)
+            record.symbols = symbol.split(".")
+            record.add(
+                "PY10c_cross_test_reachability",
+                node,
+                evidence,
+                "Does the immediate caller inventory confirm this production entry point "
+                "serves only tests or is orphaned; is a public/dynamic framework contract "
+                "a Counterweight?",
+            )
+            candidates.append({**record.candidates[0], "path": path, "change_tag": tag})
+    return candidates, checked
+
+
+def scan(root, files, base, tip, args):
+    candidates = []
+    parse_errors = set()
+    scanned = set()
+    before, after = {}, {}
+    active_trees = {}
+    targets, deleted_calls = set(), set()
+    for change in sorted(files, key=lambda item: item.path):
+        relative = change.path
+        if change.old_path is not None:
+            raw = git(root, "show", f"{base}:{change.old_path}")
+            if b"\x00" not in raw:
+                scanned.add(relative)
+                parsed = parse_source(raw, change.old_path, parse_errors, base=True)
+                if parsed:
+                    deleted_calls.update(
+                        terminal_name(node.func)
+                        for node in ast.walk(parsed[1])
+                        if isinstance(node, ast.Call)
+                        and intersects(node, change.deleted_lines)
+                        and target_name(terminal_name(node.func))
+                    )
+                if parsed and role(Path(change.old_path), args.test_glob) == "prod":
+                    probes = CandidateProbes(*parsed)
+                    probes.visit(parsed[1])
+                    before[relative] = probes
+        path = root / relative
+        if change.deleted or (tip is None and path.is_symlink()):
+            continue
+        raw = git(root, "show", f"{tip}:{relative}") if tip else path.read_bytes()
         if b"\x00" in raw:
             continue
-        files_scanned += 1
-        relative = change.path
-        try:
-            encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
-            source = raw.decode(encoding)
-            if has_conflict(source):
-                raise SyntaxError("Unresolved merge conflict markers")
-            tree = ast.parse(source, filename=relative)
-        except (SyntaxError, UnicodeError, LookupError) as error:
-            parse_errors.append(
-                {"path": relative, "error": " ".join(str(error).split())}
+        scanned.add(relative)
+        parsed = parse_source(raw, relative, parse_errors)
+        active_trees[relative] = parsed
+        if not parsed:
+            continue
+        is_test = role(Path(relative), args.test_glob) == "test"
+        probes = (TestProbes if is_test else CandidateProbes)(*parsed)
+        probes.visit(parsed[1])
+        if not is_test:
+            after[relative] = probes
+            targets.update(
+                node.name
+                for node in ast.walk(parsed[1])
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and target_name(node.name)
+                and not framework_hook(node)
+                and intersects(node, change.added_lines)
             )
-            continue
-        if role(Path(relative), args.test_glob) == "test":
-            continue
-        probes = CandidateProbes(source, tree)
-        probes.visit(tree)
         for candidate in probes.candidates:
-            spans = candidate.pop("_spans")
             if change.added_lines is not None and not any(
                 line in change.added_lines
-                for start, end in spans
+                for start, end in candidate["_spans"]
                 for line in range(start, end + 1)
             ):
                 continue
-            candidate.update(
-                path=relative, change_tag="changed" if args.base else "path-audit"
+            candidates.append(
+                {
+                    **candidate,
+                    "path": relative,
+                    "change_tag": "changed" if args.base else "path-audit",
+                }
             )
-            candidates.append(candidate)
+    candidates.extend(moved_defenses(before, after))
+    cross, checked = cross_reachability(
+        root,
+        tip,
+        args,
+        targets | deleted_calls,
+        deleted_calls,
+        active_trees,
+        parse_errors,
+    )
+    candidates.extend(cross)
     candidates.sort(key=lambda item: (item["path"], item["span"][0], item["rule"]))
     for index, candidate in enumerate(candidates, 1):
+        candidate.pop("_spans")
         candidate["id"] = f"C{index:02d}"
     return {
         "summary": {
             "mode": "diff" if args.base else "paths",
-            "files_scanned": files_scanned,
-            "cross_checked_files": 0,
+            "files_scanned": len(scanned),
+            "cross_checked_files": checked,
             "candidate_count": len(candidates),
             "parse_error_count": len(parse_errors),
         },
-        "parse_errors": sorted(
-            parse_errors, key=lambda item: (item["path"], item["error"])
-        ),
+        "parse_errors": [
+            {"path": path, "error": error} for path, error in sorted(parse_errors)
+        ],
         "candidates": candidates,
     }
 
@@ -1429,11 +2179,11 @@ def main():
         parser.error("--tip and --merge-base require --base")
     try:
         if args.base:
-            root, files, tip = diff_scope(args)
+            root, files, base, tip = diff_scope(args)
         else:
             root, files = paths_scope(args)
-            tip = None
-        render(scan(root, files, tip, args), args.format)
+            base = tip = None
+        render(scan(root, files, base, tip, args), args.format)
     except (ScanError, OSError) as error:
         print(f"scan_python.py: {error}", file=sys.stderr)
         return 2
