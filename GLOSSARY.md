@@ -22,6 +22,10 @@ _Avoid_: custom linter, ratchet scanner, baseline gate
 A legitimate boundary validation, data-loss recovery path, security check, concurrency guarantee, or externally consumed compatibility shim that resembles defensive code structurally and must be preserved.
 _Avoid_: whitelist, exception rule
 
+**Lint-Owned**:
+A candidate whose exact shape a standard linter or typechecker rule already reports on the same node, and whose defect that rule's prescribed fix fully resolves.
+_Avoid_: linter overlap, too-fine
+
 **Semantic Fidelity**:
 The requirement that normalization, fallback, coalescing, or cleanup preserves distinct domain values (such as `0`, `""`, `[]`, `False`, or explicit `None` clear vs omitted key) without collapsing them into a lossy default.
 _Avoid_: lenient normalization
