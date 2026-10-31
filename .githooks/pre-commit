@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Gate commits on the ruff locked in uv.lock: lint and format-check staged Python files.
+# Checks working-tree content of staged paths, so partially staged files are checked as a whole.
+set -euo pipefail
+
+mapfile -d '' files < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.py' '*.pyi')
+((${#files[@]})) || exit 0
+
+uv run --locked ruff check --force-exclude -- "${files[@]}"
+uv run --locked ruff format --check --force-exclude -- "${files[@]}"

@@ -36,6 +36,7 @@ class ScanPythonTests(unittest.TestCase):
             cwd=cwd or self.root,
             capture_output=True,
             text=True,
+            check=False,
         )
         self.assertEqual(result.returncode, code, result.stderr)
         if code == 0:
@@ -747,9 +748,9 @@ class ScanPythonTests(unittest.TestCase):
                 [str(SCRIPT), "--base", base, "--tip", tip, "--format", "json"],
             ),
             patch("ast.parse", wraps=ast.parse) as parse,
+            self.assertRaises(SystemExit) as exit_,
         ):
-            with self.assertRaises(SystemExit) as exit_:
-                runpy.run_path(str(SCRIPT), run_name="__main__")
+            runpy.run_path(str(SCRIPT), run_name="__main__")
         self.assertEqual(exit_.exception.code, 0)
         counts = Counter(call.kwargs.get("filename") for call in parse.call_args_list)
         self.assertEqual(counts["base:app.py"], 1)
@@ -794,7 +795,7 @@ class ScanPythonTests(unittest.TestCase):
         ]
         self.put(
             "tests/test_app.py",
-            "\n".join(f"{name}()" for name in names + ["run", "__magic__"]) + "\n",
+            "\n".join(f"{name}()" for name in [*names, "run", "__magic__"]) + "\n",
         )
         result = self.scan("--paths", "app.py")
         self.assertEqual([c["symbol"] for c in result["candidates"]], ["ordinary"])

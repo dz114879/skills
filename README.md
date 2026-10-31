@@ -34,3 +34,13 @@ engineering/
 
 - `code-review-lean`
 - `tdd` / `diagnosing-bugs` (when applicable)
+
+## Development
+
+Python scripts must pass the ruff version locked in `uv.lock` (rules in `pyproject.toml`). Enable the pre-commit gate once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+Fix findings with `uv run ruff check --fix` and `uv run ruff format`.

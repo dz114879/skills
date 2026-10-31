@@ -1,0 +1,32 @@
+[project]
+name = "skills"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "ruff>=0.17.3",
+]
+
+[tool.ruff]
+# Skill reference catalogues hand-lay-out their Python examples.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = [
+    "E4", "E7", "E9", "F",  # ruff defaults
+    "B",           # bugbear: likely bugs, incl. silent zip truncation
+    "PLE", "PLW",  # pylint errors/warnings, incl. subprocess.run without check=
+    "I",           # import order
+    "UP",          # syntax upgrades for requires-python
+    "SIM", "C4", "PIE", "PERF",  # simplifications and churn
+    "RUF",         # ruff-specific, incl. RUF100 unused noqa
+    "BLE",         # blind `except Exception` (Error Washing)
+    "ARG",         # unused arguments (Dead Plumbing)
+    "PGH",         # blanket noqa / type: ignore
+]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+lines-after-imports = 2

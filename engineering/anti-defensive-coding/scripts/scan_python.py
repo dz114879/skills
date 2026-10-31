@@ -11,8 +11,8 @@ import os
 from pathlib import Path
 import re
 import subprocess
-import tokenize
 import sys
+import tokenize
 
 
 SKIP_SEGMENTS = {
@@ -62,6 +62,7 @@ def git(root, *args, allow_non_repo=False, input=None):
         env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"},
         capture_output=True,
         input=input,
+        check=False,
     )
     if result.returncode:
         message = result.stderr.decode("utf-8", errors="replace").strip()
@@ -144,12 +145,12 @@ def diff_scope(args):
         for match in re.finditer(
             rb"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", patch, re.MULTILINE
         ):
-            for lines, start, count in (
+            for lines, raw_start, raw_count in (
                 (deleted, match[1], match[2]),
                 (added, match[3], match[4]),
             ):
-                start = int(start)
-                count = int(count) if count is not None else 1
+                start = int(raw_start)
+                count = int(raw_count) if raw_count is not None else 1
                 lines.update(range(start, start + count))
         changes.append(
             FileChange(
@@ -406,9 +407,10 @@ def none_check(node):
 def literal_truth(node):
     if isinstance(node, ast.Constant) and node.value is not None:
         return bool(node.value)
-    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
-        if not any(isinstance(item, ast.Starred) for item in node.elts):
-            return bool(node.elts)
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)) and not any(
+        isinstance(item, ast.Starred) for item in node.elts
+    ):
+        return bool(node.elts)
     if isinstance(node, ast.Dict) and all(key is not None for key in node.keys):
         return bool(node.keys)
     if (
@@ -466,7 +468,9 @@ def parameter_defaults(node):
     values = [None] * (len(positional) - len(node.args.defaults)) + node.args.defaults
     return {
         param.arg: value
-        for param, value in zip(parameters(node), values + node.args.kw_defaults)
+        for param, value in zip(
+            parameters(node), values + node.args.kw_defaults, strict=True
+        )
     }
 
 
@@ -802,19 +806,22 @@ class CandidateProbes(CandidateRecords):
                     break
 
     def visit_Compare(self, node):
-        if len(node.ops) == 1 and isinstance(node.ops[0], (ast.IsNot, ast.NotEq)):
-            if any(
+        if (
+            len(node.ops) == 1
+            and isinstance(node.ops[0], (ast.IsNot, ast.NotEq))
+            and any(
                 (terminal_name(operand) or "").startswith("_DEFAULT_")
                 for operand in (node.left, node.comparators[0])
-            ):
-                self.add(
-                    "PY10b_test_smell",
-                    node,
-                    "Production callable identity is compared with a _DEFAULT_* hook",
-                    "Does the immediate caller require a public replacement hook, or "
-                    "does this only accommodate test patching; is a live extension "
-                    "contract a Counterweight?",
-                )
+            )
+        ):
+            self.add(
+                "PY10b_test_smell",
+                node,
+                "Production callable identity is compared with a _DEFAULT_* hook",
+                "Does the immediate caller require a public replacement hook, or "
+                "does this only accommodate test patching; is a live extension "
+                "contract a Counterweight?",
+            )
         self.generic_visit(node)
 
     def visit_BoolOp(self, node):
@@ -933,7 +940,7 @@ class CandidateProbes(CandidateRecords):
         imported = import_bindings(nodes) | (self.module_imported - bindings.keys())
         for child in nodes:
             if isinstance(child, ast.Dict):
-                for key, value in zip(child.keys, child.values):
+                for key, value in zip(child.keys, child.values, strict=True):
                     self.dict_dependency(key, value)
             if isinstance(child, (ast.Try, ast.TryStar)) and child.finalbody:
                 active = self_state_writes(child.body, reset=False)
@@ -1503,7 +1510,7 @@ class TestProbes(CandidateRecords):
             for expression in expressions:
                 for check in local_walk(expression):
                     if isinstance(check, ast.Compare):
-                        for op, right in zip(check.ops, check.comparators):
+                        for op, right in zip(check.ops, check.comparators, strict=True):
                             if isinstance(op, (ast.In, ast.NotIn)):
                                 self.raw_assertion(check, right, bindings)
                     elif (
@@ -1566,11 +1573,12 @@ class TestProbes(CandidateRecords):
                 ):
                     getters[name] = GetterReturn(name_path(value.func), node, value)
             for target in write_targets(node):
-                if isinstance(target, ast.Subscript) and isinstance(
-                    target.value, ast.Name
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in getters
                 ):
-                    if target.value.id in getters:
-                        getters[target.value.id].mutations.append(node)
+                    getters[target.value.id].mutations.append(node)
             if not isinstance(node, ast.Call):
                 continue
             if (
@@ -1903,7 +1911,11 @@ def effective_arguments(node, call):
     )
     if len(call.args) > len(positional) - offset and node.args.vararg is None:
         return None
-    bound = {param.arg: value for param, value in zip(positional[offset:], call.args)}
+    # Calls may omit defaulted parameters or spill extra args into *args.
+    bound = {
+        param.arg: value
+        for param, value in zip(positional[offset:], call.args, strict=False)
+    }
     if offset:
         bound[positional[0].arg] = call.func.value
     positional_only = {param.arg for param in node.args.posonlyargs}
