@@ -4,7 +4,7 @@
 
 ### Rechecking a guaranteed count row
 
-**Pattern Name & Grade Condition:** Aggregate scalar hedging — `[Simplify]`, **Revalidation**, when the query guarantees one non-null scalar row.
+**Pattern Name & Grade Condition:** Aggregate scalar hedging — `[Simplify]`, **Revalidation**, when the query guarantees one non-null scalar row, or a non-null aggregate in every emitted group.
 
 **Signal (Bad):** Python supplies missing-row, null-cell, and falsy defaults for a query that already guarantees one non-null integer scalar.
 
@@ -20,6 +20,8 @@ count = connection.execute(
     "SELECT COUNT(*) FROM records WHERE active = 1"
 ).fetchone()[0]
 ```
+
+**Per-group guarantee:** Distinguish an absent group from a nullable value inside an emitted group. Each row of a `GROUP BY` result stands for a non-empty group, so its `COUNT(*)` and its `SUM(CASE … THEN 1 ELSE 0 END)` with non-null literal branches are non-null integers that the empty-input caveat below never reaches. A per-row `row["total"] or 0` on such a projection is a dead fallback.
 
 **Counterweight (When to Keep):** `SUM`, `MAX`, and `MIN` can return `NULL` on an empty input, even for a `NOT NULL` column. `GROUP BY` can return zero or multiple rows; `HAVING`, `LIMIT 0`, non-zero `OFFSET`, and an outer filtering query can eliminate the aggregate row. Preserve absent-row and nullable-value handling where those contracts require it, and preserve the distinction between “no value” and zero. A custom adapter that changes row shape/cardinality requires its own contract proof.
 
@@ -63,6 +65,8 @@ class ReleaseSummary:
         )
 ```
 
+**Projected `.get(col, d)`:** A `.get(col, d)` default on a row whose `SELECT` projects `col` never fires, and it does not cover SQL `NULL`: a `NULL` cell still delivers `None` to the consumer. Index the projected column directly and handle `None` explicitly where the column is nullable.
+
 **Counterweight (When to Keep):** When reading cross-version archive tables or external database dumps where an older schema version genuinely lacks a column prior to migration, handle the version boundary explicitly in the migration or versioned reader rather than swallowing `KeyError` across all queries.
 
 ### `NOT NULL` storage integer parsers with `default=0/1` or lossy byte decoding
@@ -91,6 +95,8 @@ def decode_required_int(raw: object, *, field: str) -> int:
         return int(raw)
     raise ValueError(f"Corrupt integer in NOT NULL column {field}: {raw!r}")
 ```
+
+**`int(row[…] or 0)`:** On a `NOT NULL` column whose writers store only integers, `int(row["n"] or 0)` is a dead fallback; it washes no conversion failure, because non-empty corrupt text such as `"N/A"` still raises. It does turn falsy invalid input such as `""` into `0`, so it reaches the Error Washing condition only when the column can actually hold such a value. Consume `row["n"]` directly.
 
 **Counterweight (When to Keep):** User-facing query string parameters or optional configuration inputs at an external HTTP/CLI boundary may legitimately substitute a documented default when the parameter is omitted (`raw is None`), while still rejecting malformed non-empty strings.
 

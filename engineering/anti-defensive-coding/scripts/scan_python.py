@@ -1184,14 +1184,16 @@ class CandidateProbes(CandidateRecords):
                 for value in node.values[:-1]
             )
         ):
-            verify = (
-                'Does the immediate producer permit legitimate 0/""/False values that '
-                "this fallback overwrites, breaching Semantic Fidelity, or does its "
-                "boundary contract explicitly equate them (Counterweight)?"
+            lossy = (
+                'a legitimate 0/""/False, the fallback overwrites it'
                 if truth
-                else "Does the immediate producer guarantee this field, or distinguish "
-                "missing/None from zero/empty state, making this fallback lossy; or is "
-                "that equivalence part of the boundary contract (Counterweight)?"
+                else 'a distinct legitimate one (None vs 0, 0 vs ""), the fallback rewrites it'
+            )
+            verify = (
+                "Can the immediate producer or governing type deliver a falsy value "
+                f"here? If not, the fallback is dead; if it delivers {lossy}. "
+                "Counterweight only if the boundary contract equates missing with "
+                "empty or the producer already rejects empty. See python.md §6."
             )
             self.add(
                 "PY04_lossy_falsy_coalesce",

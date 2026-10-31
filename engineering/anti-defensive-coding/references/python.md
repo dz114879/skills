@@ -384,7 +384,7 @@ def prepare_execution(items: list[dict], archived_decisions=_COMPUTE_FRESH):
 
 ### Falsy `or` coalescing over valid zero, empty, or `False` values
 
-**Pattern Name & Grade Condition:** Lossy falsy coalescing — `[Hard]`, **Error Washing**, when the producer can deliver a legitimate falsy value that the fallback overwrites (broken **Semantic Fidelity**); `[Simplify]`, **Dead Plumbing**, when the producer or governing type cannot deliver a falsy value.
+**Pattern Name & Grade Condition:** Falsy coalescing — the immediate producer or governing type selects one of three outcomes. **Dead fallback**: `[Simplify]`, **Dead Plumbing**, when no falsy value can arrive; a fallback that is harmless because it never fires is dead plumbing. **Lossy fallback**: `[Hard]`, **Error Washing**, when the producer can deliver a legitimate falsy value distinct from the fallback, which the fallback rewrites (broken **Semantic Fidelity**). **Boundary normalization**: a **Counterweight** when the producer's contract equates missing with empty, or the producer already rejects empty so that `or` behaves exactly like `is None`.
 
 **Signal (Bad):** An `or` fallback (`cfg.get("timeout") or 30`, `metrics.get("pending_count") or len(scan_all())`) overwrites legitimate `0`, `0.0`, `""`, `[]`, or `False` domain values with a non-zero default or forces a full cache-miss recomputation whenever the cached result is `0` or `[]`.
 
@@ -395,7 +395,7 @@ def resolve_pending_summary(cfg: dict, metrics: dict, all_items: list) -> tuple[
     return timeout, pending
 ```
 
-**1-Hop Verify & Fix (Good):** Check the domain of the left-hand expression. When `0`, `""`, `[]`, or `False` is a valid value or cached result, test `is not None` (or `key in mapping`) explicitly so **Semantic Fidelity** is preserved.
+**1-Hop Verify & Fix (Good):** Check the domain of the left-hand expression at its immediate producer or governing type. When `0`, `""`, `[]`, or `False` is a valid value or cached result, test `is not None` (or `key in mapping`) explicitly so **Semantic Fidelity** is preserved. When no falsy value can arrive, consume the value directly and delete the fallback.
 
 ```python
 def resolve_pending_summary(cfg: dict, metrics: dict, all_items: list) -> tuple[int, int]:
@@ -406,7 +406,22 @@ def resolve_pending_summary(cfg: dict, metrics: dict, all_items: list) -> tuple[
     return timeout, pending
 ```
 
-**Counterweight (When to Keep):** When empty strings or empty containers are contractually equivalent to missing input at a normalization boundary (e.g., stripping optional blank form text `raw.strip() or None` where `""` means "unset"), `or` coalescing matches the domain rule.
+**Recognition shapes:**
+
+- **Whole expression.** Compare the complete expression, including an enclosing coercion and every operand of an alias chain (`a.get("new") or a.get("old") or ""`). `str(x or "")` erases a numeric `0` or `False` although the fallback is empty. `int(x or 0)` still raises on non-empty invalid text but turns falsy invalid input such as `""` into `0`; call it dead only after establishing the actual producer domain. A fallback can also be an identity operation on an already-normalized string or integer.
+- **Dictionary receiver provenance.** For a dictionary lookup, record the receiver's immediate producer, caller argument, or governing schema, and classify it as a raw boundary map, a producer-normalized map, or an open internal map. Provenance comes from that binding: `dict[str, Any]` establishes neither required keys nor external provenance, and neither does a receiver name such as `args`, `entry`, or `data`. Raw JSON or configuration is a boundary clue, not proof that every falsy value means missing. Conversely, a concrete dictionary constructor or a normalized row adapter can establish a guarantee despite an `Any`-valued annotation.
+- **Dead missing-key default.** `mapping.get(k, d)` on a mapping whose immediate producer always writes `k` never applies `d`: dead plumbing. Rows from a `SELECT` follow `sql.md` §2.
+- **Truthiness that selects an operation.** `method = "POST" if content or data or files or json else "GET"` behind a parsed-JSON producer sends `json={}`, `[]`, `0`, `false`, or `""` with `GET`: a legitimate falsy value selects the wrong operation, which is the lossy outcome. Test presence with `is not None`.
+- **`IfExp` default.** `x if x else d` follows the same three outcomes. `stats["join_count"] if stats else 1` after `INSERT OR IGNORE` and a re-read on the same connection never takes the `else` branch: dead plumbing.
+
+**Counterweight (When to Keep):** The equivalence or rejection belongs to the producer's or governing type's contract; cite that declaration.
+
+- Blank optional form text that means "unset" at a normalization boundary (`raw.strip() or None`).
+- **Governing-type Optional asymmetry.** When the destination type records presence only in Optional sibling fields and its producer documents that split, absent ≡ empty is the schema contract for a non-Optional field, and a fidelity concern belongs to the schema rather than this coalesce. httpx `ParseResult` declares `userinfo: str` and `host: str` but `query: str | None` and `fragment: str | None`, and the parser documents that `None` marks a missing `?` or `#` while the other components may be empty, so `userinfo or ""` and `host or ""` follow the schema. Without that documented split, a required non-Optional field may call for rejecting the missing value instead.
+- **`None`-or-identifier domains.** A codec name or MIME type is either `None` or non-empty (`self._encoding or "utf-8"`, `mimetypes.guess_type(name)[0] or "application/octet-stream"`), so the fallback overwrites no legitimate falsy value.
+- **Presence-keeping accessors.** A delimiter-free public accessor may return `""` for an absent component while the stored form keeps presence (`URL.query` returns bytes without `?`, while `raw_path` keeps `b"/p?"`).
+- **HTTP empty path.** An empty request path is sent as `/` in origin form (`path or "/"`).
+- **CLI `None` defaults.** A string-valued argparse option declared without a default has the domain `None | str`, so `""` is its only falsy value. When the parser or `main()` rejects `""` (`args.tip or "HEAD"` after `main()` rejects `--tip ""`), or `""` equals the fallback (`Path(args.repo or ".")`, since `Path("") == Path(".")`), `or` is exact. A typed option such as `type=int` also delivers `0`; check the parser declaration for every reachable falsy value.
 
 ### Pre-validation `==` diffing (`True == 1`) and lax integer guards
 

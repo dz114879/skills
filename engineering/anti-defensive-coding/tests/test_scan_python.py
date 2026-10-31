@@ -2397,7 +2397,8 @@ class ScanPythonTests(unittest.TestCase):
             },
         )
 
-    def test_lossy_coalesce_distinguishes_value_loss_from_empty_state_washing(self):
+    def test_lossy_coalesce_separates_truthy_and_falsy_fallback_prompts(self):
+        prompts = {True: set(), False: set()}
         for lookup in [
             "data['limit']",
             "config.limit",
@@ -2433,13 +2434,9 @@ class ScanPythonTests(unittest.TestCase):
                     self.assertIn(fallback, candidate["evidence"])
                     self.assertIn("line 2", candidate["evidence"])
                     self.assertIn("Counterweight", candidate["verify"])
-                    if fallback in {"30", "'default'", "True", "-1"}:
-                        self.assertIn("Semantic Fidelity", candidate["verify"])
-                        self.assertIn('0/""/False', candidate["verify"])
-                    else:
-                        self.assertIn("missing/None", candidate["verify"])
-                        self.assertIn("zero/empty", candidate["verify"])
-                        self.assertNotIn("Semantic Fidelity", candidate["verify"])
+                    truthy = fallback in {"30", "'default'", "True", "-1"}
+                    prompts[truthy].add(candidate["verify"])
+        self.assertTrue(prompts[True].isdisjoint(prompts[False]))
         for expression in [
             "value or 30",
             "value or []",
