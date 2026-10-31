@@ -56,7 +56,7 @@ Co-load every matching catalogue; a Python repository test can trigger all three
 - **SQL queries, migrations, repositories, transactions, or backup/restore in any host language** → [SQL/storage catalogue](references/sql.md).
 - **Tests/fixtures, or suspected production test-only scaffolding or monkeypatch trampolines** (`PY10b`/`PY10c` candidates, `_DEFAULT_*` hooks, `_sync_runtime_hooks`) → [Tests catalogue](references/tests.md).
 
-Keep unmatched catalogues unloaded. Catalogue entries supply recognition examples and Counterweights; the four gates govern novel variants too.
+Keep unmatched catalogues unloaded. Catalogue entries supply recognition examples, grade conditions, and Counterweights; the four gates govern novel variants too.
 
 **Completion criterion:** Every triggered reference catalogue is loaded; zero untriggered catalogues are loaded.
 
@@ -66,14 +66,20 @@ For every extractor candidate and manually spotted family pattern, inspect its i
 
 **Unresolved contract:** Suppress a candidate when the 1-hop check cannot establish the upstream producer/type guarantee, or the consumer might rely on an external public/dynamic contract. Preserve any applicable Counterweight. Same-name declarations elsewhere in a file remain clues until tied to the actual receiver.
 
-**Completion criterion:** Every candidate is either confirmed with a concrete 1-hop proof (`file:line` of producer/caller/schema) or dismissed via a Counterweight / unresolved contract.
+**`Any` receiver:** An `Any` or unannotated receiver whose immediate supplier is also `Any`, or which arrives through a dynamic loader or registry, has no governing type at 1 hop. A class found further along the chain is a clue, so the candidate stays unresolved.
+
+**Empty caller inventory:** When a definition has no static callers, check the framework's dispatch mechanism (registration API, by-name loader, inherited hook, abstract interface, export) at its source. Once that dispatch provably does not reach the definition, the empty inventory confirms **Dead Plumbing**, with the dispatch source as the 1-hop proof.
+
+**Lint-Owned:** When a standard linter or typechecker rule already reports the candidate's exact node, confirm the candidate only when a 1-hop defect survives that rule's prescribed fix; otherwise dismiss it as **Lint-Owned**.
+
+**Completion criterion:** Every candidate is either confirmed with a concrete 1-hop proof (`file:line` of producer/caller/schema/dispatch source) or dismissed as a Counterweight, an unresolved contract, or Lint-Owned.
 
 ### 4. Grade & Report
 
-Grade confirmed findings by consequence; catalogue grades are starting hints:
+Grade each confirmed finding by its demonstrated consequence. These clauses are the only grade definitions; a catalogue grade condition names the consequence that selects one of them:
 
-- **`[Hard]`** — Masked internal errors or false success; broken Semantic Fidelity; lock/transaction safety failures; Corruption Test or Zombie Scaffolding defects that mask broken mocks or keep dead production entry points alive.
-- **`[Simplify]`** — Redundant revalidation of established invariants; dead plumbing; single-use pass-through wrappers; avoidable copy/conversion churn; duplicate layer assertions.
+- **`[Hard]`** — Masked internal errors or false success; broken Semantic Fidelity; lock, transaction, or concurrency-isolation safety failures; algorithmic or resource blowup at supported load; Corruption Test or Zombie Scaffolding whose tests mask broken mocks or pin behavior that diverges from the live production path. Every `[Hard]` clause requires that the immediate producer can actually deliver the triggering value; an unreachable trigger makes the defense dead plumbing.
+- **`[Simplify]`** — Every other confirmed finding: redundant revalidation of established invariants; dead plumbing, including zero-reference orphans; dead production helpers retained only by tests; single-use pass-through wrappers; avoidable copy/conversion churn; duplicate layer assertions.
 
 Emit one line per confirmed finding in exactly this form:
 

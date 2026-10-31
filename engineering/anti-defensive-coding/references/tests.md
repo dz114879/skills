@@ -4,7 +4,7 @@
 
 ### Impossible required-field fixture
 
-**Pattern Name & Default Grade Hint:** Impossible required-field fixture — `[Simplify]`, **Implementation-Coupled Tests**.
+**Pattern Name & Grade Condition:** Impossible required-field fixture — `[Simplify]`, **Implementation-Coupled Tests**, when the sole producer rejects the fixture's value, so only a dead fallback depends on it.
 
 **Signal (Bad):** A test overwrites an admitted field with a value its sole producer rejects, solely to keep an internal fallback alive.
 
@@ -27,7 +27,7 @@ def test_renders_admitted_summary():
 
 ### Fabricated internal corruption legitimizing a catch
 
-**Pattern Name & Default Grade Hint:** Self-justifying corruption fixture — `[Hard]`, **Implementation-Coupled Tests**, when it locks in Error Washing that hides production bugs.
+**Pattern Name & Grade Condition:** Self-justifying corruption fixture — `[Hard]`, **Implementation-Coupled Tests**, when the catch it legitimizes can mask production defects (locked-in Error Washing); `[Simplify]` when that catch is dead in production.
 
 **Signal (Bad):** A newly added catch is justified by mutating a validated internal record into a shape that no producer emits.
 
@@ -52,7 +52,7 @@ def test_rejects_malformed_external_columns():
 
 ### Invented metadata sustaining dead degradation
 
-**Pattern Name & Default Grade Hint:** Zero-writer metadata fixture — `[Simplify]`, **Implementation-Coupled Tests**.
+**Pattern Name & Grade Condition:** Zero-writer metadata fixture — `[Simplify]`, **Implementation-Coupled Tests**, when the producer never writes the fabricated metadata.
 
 **Signal (Bad):** Tests fabricate a failure flag or textual status in a current-process result whose producer only emits success or raises.
 
@@ -76,7 +76,7 @@ def test_rejects_failed_input():
 
 ### Fixture bypasses admission
 
-**Pattern Name & Default Grade Hint:** Admission-bypassing fixture — `[Simplify]`, **Implementation-Coupled Tests**.
+**Pattern Name & Grade Condition:** Admission-bypassing fixture — `[Simplify]`, **Implementation-Coupled Tests**, when production always constructs the input through the admission helper.
 
 **Signal (Bad):** A helper feeds raw dictionaries into an internal algorithm that production receives only after admission, sustaining duplicate type/key guards.
 
@@ -98,7 +98,7 @@ def make_test_plan(raw):
 
 ### Mutating read-only getter returns to justify defensive copies
 
-**Pattern Name & Default Grade Hint:** **Corruption Test** — read-only return mutation & defensive copy — `[Simplify]`, **Implementation-Coupled Tests** (for the return-mutating test) / **Redundant Churn** (for the production `list()` copy).
+**Pattern Name & Grade Condition:** **Corruption Test** — read-only return mutation & defensive copy — `[Simplify]`, **Implementation-Coupled Tests** for the return-mutating test and **Redundant Churn** for the production `list()` copy, when no production caller mutates the returned collection.
 
 **Signal (Bad):** An internal read-only accessor copies its stored sequence via `list(...)` on every call even though no production caller mutates the returned collection, and a unit test mutates the returned list in place (`.append(...)`, `.pop()`, or item assignment) and re-calls the getter solely to prove the defensive copy cannot be removed.
 
@@ -140,7 +140,7 @@ def test_rows_exposes_admitted_entries():
 
 ### Synthetic cross-mode call combinations exercising unreachable cache or fallback branches
 
-**Pattern Name & Default Grade Hint:** Synthetic cross-mode branch test — `[Simplify]`, **Implementation-Coupled Tests** (for the synthetic cross-mode test) / **Dead Plumbing** (for the unreachable `_pinned()` branch); `[Hard]`, **Half-Moves & Zombie Scaffolding**, when hanging the method on a shared base class exposes a dead entry point on subclasses.
+**Pattern Name & Grade Condition:** Synthetic cross-mode branch test — `[Simplify]`, **Implementation-Coupled Tests** for the synthetic cross-mode test and **Dead Plumbing** for the unreachable `_pinned()` branch and any zero-caller method subclasses inherit through the shared base; `[Hard]` only when that test pins behavior that diverges from the live production path.
 
 **Signal (Bad):** Production calls `choices()` only on fresh standalone `ChoiceReader` instances outside `detached_snapshot()`, so `self._pinned()` is always `None`; yet a test combines `with reader.detached_snapshot():` and `reader.choices()` solely to exercise the unreachable `_pinned()` branch, while defining `choices()` on `BaseSnapshotReader` leaves `FullBatchProjection` inheriting a zero-caller method.
 
@@ -199,7 +199,7 @@ def test_choices_loads_available_options(db_conn):
 
 ### Zero-production-caller `.apply()` entry points and test-resurrected orphaned repositories
 
-**Pattern Name & Default Grade Hint:** **Zombie Scaffolding** — test-only entry point or orphaned repository — `[Hard]`, **Half-Moves & Zombie Scaffolding** (or `[Simplify]`, **Dead Plumbing**, when `PY10c_cross_test_reachability` reports a live function whose default parameter receives a uniform constant or `<DEFAULT>` at all production call sites).
+**Pattern Name & Grade Condition:** **Zombie Scaffolding** — test-only entry point or orphaned repository — `[Simplify]`, **Half-Moves & Zombie Scaffolding**, for an entry point or helper retained only by tests (`cross-test`); `[Hard]` only when 1-hop evidence shows those tests masking broken mocks or pinning behavior that diverges from the live production path. `[Simplify]`, **Dead Plumbing**, for a zero-reference orphan (`orphaned`) and for a live function whose default parameter receives one uniform production value.
 
 **Signal (Bad):** After production routes cut over to a two-phase `stage()` + `commit_staged()` protocol—or after an upper query service is deleted—a production service retains a zero-production-caller `.apply()` wrapper, or lower-level repository methods and helpers (`InvoiceRepository.list_archived_by_region`, `_coerce_entries`) survive with zero production callers, kept alive only because legacy tests still call `.apply()` or were rewritten during cleanup to call the newly orphaned methods directly.
 
@@ -226,7 +226,7 @@ def test_order_batch_apply(updater):
     assert receipt.committed is True
 ```
 
-**1-Hop Verify & Fix (Good):** Use the **Candidate Extractor**'s `PY10c_cross_test_reachability` candidate to locate the entry point, then verify its immediate caller and export contract. When production callers exclusively use `stage()` + `commit_staged()` and `.apply()` (or an orphaned repository/helper method individually surfaced by `PY10c`) has zero production callers and no external export obligation, delete `.apply()` and confirmed orphaned helpers, and migrate the test to `stage()` + `commit_staged()`. When `PY10c` instead reports a live function whose default parameter has a uniform production value while tests pass other values, verify the immediate callers and inline or remove the dead parameter branch as `[Simplify]`, **Dead Plumbing**.
+**1-Hop Verify & Fix (Good):** Use the **Candidate Extractor**'s `PY10c_cross_test_reachability` candidate to locate the entry point, then verify its immediate caller and export contract. When production callers exclusively use `stage()` + `commit_staged()` and `.apply()` (or an orphaned repository/helper method individually surfaced by `PY10c`) has zero production callers and no external export obligation, delete `.apply()` and confirmed orphaned helpers, and migrate the test to `stage()` + `commit_staged()`. When `PY10c` instead reports a live function whose default parameter has a uniform production value while tests pass other values, verify the immediate callers and inline or remove the dead parameter branch.
 
 ```python
 def test_order_batch_stage_and_commit(updater):
@@ -239,7 +239,7 @@ def test_order_batch_stage_and_commit(updater):
 
 ### Single-user `*_support.py` wrappers and private `._legacy_*` access
 
-**Pattern Name & Default Grade Hint:** Private-legacy test access & single-user support wrapper — `[Hard]`, **Half-Moves & Zombie Scaffolding** (for a dead `._legacy_*` production method/attribute) / **Implementation-Coupled Tests** (for the test or wrapper accessing `._legacy_*`); `[Simplify]`, **Implementation-Coupled Tests**, when a single-consumer `*_support.py` wrapper only adds indirection around a live public API.
+**Pattern Name & Grade Condition:** Private-legacy test access & single-user support wrapper — `[Simplify]`, **Half-Moves & Zombie Scaffolding** for a `._legacy_*` production method kept alive only by tests and **Implementation-Coupled Tests** for the test or wrapper reaching it; `[Hard]` only when those tests mask broken mocks or pin legacy behavior that diverges from the live public path. `[Simplify]`, **Implementation-Coupled Tests**, for a single-consumer `*_support.py` wrapper that only forwards to a live public API.
 
 **Signal (Bad):** A test or a single-consumer `*_test_support.py` helper module bypasses the public service API (`provider.records_by_scope([scope])`) to read or call a private compatibility attribute (`provider._legacy_records([scope])`, flagged by `PY10b_test_smell`), keeping the private `_legacy_*` path alive in production.
 
@@ -252,7 +252,7 @@ def test_scope_records(provider):
     assert load_legacy_scope(provider, "north") == [{"scope": "north", "active": True}]
 ```
 
-**1-Hop Verify & Fix (Good):** Use the **Candidate Extractor**'s `PY10b_test_smell` and `PY10c_cross_test_reachability` candidates, then inspect the receiver's governing class contract, `_legacy_records`' immediate callers, and the support module's importers. When `_legacy_records` has zero production callers and no external compatibility obligation, delete `_legacy_records` and the single-use wrapper module, and assert behavior through `provider.records_by_scope([scope])`. **Live public API variant (`[Simplify]`):** When a single-consumer support wrapper only forwards to a live public API, invoke that public API directly in the test and delete only the wrapper.
+**1-Hop Verify & Fix (Good):** Use the **Candidate Extractor**'s `PY10b_test_smell` and `PY10c_cross_test_reachability` candidates, then inspect the receiver's governing class contract, `_legacy_records`' immediate callers, and the support module's importers. When `_legacy_records` has zero production callers and no external compatibility obligation, delete `_legacy_records` and the single-use wrapper module, and assert behavior through `provider.records_by_scope([scope])`. **Live public API variant:** When a single-consumer support wrapper only forwards to a live public API, invoke that public API directly in the test and delete only the wrapper.
 
 ```python
 def test_scope_records(provider):
@@ -265,7 +265,7 @@ def test_scope_records(provider):
 
 ### Production `getattr` capability probes and `except Exception` blocks for incomplete test doubles
 
-**Pattern Name & Default Grade Hint:** Mock-accommodating production probe or catch — `[Hard]`, **Half-Moves & Zombie Scaffolding** (for the `getattr` capability probe and fallback counters serving only incomplete stubs) / **Error Washing** (for the `except Exception` fallback concealing callback unpacking or runtime errors).
+**Pattern Name & Grade Condition:** Mock-accommodating production probe or catch — `[Hard]`, **Half-Moves & Zombie Scaffolding**, when the `getattr` capability probe and its fallback counters mask incomplete stubs, or **Error Washing** when the `except Exception` fallback masks callback unpacking or runtime errors.
 
 **Signal (Bad):** Every production implementation of `calendar` defines `billable_minutes` and every production `callback` returns a 2-tuple `(result, blocked)`, yet production code probes `getattr(calendar, "billable_minutes", None)` (spawning unreachable fallback flags, counters, and error codes) or wraps `result, blocked = callback(step)` in `except Exception: return StepResult.empty(step.id), set()` solely because unit tests pass an incomplete stub or bare `MagicMock()` whose return value fails tuple unpacking with `ValueError`.
 
@@ -305,7 +305,7 @@ def test_run_step_forwards_billable_minutes():
 
 ### Runtime `_sync_runtime_hooks()` trampolines and `_DEFAULT_*` identity checks
 
-**Pattern Name & Default Grade Hint:** **Zombie Scaffolding** — runtime monkeypatch trampoline — `[Hard]`, **Half-Moves & Zombie Scaffolding**.
+**Pattern Name & Grade Condition:** **Zombie Scaffolding** — runtime monkeypatch trampoline — `[Hard]`, **Half-Moves & Zombie Scaffolding**, when the trampoline or `_DEFAULT_*` check masks tests that patch the wrong lookup site; `[Simplify]`, **Dead Plumbing**, when no test patches the hooked symbol.
 
 **Signal (Bad):** A facade module runs `_sync_runtime_hooks()` on every call to copy monkeypatched facade attributes into submodule globals, or compares `if stop_worker is not _DEFAULT_STOP_HOOK:` in production (`PY10b_test_smell`) solely to detect whether a test monkeypatched `stop_worker`.
 
@@ -337,7 +337,7 @@ def dispatch_order(order: Order) -> str:
 
 ### Self-patched SUT tests mocking the directly invoked function
 
-**Pattern Name & Default Grade Hint:** **Corruption Test** — self-patched system under test — `[Hard]`, **Implementation-Coupled Tests**.
+**Pattern Name & Grade Condition:** **Corruption Test** — self-patched system under test — `[Hard]`, **Implementation-Coupled Tests**, when the active patch replaces the exact binding the test invokes, so the test passes without running the system under test (false success).
 
 **Signal (Bad):** A test patches `orders.dispatch_order` with a canned `return_value` while directly invoking `orders.dispatch_order(...)` inside the active patch (`PY10b_test_smell`), asserting on the mock's return value instead of executing the system under test.
 
@@ -369,7 +369,7 @@ def test_dispatch_order_formats_worker_receipt():
 
 ### Raw source or documentation literal assertions (`read_text` + `in`)
 
-**Pattern Name & Default Grade Hint:** **Corruption Test** — raw source/documentation literal assertion — `[Simplify]`, **Implementation-Coupled Tests** (`[Hard]` when 1-hop diff evidence shows the literal check substitutes for executing changed runtime behavior, locks in dead production code, or makes a false verification claim).
+**Pattern Name & Grade Condition:** **Corruption Test** — raw source/documentation literal assertion — `[Simplify]`, **Implementation-Coupled Tests**; `[Hard]` when 1-hop diff evidence shows the literal check standing in for changed runtime behavior it never executes (false success).
 
 **Signal (Bad):** A test reads a `.py` or `.md` file from disk via `Path(...).read_text()` or `open(...)` and asserts substring membership (`assert "def enforce_workspace_quota" in source_text` or `assert "Quota limit" in guide_text`, flagged by `PY10b_test_smell`) to verify a code change or prose edit without executing runtime behavior.
 
@@ -394,7 +394,7 @@ def test_enforce_workspace_quota_rejects_excess_usage():
 
 ### Hardcoded constant echo-chamber assertions
 
-**Pattern Name & Default Grade Hint:** Constant echo-chamber assertion — `[Simplify]`, **Implementation-Coupled Tests** (for the test echoing a constant) / **Dead Plumbing** (for the unconsumed constant dictionary); `[Hard]`, **Error Washing**, when a hardcoded constant falsely claims verification that never occurred, or `[Hard]`, **Split Paths & Compensation**, when a worker discards an archived admission snapshot and recomputes with wall-clock `date.today()`.
+**Pattern Name & Grade Condition:** Constant echo-chamber assertion — `[Simplify]`, **Implementation-Coupled Tests** for the test echoing a constant and **Dead Plumbing** for the unconsumed constant dictionary; `[Hard]`, **Error Washing**, when the constant reaches a consumer as a claim of verification that never occurred (false success), or **Split Paths & Compensation** when the producer recomputes with wall-clock `date.today()` instead of the archived admission snapshot, so the view reports decisions admission never accepted.
 
 **Signal (Bad):** A test repeats a hardcoded bookkeeping dictionary (`"audit_stamp": {"facts_verified": True, "baseline_matched": True, "verified_at": "admission"}`) that the producer emits unconditionally without any dynamic branch or consumer—and in the worst case, the producer claims `"verified_at": "admission"` while discarding `run.accepted_decisions` and recomputing readiness with wall-clock `current_date()` (`date.today()`).
 

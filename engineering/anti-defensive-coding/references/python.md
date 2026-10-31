@@ -4,7 +4,7 @@
 
 ### Owned attribute hedging
 
-**Pattern Name & Default Grade Hint:** Owned attribute hedging — `[Simplify]`, **Revalidation**.
+**Pattern Name & Grade Condition:** Owned attribute hedging — `[Simplify]`, **Revalidation**, when the receiver's constructor or immediate producer already guarantees the attribute.
 
 **Signal (Bad):** A known local type is treated as a partially initialized dynamic object.
 
@@ -32,7 +32,7 @@ def read_total(reader: Reader):
 
 ### Required model fields disguised as optional or rechecked at runtime
 
-**Pattern Name & Default Grade Hint:** Required-field reflection and type revalidation — `[Simplify]`, **Revalidation**.
+**Pattern Name & Grade Condition:** Required-field reflection and type revalidation — `[Simplify]`, **Revalidation**, when the admission boundary already guarantees the field and its type.
 
 **Signal (Bad):** An admission boundary guarantees a non-null typed field, but a partial internal `SimpleNamespace`, `Optional` field annotation, or runtime `is None` / `isinstance` guard treats the established contract as untrusted.
 
@@ -66,7 +66,7 @@ def describe(item: AcceptedItem) -> str:
 
 ### Required protocol methods probed for incomplete stubs
 
-**Pattern Name & Default Grade Hint:** Test-stub capability fallback — `[Hard]`, **Half-Moves & Zombie Scaffolding**, when it masks a broken test double and sustains a dead production path.
+**Pattern Name & Grade Condition:** Test-stub capability fallback — `[Hard]`, **Half-Moves & Zombie Scaffolding**, when the fallback masks an incomplete test double; `[Simplify]`, **Dead Plumbing**, when every production implementation provides the method and no test reaches the fallback.
 
 **Signal (Bad):** All production implementations provide the protocol method; incomplete test stubs alone exercise the `getattr` fallback and its derived error codes or counters.
 
@@ -96,7 +96,7 @@ class StubSender:
 
 ### Fixed-key internal dict `.get()` hedging and fake sentinel caps
 
-**Pattern Name & Default Grade Hint:** Fixed-shape dict `.get()` hedging — `[Simplify]`, **Revalidation** (`[Hard]`, **Error Washing**, when a missing key silently falls back to stale state or hides a missing SQL projection column).
+**Pattern Name & Grade Condition:** Fixed-shape dict `.get()` hedging — `[Simplify]`, **Revalidation**, when the producer always writes the key; `[Hard]`, **Error Washing**, when the producer can omit the key and the fallback silently substitutes stale state or hides a missing SQL projection column.
 
 **Signal (Bad):** Code reads a fixed-shape dict or row mapping just produced by an owned helper via `.get(key, default)`, falls back to stale state on a missing required key, or fabricates a sentinel upper bound (`start + 30`) before calling a window helper that already clamps against the same `start + 30` limit.
 
@@ -123,7 +123,7 @@ def format_summary(metric: dict) -> dict:
 
 ### Unnarrowed variant dicts vs. discriminated-union narrowing
 
-**Pattern Name & Default Grade Hint:** Unnarrowed variant-dict `.get()` — `[Hard]`, **Error Washing** (or `[Simplify]`, **Revalidation**, when variant narrowing is already established).
+**Pattern Name & Grade Condition:** Unnarrowed variant-dict `.get()` — `[Hard]`, **Error Washing**, when another variant can reach the read and its missing key silently yields a wrong result; `[Simplify]`, **Revalidation**, when narrowing on the discriminant is already established.
 
 **Signal (Bad):** A polymorphic dict varies by an authoritative discriminant key (`kind == "tcp" | "unix"`), and downstream code either papers over variant-specific keys with `.get("port")` or indexes `endpoint["port"]` without narrowing on `endpoint["kind"]` first.
 
@@ -147,7 +147,7 @@ def changed_tcp_port(before: dict, after: dict) -> bool:
 
 ### Import-time static literal and unreachable-default self-checks
 
-**Pattern Name & Default Grade Hint:** Static literal self-check — `[Simplify]`, **Revalidation** / **Dead Plumbing**.
+**Pattern Name & Grade Condition:** Static literal self-check — `[Simplify]`, **Revalidation**, when the validated table is a module-owned literal, or **Dead Plumbing** when the validated config section has no producer.
 
 **Signal (Bad):** A module defines a hardcoded constant table and immediately runs an import-time validator over its own literal, or maintains a full whitelist/range validator around a config sub-dict that no producer ever populates (repeatedly validating its own hardcoded defaults).
 
@@ -180,7 +180,7 @@ _COLUMN_RULES = {
 
 ### Repeated linear scan over static specification tables
 
-**Pattern Name & Default Grade Hint:** Repeated static-table linear scan — `[Simplify]`, **Redundant Churn**.
+**Pattern Name & Grade Condition:** Repeated static-table linear scan — `[Simplify]`, **Redundant Churn**, when the table is fixed at import time.
 
 **Signal (Bad):** Every lookup linearly scans an immutable module-level tuple or rebuilds a temporary dictionary instead of indexing a prebuilt map.
 
@@ -218,7 +218,7 @@ def get_header_spec(name: str) -> HeaderSpec:
 
 ### Broad or migrated internal exception washing
 
-**Pattern Name & Default Grade Hint:** Internal exception washing / **Moved Defense** — `[Hard]`, **Error Washing** (and **Half-Moves & Zombie Scaffolding** when relocated into callees during a refactor).
+**Pattern Name & Grade Condition:** Internal exception washing / **Moved Defense** — `[Hard]`, **Error Washing**, when an internal defect the guarded code can raise becomes a fallback value or false success at the caller; add **Half-Moves & Zombie Scaffolding** when the catch was relocated into callees during a refactor.
 
 **Signal (Bad):** Internal typed computation is wrapped in `except Exception:` or a multi-exception tuple (`KeyError`, `TypeError`, `AttributeError`, `ValueError`, `OverflowError`) that returns a fallback value or gets copy-pasted/migrated into downstream constructors and helpers when an upstream catch is removed.
 
@@ -241,7 +241,7 @@ def compute_allocation(plan: ValidatedPlan) -> dict[str, int]:
 
 ### `json.loads(..., object_pairs_hook=...)` washed under `except ValueError`
 
-**Pattern Name & Default Grade Hint:** Hook rejection diagnostic erasure — `[Hard]`, **Error Washing**.
+**Pattern Name & Grade Condition:** Hook rejection diagnostic erasure — `[Hard]`, **Error Washing**, when the hook's specific rejection is masked behind the generic parse error or fallback.
 
 **Signal (Bad):** `json.loads` uses an `object_pairs_hook` that raises a `ValueError`-subclassed domain exception on duplicate or forbidden keys, while the enclosing `try` catches `ValueError` or `Exception` (instead of `json.JSONDecodeError`) and returns a fallback or raises a generic parse error that erases the hook's specific rejection message.
 
@@ -269,7 +269,7 @@ def parse_payload(raw: str) -> dict:
 
 ### Premature default shadowing a required-value guard
 
-**Pattern Name & Default Grade Hint:** Default-shadowed validation — `[Hard]`, **Error Washing**.
+**Pattern Name & Grade Condition:** Default-shadowed validation — `[Hard]`, **Error Washing**, when the producer can omit the required value and the default lets it pass the check as valid input; `[Simplify]`, **Dead Plumbing**, when the producer always supplies it, leaving both default and check dead.
 
 **Signal (Bad):** A lookup applies a non-`None` fallback via `or` (making `if val is None:` unreachable) or `.get(k, default)` (shadowing missing keys unless `None` is explicitly stored), or calls a parser helper that returns a default string on missing input, and the following lines check `if val is None:` or `if not val:` to reject missing keys (**Lossy Coalescing**).
 
@@ -299,7 +299,7 @@ def parse_shift(row: dict) -> tuple[str, str]:
 
 ### Corrupt context downgraded to `None` or conflated with omitted-argument `None` sentinel
 
-**Pattern Name & Default Grade Hint:** Corrupt-state `None` conflation — `[Hard]`, **Error Washing**.
+**Pattern Name & Grade Condition:** Corrupt-state `None` conflation — `[Hard]`, **Error Washing**, when a caller can pass corrupt stored `None` and it silently triggers recomputation instead of rejection.
 
 **Signal (Bad):** Corrupt context is downgraded to `None` (`batch = None if problem else load_batch(ctx)`), bypassing downstream guards (`if batch and ...: raise`), or a function uses `param=None` as its omitted-argument sentinel while callers pass a deserialized stored field that can be `None` when storage is corrupt—silently triggering recomputation instead of rejecting corrupt storage.
 
@@ -334,7 +334,7 @@ def prepare_execution(items: list[dict], archived_decisions=_COMPUTE_FRESH):
 
 ### Falsy `or` coalescing over valid zero, empty, or `False` values
 
-**Pattern Name & Default Grade Hint:** Lossy falsy coalescing — `[Hard]`, **Error Washing** (**Semantic Fidelity** breach).
+**Pattern Name & Grade Condition:** Lossy falsy coalescing — `[Hard]`, **Error Washing**, when the producer can deliver a legitimate falsy value that the fallback overwrites (broken **Semantic Fidelity**); `[Simplify]`, **Dead Plumbing**, when the producer or governing type cannot deliver a falsy value.
 
 **Signal (Bad):** An `or` fallback (`cfg.get("timeout") or 30`, `metrics.get("pending_count") or len(scan_all())`) overwrites legitimate `0`, `0.0`, `""`, `[]`, or `False` domain values with a non-zero default or forces a full cache-miss recomputation whenever the cached result is `0` or `[]`.
 
@@ -360,7 +360,7 @@ def resolve_pending_summary(cfg: dict, metrics: dict, all_items: list) -> tuple[
 
 ### Pre-validation `==` diffing (`True == 1`) and lax integer guards
 
-**Pattern Name & Default Grade Hint:** Pre-validation boolean/numeric conflation — `[Hard]`, **Error Washing** (**Semantic Fidelity** breach).
+**Pattern Name & Grade Condition:** Pre-validation boolean/numeric conflation — `[Hard]`, **Error Washing**, when unvalidated input can carry a `bool`, Unicode digit, fractional value, or missing `NOT NULL` value that the diff or parser accepts as valid (broken **Semantic Fidelity**).
 
 **Signal (Bad):** Raw input fields are filtered against existing values with `v != current[k]` *before* type validation—allowing `True` / `False` to pass as unchanged `1` / `0` (`True == 1` and `False == 0` in Python)—or integer parsers use `str.isdigit()` (which accepts Unicode superscripts like `"²"`), `int(Decimal("1.5"))` truncation, `default=0` on `NOT NULL` storage columns, or `isinstance(v, int)` without excluding `bool`.
 
@@ -389,7 +389,7 @@ def changed_numeric_fields(incoming: dict, current: dict) -> dict:
 
 ### Linter-evading dead parameters (`_ = param`, entry overwrite, dual-parameter fallback)
 
-**Pattern Name & Default Grade Hint:** Linter-evading dead parameter — `[Simplify]`, **Dead Plumbing**.
+**Pattern Name & Grade Condition:** Linter-evading dead parameter — `[Simplify]`, **Dead Plumbing**, when no caller relies on the discarded or overwritten parameter.
 
 **Signal (Bad):** A function silences unused-argument checks via `_ = param`, overwrites a parameter in its entry prefix before reading it (`metrics = prepared["metrics"]`), or keeps an old parent container alongside a new pre-extracted slice parameter with an unreachable fallback (`if item_slice is None: item_slice = parent_map.get(item.id)`).
 
@@ -413,7 +413,7 @@ def score_item(item_timeline: list) -> int:
 
 ### Ubiquitous `context=None` fallback chains across internal callees
 
-**Pattern Name & Default Grade Hint:** Pseudo-optional context fallback chain — `[Simplify]`, **Dead Plumbing** (`[Hard]`, **Half-Moves & Zombie Scaffolding**, when the fallback keeps dead repository methods alive).
+**Pattern Name & Grade Condition:** Pseudo-optional context fallback chain — `[Simplify]`, **Dead Plumbing**, when every production entry point passes a context; the repository methods only the fallback reaches belong to the same finding.
 
 **Signal (Bad):** Every production entry point constructs a transaction/read context and passes it down, yet internal helpers declare `context=None` and repeat `context.items if context is not None else ItemRepository(conn).list_items()` across layers.
 
@@ -441,7 +441,7 @@ def resolve_references(plan_id: str, context: ReadContext):
 
 ### Cross-object state and dependency smuggling
 
-**Pattern Name & Default Grade Hint:** Hidden state or dependency smuggling — `[Hard]`, **Hidden Flow**.
+**Pattern Name & Grade Condition:** Hidden state or dependency smuggling — `[Simplify]`, **Hidden Flow**; `[Hard]` only when the smuggled state causes a listed consequence, such as transient `self` state shared across concurrent or reentrant calls.
 
 **Signal (Bad):** Code stashes private `_attr` fields onto a foreign service/snapshot object and probes them downstream with `getattr(..., None)`, sets `self.active_tokens = ...` or `repo.revisions = ...` inside a `try` block and resets it to `None` in `finally:`, attaches extra functions/maps as attributes on a function object (`fn.prepared = ...`), or mutates `facts["reader"] = reader` to smuggle a database reader into a pure calculation dict.
 
@@ -474,7 +474,7 @@ class ProjectionRunner:
 
 ### Production monkeypatch trampolines, `_DEFAULT_*` hook checks, and dropped mode flags
 
-**Pattern Name & Default Grade Hint:** Runtime test-hook trampoline & mock accommodation — `[Hard]`, **Half-Moves & Zombie Scaffolding** / **Error Washing**.
+**Pattern Name & Grade Condition:** Runtime test-hook trampoline & mock accommodation — `[Hard]`, **Half-Moves & Zombie Scaffolding**, when the hook sync or `_DEFAULT_*` check masks tests that patch the wrong lookup site, or a dropped mode flag silently runs the lenient path for a caller that requested strict mode; **Error Washing** when the catch masks a broken mock's unpacking error.
 
 **Signal (Bad):** A facade module runs `_sync_runtime_hooks()` on every call to copy monkeypatched attributes into submodule globals, branches on `if fn is not _DEFAULT_FN:` in production to detect test monkeypatching, drops `kwargs.pop("strict_mode", False)` in an intermediate dispatcher so downstream `strict_mode: bool = False` defaults permanently run the lenient path, or wraps a callback in `except Exception: return result, set()` to swallow `MagicMock` tuple-unpacking `ValueError`s.
 
@@ -512,7 +512,7 @@ def execute_step(step: Step, callback, **kwargs) -> tuple[StepResult, set[str]]:
 
 ### Single-caller throw-catch circles and single-policy dispatchers
 
-**Pattern Name & Default Grade Hint:** Single-caller throw-catch circle / ghost polymorphism — `[Hard]`, **Error Washing** / **Half-Moves & Zombie Scaffolding** (or `[Simplify]` for pure pass-through shims and re-export shells).
+**Pattern Name & Grade Condition:** Single-caller throw-catch circle / ghost polymorphism — `[Hard]`, **Error Washing**, when the caller's catch can mask defects beyond the helper's own raise (such as a `TypeError` from construction); `[Simplify]`, **Half-Moves & Zombie Scaffolding** or **Dead Plumbing**, for an exact throw-catch circle, a single-policy dispatcher's dead branches, a pure pass-through shim, or a re-export shell.
 
 **Signal (Bad):** A helper with a single caller raises an exception when an optional object is `None`, and its sole caller immediately catches `(DomainError, ValueError, TypeError)` to turn it back into `None`; or a codebase with only one live policy/table/schema version still packs `"policy": "portfolio"` into a dict to branch on `cfg.get("policy") == "portfolio"`, threads `source_table` / `(version, source_table)` across layers, or leaves single-line alias wrappers and pure re-export modules after a move.
 
@@ -548,7 +548,7 @@ class Validator:
 
 ### Read-side `.strip()` identity collapse and single-method bypass subclasses
 
-**Pattern Name & Default Grade Hint:** Read-side identity `.strip()` & bypass subclass — `[Hard]`, **Split Paths & Compensation** (**Semantic Fidelity** breach).
+**Pattern Name & Grade Condition:** Read-side identity `.strip()` & bypass subclass — `[Hard]`, **Split Paths & Compensation**, when stored keys can differ only by whitespace, so the read path collapses distinct records (broken **Semantic Fidelity**); `[Simplify]`, **Revalidation**, when admission already guarantees stripped keys.
 
 **Signal (Bad):** A read or lookup path calls `.strip()` on persisted entity keys—collapsing distinct stored records `" B1 "` and `"B1"` into the same identity and hijacking sibling records—and a caller works around the bug by defining a single-method subclass solely to override the method without `.strip()`.
 
@@ -580,7 +580,7 @@ class BaseQueryService:
 
 ### Serialization, datetime, and `int(float(x))` round-trip conversions
 
-**Pattern Name & Default Grade Hint:** Precision-losing or redundant round-trip conversion — `[Hard]`, **Error Washing** / **Redundant Churn** when `int(float(x))` loses 64-bit integer precision (`> 2^53`); `[Simplify]`, **Redundant Churn**, for `json.loads(json.dumps(x))`, `fromisoformat(dt.isoformat())`, and `set(list(set(x)))`.
+**Pattern Name & Grade Condition:** Precision-losing or redundant round-trip conversion — `[Hard]`, **Error Washing**, when `int(float(x))` can receive integers above `2^53` or fractional values and silently rounds or truncates them (broken **Semantic Fidelity**); `[Simplify]`, **Redundant Churn**, for `json.loads(json.dumps(x))`, `fromisoformat(dt.isoformat())`, `set(list(set(x)))`, and an `int(float(x))` whose producer delivers only integers within `2^53`.
 
 **Signal (Bad):** Code uses `json.loads(json.dumps(x))` as an internal deep copy or self-check, converts a parsed `datetime` to `.isoformat()` only for the next layer to call `datetime.fromisoformat(...)`, wraps `set(list(set(items)))`, or routes integer validation through `int(float(value))`—which silently rounds 64-bit integers `> 2^53` (`9007199254740993` becomes `9007199254740992`).
 
@@ -611,7 +611,7 @@ def build_event(payload: dict, started_at: datetime) -> tuple[dict, datetime]:
 
 ### Redundant `[dict(r)]`, `dataclasses.asdict()`, and defensive container copies
 
-**Pattern Name & Default Grade Hint:** Unaliased copy churn — `[Simplify]`, **Redundant Churn**.
+**Pattern Name & Grade Condition:** Unaliased copy churn — `[Simplify]`, **Redundant Churn**, when no consumer mutates or retains the copied value.
 
 **Signal (Bad):** Code wraps `[dict(row) for row in self.fetchall()]` when `fetchall()` already materializes fresh dicts, calls `dataclasses.asdict(item)` or `deepcopy(item)` inside a loop over immutable scalar dataclasses, or copies a list at both caller and callee when neither mutates it in place.
 
@@ -635,7 +635,7 @@ def summarize_results(repo, results: list[OutcomeRecord]) -> list[dict]:
 
 ### Hot-loop `copy(obj)` busting `id(obj)` caches and unique row IDs in shared cache keys
 
-**Pattern Name & Default Grade Hint:** Cache-busting copy & zero-hit cache key — `[Simplify]`, **Redundant Churn** (`[Hard]` when 0% cache hits cause algorithmic blowup at supported load).
+**Pattern Name & Grade Condition:** Cache-busting copy & zero-hit cache key — `[Simplify]`, **Redundant Churn**; `[Hard]` when the 0% hit rate causes algorithmic blowup at supported load.
 
 **Signal (Bad):** A hot loop calls `copy(base_item)` on every iteration to override 1–2 fields while downstream caches key on `id(item)` (busting every `id()` cache), or a shared window/group cache includes a per-row unique identifier (`entry_id`) in its cache key `(entry_id, range_start, range_end)`, guaranteeing a 0% cross-row hit rate.
 

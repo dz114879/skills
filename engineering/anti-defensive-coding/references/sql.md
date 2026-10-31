@@ -4,7 +4,7 @@
 
 ### Rechecking a guaranteed count row
 
-**Pattern Name & Default Grade Hint:** Aggregate scalar hedging — `[Simplify]`, **Revalidation**.
+**Pattern Name & Grade Condition:** Aggregate scalar hedging — `[Simplify]`, **Revalidation**, when the query guarantees one non-null scalar row.
 
 **Signal (Bad):** Python supplies missing-row, null-cell, and falsy defaults for a query that already guarantees one non-null integer scalar.
 
@@ -27,7 +27,7 @@ count = connection.execute(
 
 ### `from_row` swallowing `KeyError` across divergent `SELECT` projections
 
-**Pattern Name & Default Grade Hint:** Missing-column `KeyError` washing in `from_row` — `[Hard]`, **Error Washing** (when missing required columns are defaulted into silent `None`/`""`) or **Split Paths & Compensation** (when `from_row` compensates for divergent `SELECT` column sets across callers).
+**Pattern Name & Grade Condition:** Missing-column `KeyError` washing in `from_row` — `[Hard]`, **Error Washing** (or **Split Paths & Compensation** when it absorbs divergent `SELECT` column sets across callers), when a feeding query can omit a required column and `from_row` silently defaults it to `None` or `""`; `[Simplify]`, **Dead Plumbing**, when every feeding query projects the column.
 
 **Signal (Bad):** A model's `from_row` uses a `KeyError`-swallowing helper (`row.get(key, default)` or `try: row[key] except (KeyError, IndexError): return default`) so one broad model constructor can absorb divergent `SELECT` column sets and dead model fields—silently turning omitted SQL columns (`published_rev`, `notes`) into `None` or `""`.
 
@@ -67,7 +67,7 @@ class ReleaseSummary:
 
 ### `NOT NULL` storage integer parsers with `default=0/1` or lossy byte decoding
 
-**Pattern Name & Default Grade Hint:** Corrupt `NOT NULL` storage integer washing — `[Hard]`, **Error Washing** (**Semantic Fidelity** breach).
+**Pattern Name & Grade Condition:** Corrupt `NOT NULL` storage integer washing — `[Hard]`, **Error Washing**, when corrupt raw storage the parser can receive becomes a valid-looking `0` or `1` (broken **Semantic Fidelity**); `[Simplify]`, **Dead Plumbing**, when the column's writers and row adapter make the default unreachable.
 
 **Signal (Bad):** A storage parser for `NOT NULL` integer columns (`revision`, `item_count`) supplies `default=0` or `default=1` on conversion failure, decodes `bytes` with `errors="ignore"`, truncates fractional `Decimal`/`float` values via `int()`, or relies on `str.isdigit()` (which accepts Unicode superscripts like `"²"` that fail `int()`)—turning corrupt stored values (`None`, `"N/A"`, `"1.5"`, corrupt bytes) into valid-looking `0` or `1`.
 
@@ -98,7 +98,7 @@ def decode_required_int(raw: object, *, field: str) -> int:
 
 ### Double-copying fresh repository row mappings
 
-**Pattern Name & Default Grade Hint:** Redundant row-dict copy churn — `[Simplify]`, **Redundant Churn**.
+**Pattern Name & Grade Condition:** Redundant row-dict copy churn — `[Simplify]`, **Redundant Churn**, when the base helper already returns fresh, unaliased `dict` objects.
 
 **Signal (Bad):** A repository base helper (`self.fetchall(...)` / `self.fetchone(...)`) already materializes fresh `dict` instances from `sqlite3.Row`, and the calling repository method or service immediately wraps the result in `[dict(row) for row in self.fetchall(...)]` or `dict(row)`.
 
@@ -129,7 +129,7 @@ class InvoiceStore(RowStore):
 
 ### Same-snapshot probe-then-fetch and repeated `PRAGMA` metadata queries
 
-**Pattern Name & Default Grade Hint:** Same-snapshot redundant query / metadata re-probe — `[Simplify]`, **Redundant Churn** (when re-fetching data or metadata) or **Revalidation** (when rechecking existence/schema guarantees already established in the same snapshot).
+**Pattern Name & Grade Condition:** Same-snapshot redundant query / metadata re-probe — `[Simplify]`, **Redundant Churn**, when the repeat re-fetches data or metadata already read in the same snapshot, or **Revalidation** when it rechecks existence or schema guarantees established there.
 
 **Signal (Bad):** Within a single read snapshot or write transaction, code probes a table by key to get an ID (`find_by_token`) and immediately queries the same entity again (`get_state(shipment_id)`), re-runs quota/existence checks just verified in the same transaction, or executes `PRAGMA table_info(t)`, `PRAGMA index_list(t)`, or `SELECT sql FROM sqlite_master` more than once for the same table inside one schema check while the schema is unchanged.
 
@@ -183,7 +183,7 @@ def verify_ledger_table(conn) -> None:
 
 ### Partial-slice query feeding a full relational closure check
 
-**Pattern Name & Default Grade Hint:** Partial-slice closure validation bug — `[Hard]`, **Split Paths & Compensation** (**Semantic Fidelity** breach).
+**Pattern Name & Grade Condition:** Partial-slice closure validation bug — `[Hard]`, **Split Paths & Compensation**, when unqueried rows can violate the invariant, so the check misses their conflicts (broken **Semantic Fidelity**).
 
 **Signal (Bad):** A query filters rows to the local subset being edited (`WHERE workspace_id IN (...)` or `WHERE parent_stage_id IS NULL`) and passes that partial slice into an invariant checker that validates a global relational closure—such as verifying that a shared `bundle_id` never spans multiple workspaces, or that two top-level stages (`parent_stage_id IS NULL`) are adjacent when a filtered-out child stage (`parent_stage_id IS NOT NULL`) sits between them—silently missing conflicts with unqueried rows.
 
@@ -229,7 +229,7 @@ def check_bundle_workspace_isolation(conn, edited_workspaces: list[str]) -> None
 
 ### Per-row nested `SAVEPOINT` in batch loops and assertion-then-savepoint
 
-**Pattern Name & Default Grade Hint:** Redundant nested `SAVEPOINT` / transaction wrapper — `[Simplify]`, **Redundant Churn** (or **Revalidation** when repeating per-row schema/precondition checks); `[Hard]` when misplaced transaction/savepoint scopes break atomicity, rollback boundaries, or lock lifecycles under batch load.
+**Pattern Name & Grade Condition:** Redundant nested `SAVEPOINT` / transaction wrapper — `[Simplify]`, **Redundant Churn**, for a wrapper with no independent rollback consumer, or **Revalidation** when it repeats per-row schema or precondition checks; `[Hard]` when the misplaced scope breaks atomicity, rollback boundaries, or lock lifecycles under batch load.
 
 **Signal (Bad):** A batch entry point opens a transaction and validates the batch, then loops over items calling a single-item command method or opening a per-row nested `with self.tx.savepoint():` (`SAVEPOINT`) that repeats schema/precondition checks per row; or a helper inside an caller-owned transaction scope asserts `if not self.conn.in_transaction: raise ...` on line 1 and immediately opens a nested `with self.tx.savepoint():` / `transaction()` on line 2 when the entire outer transaction always rolls back as one unit.
 
@@ -277,7 +277,7 @@ class LedgerWriter:
 
 ### Caller-side manual chunking that duplicates or bypasses callee batch limits
 
-**Pattern Name & Default Grade Hint:** Caller chunking around callee contract limit — `[Hard]`, **Split Paths & Compensation** (when chunking breaks cross-chunk uniqueness or closure checks); `[Simplify]`, **Revalidation**, when chunking only duplicates validation without state loss.
+**Pattern Name & Grade Condition:** Caller chunking around callee contract limit — `[Hard]`, **Split Paths & Compensation**, when the input can carry duplicates or closure conflicts across chunks that per-chunk validation misses (broken **Semantic Fidelity**); `[Simplify]`, **Revalidation**, when chunking only duplicates validation.
 
 **Signal (Bad):** A callee enforces `if len(items) > BATCH_LIMIT: raise ...` and deduplicates `seen_keys` within its argument list, while a caller slices `range(0, len(items), BATCH_LIMIT)` in a loop to bypass the limit—either duplicating the callee's validation/deduplication at the call site or breaking cross-chunk uniqueness checks because each chunk validates `seen_keys` in isolation.
 
@@ -337,7 +337,7 @@ def restore_all_projections(items: list[dict]) -> list[dict]:
 
 ### Unconsumed external file I/O or heavy CPU/hashing inside `BEGIN IMMEDIATE` write locks
 
-**Pattern Name & Default Grade Hint:** Write-lock I/O or CPU bleed — `[Hard]`, **Redundant Churn** (when holding an exclusive `BEGIN IMMEDIATE` write lock across external I/O, heavy hashing, or per-row N+1 SQL, or **Error Washing** when pre-check file I/O escapes the storage error boundary); `[Simplify]`, **Redundant Churn**, for minor movable work inside a lock.
+**Pattern Name & Grade Condition:** Write-lock I/O or CPU bleed — `[Hard]`, **Redundant Churn**, when external I/O, heavy hashing, or per-row N+1 SQL inside the exclusive `BEGIN IMMEDIATE` write lock makes concurrent writers time out or lock duration grow with batch size at supported load, or **Error Washing** when pre-check file I/O outside the storage error boundary masks the precondition failure the caller expects (such as a 404); `[Simplify]`, **Redundant Churn**, for movable work inside the lock that causes neither.
 
 **Signal (Bad):** While holding an exclusive database write lock (`BEGIN IMMEDIATE` / `with self.tx.immediate_transaction():`) or outside the storage error boundary before checking database preconditions, code reads external files on disk (populating a receipt field no caller consumes, or failing before a 404 precondition check), computes multi-megabyte `sha256` / compact JSON hashes, builds `.xlsx` exports in memory, or issues per-row N+1 sequence-allocation SQL queries.
 
@@ -370,7 +370,7 @@ def commit_import(self, batch_id: str, rows: list[dict]) -> dict:
 
 ### `PRAGMA integrity_check == 'ok'` treated as valid backup or falling through to `schema.sql` initialization
 
-**Pattern Name & Default Grade Hint:** Empty-backup wash via `integrity_check` / first-boot init fallthrough — `[Hard]`, **Error Washing** (**Semantic Fidelity** breach).
+**Pattern Name & Grade Condition:** Empty-backup wash via `integrity_check` / first-boot init fallthrough — `[Hard]`, **Error Washing**, when an empty or truncated backup can pass verification and fall through to first-boot initialization (false success that wipes production data on swap).
 
 **Signal (Bad):** Backup restore or verification treats `PRAGMA integrity_check == "ok"` as sufficient proof that a backup file is valid (SQLite returns `"ok"` on a 0-byte file or an empty database with zero tables) and then calls a shared `init_schema_if_missing(conn)` helper that sees missing tables and runs `executescript(schema.sql)` first-boot initialization—silently turning an empty or truncated backup into a blank initialized database and wiping production data on swap.
 
@@ -426,7 +426,7 @@ def verify_backup_database(backup_path: Path) -> None:
 
 ### Fail-Open lock file `OSError` deletion during stale-lock self-healing
 
-**Pattern Name & Default Grade Hint:** Fail-Open lock `OSError` self-healing — `[Hard]`, **Error Washing** (violates the lock-safety **Counterweight**).
+**Pattern Name & Grade Condition:** Fail-Open lock `OSError` self-healing — `[Hard]`, **Error Washing**, when a read failure on a held lock leads to its deletion and lets concurrent maintenance or writes proceed (lock safety failure).
 
 **Signal (Bad):** A lock-file reader catches `OSError` (permission denied, transient I/O error, or sharing violation) and returns `(None, "read_failed")`, and the caller treats any `None` payload with an old `mtime` as a corrupt/stale lock and unlinks the active lock file (`_unlink_stale_lock`)—failing open and allowing concurrent maintenance or writes while another process holds the lock.
 
