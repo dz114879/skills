@@ -306,12 +306,15 @@ def local_walk(node):
 
 
 def lexical_nodes(body):
+    """Located statement and expression nodes under body, in source order."""
     return sorted(
-        (child for statement in body for child in local_walk(statement)),
-        key=lambda child: (
-            getattr(child, "lineno", 0),
-            getattr(child, "col_offset", 0),
+        (
+            child
+            for statement in body
+            for child in local_walk(statement)
+            if isinstance(child, (ast.stmt, ast.expr))
         ),
+        key=lambda child: (child.lineno, child.col_offset),
     )
 
 
@@ -716,18 +719,12 @@ class CandidateProbes(CandidateRecords):
     def __init__(self, source, tree):
         super().__init__(source)
         self.attributes = declarations(tree)
-        self.imported = set()
+        self.imported = import_bindings(ast.walk(tree))
         self.module_imported = import_bindings(local_walk(tree))
         self.iterations = {}
         self.lock_contexts = {}
         self.transaction_contexts = set()
         for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                self.imported.update(
-                    alias.asname or alias.name.split(".")[0] for alias in node.names
-                )
-            elif isinstance(node, ast.ImportFrom):
-                self.imported.update(alias.asname or alias.name for alias in node.names)
             if isinstance(node, (ast.With, ast.AsyncWith)):
                 self.transaction_contexts.update(
                     item.context_expr
