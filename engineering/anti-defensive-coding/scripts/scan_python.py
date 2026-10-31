@@ -1156,7 +1156,8 @@ class CandidateProbes(CandidateRecords):
             len(node.ops) == 1
             and isinstance(node.ops[0], (ast.IsNot, ast.NotEq))
             and any(
-                (terminal_name(operand) or "").startswith("_DEFAULT_")
+                isinstance(operand, (ast.Name, ast.Attribute))
+                and terminal_name(operand).startswith("_DEFAULT_")
                 for operand in (node.left, node.comparators[0])
             )
         ):
@@ -1802,6 +1803,102 @@ def patch_symbol(node):
     return None
 
 
+def is_patch_constructor(node):
+    return (
+        isinstance(node, ast.Call)
+        and bool(patch_symbol(node))
+        and name_path(node.func) != "monkeypatch.setattr"
+    )
+
+
+@dataclass
+class PatchWindow:
+    patch: ast.Call
+    start: tuple[int, int]
+    end: tuple[int, int]
+    activation: ast.Call | None = None
+
+
+def patch_windows(node, nodes):
+    """Lexical patch regions; resets affect only statement-installed patches."""
+    end = (node.end_lineno, node.end_col_offset)
+    windows = [
+        PatchWindow(decorator, (node.lineno, node.col_offset), end)
+        for decorator in node.decorator_list
+        if is_patch_constructor(decorator)
+    ]
+    active = []
+    patchers = {}
+    for child in nodes:
+        if isinstance(child, (ast.With, ast.AsyncWith)):
+            for item in child.items:
+                patch = item.context_expr
+                if is_patch_constructor(patch):
+                    windows.append(
+                        PatchWindow(
+                            patch,
+                            (child.body[0].lineno, child.body[0].col_offset),
+                            (child.end_lineno, child.end_col_offset),
+                        )
+                    )
+        if isinstance(child, ast.Call):
+            call = child
+        elif isinstance(child, (ast.Expr, ast.Assign, ast.AnnAssign)):
+            call = child.value
+        else:
+            call = None
+        if isinstance(call, ast.Call):
+            path = name_path(call.func)
+            method = terminal_name(call.func)
+            patcher = None
+            if isinstance(call.func, ast.Attribute):
+                receiver = call.func.value
+                patcher = (
+                    receiver
+                    if isinstance(receiver, ast.Call)
+                    else patchers.get(name_path(receiver))
+                )
+            stopall = path in {
+                "patch.stopall",
+                "mock.patch.stopall",
+                "unittest.mock.patch.stopall",
+            }
+            for window in active[:]:
+                monkeypatch = name_path(window.patch.func) == "monkeypatch.setattr"
+                if (
+                    (stopall and not monkeypatch)
+                    or (path == "monkeypatch.undo" and monkeypatch)
+                    or (method == "stop" and window.patch is patcher)
+                ) and window.start <= (call.lineno, call.col_offset):
+                    window.end = (call.lineno, call.col_offset)
+                    active.remove(window)
+            patch = (
+                call
+                if path == "monkeypatch.setattr"
+                else (patcher if method == "start" else None)
+            )
+            if (
+                not isinstance(child, ast.Call)
+                and isinstance(patch, ast.Call)
+                and patch_symbol(patch)
+            ):
+                window = PatchWindow(
+                    patch, (call.end_lineno, call.end_col_offset), end, call
+                )
+                windows.append(window)
+                active.append(window)
+        for target in write_targets(child):
+            for bound in bound_targets(target):
+                if isinstance(bound, ast.Name):
+                    patchers.pop(bound.id, None)
+        assignment = simple_assignment(child)
+        if assignment:
+            name, value = assignment
+            if is_patch_constructor(value):
+                patchers[name] = value
+    return windows
+
+
 @dataclass
 class GetterReturn:
     method: str
@@ -1892,28 +1989,27 @@ class TestProbes(CandidateRecords):
                         self.raw_assertion(check, check.func.value, bindings)
         self.getter_mutations(nodes)
         calls = [child for child in nodes if isinstance(child, ast.Call)]
-        calls += [
-            child
-            for decorator in node.decorator_list
-            for child in ast.walk(decorator)
-            if isinstance(child, ast.Call)
-        ]
-        patches = [(call, patch_symbol(call)) for call in calls if patch_symbol(call)]
-        patch_contents = {child for call, _ in patches for child in ast.walk(call)}
-        for patch, symbol in patches:
+        windows = patch_windows(node, nodes)
+        for window in windows:
+            symbol = patch_symbol(window.patch)
             invoked = next(
                 (
                     call
                     for call in calls
-                    if call not in patch_contents and terminal_name(call.func) == symbol
+                    if terminal_name(call.func) == symbol
+                    and window.start <= (call.lineno, call.col_offset) < window.end
                 ),
                 None,
             )
             if invoked:
+                site = window.activation or window.patch
+                related = (invoked,)
+                if window.patch not in ast.walk(site):
+                    related = (window.patch, invoked)
                 self.smell(
-                    patch,
+                    site,
                     f"Patch targets directly invoked SUT symbol '{symbol}'",
-                    (invoked,),
+                    related,
                 )
         self.generic_visit(node)
         self.symbols.pop()

@@ -363,7 +363,7 @@ def test_dispatch_order_formats_worker_receipt():
         process_mock.assert_called_once_with(order)
 ```
 
-**Counterweight (When to Keep):** Forwarding spies (`patch.object(..., wraps=...)`, `mocker.spy`) that execute the real implementation while recording call counts, tests that patch a recursive helper to bound recursion depth under a documented seam, and tests where the patched symbol shares a terminal name with a different higher-level orchestrator function are valid patterns.
+**Counterweight (When to Keep):** Fault-injection patches whose replacement raises to simulate a collaborator I/O failure while the system under test runs unpatched are valid failure-path tests. Forwarding spies (`patch.object(..., wraps=...)`, `mocker.spy`) that execute the real implementation while recording call counts, tests that patch a recursive helper to bound recursion depth under a documented seam, and tests where the patched symbol shares a terminal name with a different higher-level orchestrator function are valid patterns.
 
 ## 6. Brittle Source-Text & Echo-Chamber Assertions
 

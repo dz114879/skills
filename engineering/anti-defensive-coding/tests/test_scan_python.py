@@ -355,10 +355,203 @@ class ScanPythonTests(unittest.TestCase):
                     self.assertEqual(candidates[0]["symbol"], "test_items")
                     self.assertEqual(candidates[0]["span"], [2, 4])
 
+    def test_self_patch_counts_calls_in_other_patch_arguments(self):
+        for source, span in [
+            (
+                "def test_patch(monkeypatch):\n"
+                '    with patch("app.execute"):\n'
+                '        monkeypatch.setattr("app.other", execute())\n',
+                [2, 3],
+            ),
+            (
+                '@patch("app.execute")\n'
+                "def test_patch():\n"
+                '    patch("app.other", execute()).start()\n',
+                [1, 3],
+            ),
+        ]:
+            with self.subTest(source=source):
+                self.put("tests/test_patch.py", source)
+                candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
+                self.assertEqual(
+                    [(c["rule"], c["symbol"], c["span"]) for c in candidates],
+                    [("PY10b_test_smell", "test_patch", span)],
+                )
+
+    def test_self_patch_calls_require_an_active_window(self):
+        for body, span in [
+            ('execute()\nmonkeypatch.setattr("app.execute", replacement)', None),
+            ('patch("app.execute").start()\nexecute()', [2, 3]),
+            ('execute()\npatch("app.execute").start()', None),
+            ('patch("app.execute").start()\npatch.stopall()\nexecute()', None),
+            ('patch("app.execute").start()\ncheck(patch.stopall())\nexecute()', None),
+            ('patch("app.execute").start(); execute(); patch.stopall()', [2, 2]),
+            ('patch("app.execute").start(); patch.stopall(); execute()', None),
+            (
+                'monkeypatch.setattr("app.execute", replacement)\nmonkeypatch.undo()\nexecute()',
+                None,
+            ),
+            (
+                'monkeypatch.setattr("app.execute", replacement)\ncheck(monkeypatch.undo())\nexecute()',
+                None,
+            ),
+            (
+                'monkeypatch.setattr("app.execute", reset(monkeypatch.undo()))\nexecute()',
+                [2, 3],
+            ),
+            ('execute()\nwith patch("app.execute"):\n    pass', None),
+            ('patch("app.execute")\nexecute()', None),
+            ('monkeypatch.setattr("app.execute", execute())', None),
+            ('patch("app.execute", execute()).start()', None),
+            (
+                'if enabled:\n    monkeypatch.setattr("app.execute", replacement)\nexecute()',
+                [3, 4],
+            ),
+        ]:
+            with self.subTest(body=body):
+                self.put(
+                    "tests/test_patch.py",
+                    "def test_patch(monkeypatch):\n"
+                    + textwrap.indent(body, "    ")
+                    + "\n",
+                )
+                candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
+                self.assertEqual(
+                    [(c["rule"], c["symbol"], c["span"]) for c in candidates],
+                    [("PY10b_test_smell", "test_patch", span)] if span else [],
+                )
+
+    def test_self_patch_tracks_bound_patchers_until_their_stop(self):
+        for body, span in [
+            ('p = patch("app.execute")\np.start()\nexecute()\np.stop()', [2, 4]),
+            ('p: Patcher = patch.object(app, "execute")\np.start()\nexecute()', [2, 4]),
+            ('p = patch("app.execute")\nexecute()\np.start()', None),
+            ('p = patch("app.execute")\np.start()\np.stop()\nexecute()', None),
+            (
+                'p = patch("app.execute")\np.start()\nassert p.stop() is None\nexecute()',
+                None,
+            ),
+            ('p = patch("app.execute")\np.start()\npatch.stopall()\nexecute()', None),
+            (
+                'p = patch("app.execute")\np.start()\nmonkeypatch.undo()\nexecute()',
+                [2, 5],
+            ),
+            (
+                'monkeypatch.setattr("app.execute", replacement)\npatch.stopall()\nexecute()',
+                [2, 4],
+            ),
+            (
+                'p = patch("app.execute")\nother = patch("app.other")\np.start()\nother.stop()\nexecute()',
+                [2, 6],
+            ),
+            (
+                'p = patch("app.execute")\np.start()\np = patch("app.other")\np.stop()\nexecute()',
+                [2, 6],
+            ),
+            ('p = patch("app.execute")\np = replacement\np.start()\nexecute()', None),
+            (
+                'p = patch("app.execute")\n(p := replacement)\np.start()\nexecute()',
+                None,
+            ),
+            (
+                'p = patch("app.execute")\np, other = replacements\np.start()\nexecute()',
+                None,
+            ),
+            ('mocked = patch("app.execute").start()\nmocked.stop()\nexecute()', [2, 4]),
+            (
+                'p = patch("app.execute")\np.start()\np.stop()\np.start()\nexecute()',
+                [2, 6],
+            ),
+        ]:
+            with self.subTest(body=body):
+                self.put(
+                    "tests/test_patch.py",
+                    "def test_patch(monkeypatch):\n"
+                    + textwrap.indent(body, "    ")
+                    + "\n",
+                )
+                candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
+                self.assertEqual(
+                    [(c["rule"], c["symbol"], c["span"]) for c in candidates],
+                    [("PY10b_test_smell", "test_patch", span)] if span else [],
+                )
+
+    def test_self_patch_scoped_windows_recognize_the_patch_family(self):
+        cases = [
+            (f"@{patch_call}\ndef test_patch():\n    execute()\n", [1, 3])
+            for patch_call in [
+                'patch("app.execute")',
+                'mock.patch("app.execute")',
+                'unittest.mock.patch("app.execute")',
+                'patch.object(app, "execute")',
+                'mock.patch.object(app, "execute")',
+                'unittest.mock.patch.object(app, "execute")',
+            ]
+        ]
+        cases += [
+            (
+                '@decorate(patch("app.execute"))\ndef test_patch():\n    execute()\n',
+                None,
+            ),
+            (
+                '@patch("app.execute")\ndef test_patch():\n    def helper():\n        execute()\n',
+                None,
+            ),
+            (
+                'def test_patch():\n    with patch("app.execute"):\n        execute()\n',
+                [2, 3],
+            ),
+            (
+                'def test_patch():\n    with patch("app.execute"):\n        pass\n    execute()\n',
+                None,
+            ),
+            (
+                'def test_patch():\n    with patch("app.execute"), other(execute()):\n        pass\n',
+                None,
+            ),
+        ]
+        for source, span in cases:
+            with self.subTest(source=source):
+                self.put("tests/test_patch.py", source)
+                candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
+                self.assertEqual(
+                    [(c["rule"], c["symbol"], c["span"]) for c in candidates],
+                    [("PY10b_test_smell", "test_patch", span)] if span else [],
+                )
+
+    def test_starting_a_bound_patcher_makes_the_sut_call_diff_eligible(self):
+        self.init_repo()
+        for previous, spans in [
+            ("", [[2, 4]]),
+            ("    p.start()\n    execute()\n    p.stop()\n", [[2, 4], [2, 7]]),
+        ]:
+            with self.subTest(previous=previous):
+                prefix = 'def test_patch():\n    p = patch("app.execute")\n' + previous
+                self.put("tests/test_patch.py", prefix + "    execute()\n")
+                base = self.commit()
+                self.put(
+                    "tests/test_patch.py", prefix + "    p.start()\n    execute()\n"
+                )
+                candidates = self.scan("--base", base)["candidates"]
+                self.assertEqual(
+                    [
+                        (c["rule"], c["symbol"], c["span"], c["change_tag"])
+                        for c in candidates
+                    ],
+                    [("PY10b_test_smell", "test_patch", spans[-1], "changed")],
+                )
+                candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
+                self.assertEqual(
+                    [(c["rule"], c["symbol"], c["span"]) for c in candidates],
+                    [("PY10b_test_smell", "test_patch", span) for span in spans],
+                )
+
     def test_default_hook_identity_checks_are_production_only(self):
         for expression, expected in [
             ("fn is not _DEFAULT_FN", True),
             ("module._DEFAULT_FN != fn", True),
+            ('fn is not _DEFAULT_FN["hook"]', False),
+            ('module._DEFAULT_FN["hook"] != fn', False),
             ("fn is _DEFAULT_FN", False),
             ("fn == _DEFAULT_FN", False),
             ("fn != DEFAULT_FN", False),
@@ -372,6 +565,8 @@ class ScanPythonTests(unittest.TestCase):
                 if expected:
                     self.assertEqual(candidates[0]["rule"], "PY10b_test_smell")
                     self.assertEqual(candidates[0]["path"], "app.py")
+                    self.assertEqual(candidates[0]["symbol"], "<module>")
+                    self.assertEqual(candidates[0]["span"], [1, 1])
 
     def test_test_smells_scope_decorators_module_reads_and_diff_spans(self):
         self.init_repo()
