@@ -578,11 +578,11 @@ class BaseQueryService:
 
 ## 10. Round-Trip Conversions, Copy Churn & Cache-Busting Copies
 
-### Serialization, datetime, and `int(float(x))` round-trip conversions
+### Serialization, datetime, and `int(float(x))` round-trips; same-type scalar reparsing
 
-**Pattern Name & Grade Condition:** Precision-losing or redundant round-trip conversion — `[Hard]`, **Error Washing**, when `int(float(x))` can receive integers above `2^53` or fractional values and silently rounds or truncates them (broken **Semantic Fidelity**); `[Simplify]`, **Redundant Churn**, for `json.loads(json.dumps(x))`, `fromisoformat(dt.isoformat())`, `set(list(set(x)))`, and an `int(float(x))` whose producer delivers only integers within `2^53`.
+**Pattern Name & Grade Condition:** Precision-losing or redundant round-trip conversion, or same-type scalar reparsing — `[Hard]`, **Error Washing**, when `int(float(x))` can receive integers above `2^53` or fractional values and silently rounds or truncates them (broken **Semantic Fidelity**); `[Simplify]`, **Redundant Churn**, for `json.loads(json.dumps(x))`, `fromisoformat(dt.isoformat())`, `set(list(set(x)))`, and an `int(float(x))` whose producer delivers only integers within `2^53`; `[Simplify]`, **Revalidation**, for a same-type reparse whose immediate callers all construct that exact type.
 
-**Signal (Bad):** Code uses `json.loads(json.dumps(x))` as an internal deep copy or self-check, converts a parsed `datetime` to `.isoformat()` only for the next layer to call `datetime.fromisoformat(...)`, wraps `set(list(set(items)))`, or routes integer validation through `int(float(value))`—which silently rounds 64-bit integers `> 2^53` (`9007199254740993` becomes `9007199254740992`).
+**Signal (Bad):** Code uses `json.loads(json.dumps(x))` as an internal deep copy or self-check, converts a parsed `datetime` to `.isoformat()` only for the next layer to call `datetime.fromisoformat(...)`, wraps `set(list(set(items)))`, routes integer validation through `int(float(value))`—which silently rounds 64-bit integers `> 2^53` (`9007199254740993` becomes `9007199254740992`)—or reparses a parameter into the scalar type its annotation already declares (`int(base_count or 0)` on `base_count: int`, `str(session_id or "")` on `session_id: str`).
 
 ```python
 def parse_entity_id(value: int | str) -> int:
@@ -592,9 +592,13 @@ def parse_entity_id(value: int | str) -> int:
 def build_event(payload: dict, started_at: datetime) -> tuple[dict, datetime]:
     copied = json.loads(json.dumps(payload))
     return copied, datetime.fromisoformat(started_at.isoformat())
+
+
+def next_sequence(base_count: int) -> int:
+    return int(base_count or 0) + 1
 ```
 
-**1-Hop Verify & Fix (Good):** Check the producer and consumer types and whether any 1-hop consumer mutates `payload` in place. Parse external strings once at entry, pass strong types (`int`, `datetime`, `dict`, `set`) internally, parse integers directly via `int(value)` (after excluding `bool`) or `Decimal` to preserve full 64-bit precision, and pass `payload` directly when consumers only read it.
+**1-Hop Verify & Fix (Good):** Check the producer and consumer types and whether any 1-hop consumer mutates `payload` in place. Parse external strings once at entry, pass strong types (`int`, `datetime`, `dict`, `set`) internally, parse integers directly via `int(value)` (after excluding `bool`) or `Decimal` to preserve full 64-bit precision, and pass `payload` directly when consumers only read it. For a same-type reparse, inspect what each immediate caller actually constructs (a caller that only forwards its own annotated value proves nothing), and use the value directly once every caller builds that exact type.
 
 ```python
 def parse_entity_id(value: int | str) -> int:
@@ -605,9 +609,13 @@ def parse_entity_id(value: int | str) -> int:
 
 def build_event(payload: dict, started_at: datetime) -> tuple[dict, datetime]:
     return payload, started_at
+
+
+def next_sequence(base_count: int) -> int:
+    return base_count + 1
 ```
 
-**Counterweight (When to Keep):** When a downstream consumer genuinely mutates a nested structure and requires detached copy isolation, preserve isolation with `copy.deepcopy(payload)` or a targeted shallow copy. Keep explicit wire-contract round-trip assertions in serialization tests, and use `Decimal` when an external numeric string contract explicitly permits scientific notation while requiring exact integer conversion.
+**Counterweight (When to Keep):** When a downstream consumer genuinely mutates a nested structure and requires detached copy isolation, preserve isolation with `copy.deepcopy(payload)` or a targeted shallow copy. Keep explicit wire-contract round-trip assertions in serialization tests, and use `Decimal` when an external numeric string contract explicitly permits scientific notation while requiring exact integer conversion. Keep a same-type reparse at public, SDK, route, or plugin entry points, on values read from `Any` configuration, and where it deliberately converts a `str` subclass or enum to its base type or crosses the numeric tower (`bool` to `int`, `int` to `float`).
 
 ### Redundant `[dict(r)]`, `dataclasses.asdict()`, and defensive container copies
 

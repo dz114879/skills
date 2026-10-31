@@ -912,115 +912,6 @@ class ScanPythonTests(unittest.TestCase):
         self.assertEqual(len(moved), 1)
         self.assertEqual(moved[0]["symbol"], "destination")
 
-    def test_foreign_private_writes_exclude_locally_owned_objects(self):
-        for binding, target, expected in [
-            ("", "item._cache", True),
-            ("item = receive()", "item._cache", True),
-            ("item: Record = receive()", "item._cache", True),
-            ("", "item._cache_", True),
-            ("item = Record()", "item._cache", False),
-            ("item = models.Record()", "item._cache", False),
-            ("item = cls()", "item._cache", False),
-            ("item = Record.__new__(Record)", "item._cache", False),
-            ("item = original.__class__()", "item._cache", False),
-            ("item = copy(original)", "item._cache", False),
-            ("item = deepcopy(original)", "item._cache", False),
-            ("item = copy.copy(original)", "item._cache", False),
-            ("item = copy.deepcopy(original)", "item._cache", False),
-            ("item = other.copy(original)", "item._cache", True),
-            ("def helper():\n    item = Record()", "item._cache", True),
-            ("", "self._cache", False),
-            ("", "cls._cache", False),
-            ("from external import item", "item._cache", False),
-            ("", "item.__cache", False),
-            ("", "item.__cache__", False),
-            ("", "item.cache", False),
-            ("", "owner.item._cache", False),
-        ]:
-            with self.subTest(binding=binding, target=target):
-                self.put(
-                    "state.py",
-                    "def attach(item, self, cls, owner):\n"
-                    + textwrap.indent(binding + "\n" if binding else "", "    ")
-                    + f"    {target} = payload\n",
-                )
-                candidates = [
-                    c
-                    for c in self.scan("--paths", "state.py")["candidates"]
-                    if c["rule"] == "PY07_state_smuggling"
-                ]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    self.assertEqual(candidates[0]["symbol"], "attach")
-                    self.assertIn("item", candidates[0]["evidence"])
-                    self.assertIn("line", candidates[0]["evidence"])
-                    self.assertIn("Counterweight", candidates[0]["verify"])
-        self.put("state.py", "item._cache = payload\n")
-        self.assertEqual(self.scan("--paths", "state.py")["candidates"], [])
-
-    def test_private_write_import_exclusion_respects_function_bindings(self):
-        for source, expected in [
-            (
-                "def unrelated():\n    import item\n"
-                "def attach(item):\n    item._cache = payload\n",
-                True,
-            ),
-            (
-                "import item\ndef attach(item):\n    item._cache = payload\n",
-                True,
-            ),
-            (
-                "import item\n"
-                "def attach():\n    item = receive()\n    item._cache = payload\n",
-                True,
-            ),
-            (
-                "class Unrelated:\n    import item\n"
-                "def attach(item):\n    item._cache = payload\n",
-                True,
-            ),
-            (
-                "def attach():\n    from external import receiver as item\n"
-                "    item._cache = payload\n",
-                False,
-            ),
-            (
-                "from external import receiver as item\n"
-                "def attach():\n    item._cache = payload\n",
-                False,
-            ),
-        ]:
-            with self.subTest(source=source):
-                self.put("state.py", source)
-                candidates = self.scan("--paths", "state.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    self.assertEqual(candidates[0]["rule"], "PY07_state_smuggling")
-                    self.assertEqual(candidates[0]["symbol"], "attach")
-
-    def test_private_write_constructor_exclusion_requires_a_function_local_binding(
-        self,
-    ):
-        for source, symbol in [
-            (
-                "shared = Record()\ndef attach():\n    global shared\n"
-                "    shared = Record()\n    shared._cache = payload\n",
-                "attach",
-            ),
-            (
-                "def outer():\n    shared = Record()\n    def attach():\n"
-                "        nonlocal shared\n        shared = Record()\n"
-                "        shared._cache = payload\n",
-                "outer.attach",
-            ),
-        ]:
-            with self.subTest(symbol=symbol):
-                self.put("state.py", source)
-                candidates = self.scan("--paths", "state.py")["candidates"]
-                self.assertEqual(len(candidates), 1)
-                self.assertEqual(candidates[0]["rule"], "PY07_state_smuggling")
-                self.assertEqual(candidates[0]["symbol"], symbol)
-
     def test_transient_self_state_requires_matching_try_and_finally_writes(self):
         for body, cleanup, handler, expected in [
             ("self.context = active", "self.context = None", "", True),
@@ -1069,6 +960,61 @@ class ScanPythonTests(unittest.TestCase):
                     self.assertIn("self.context", candidate["evidence"])
                     self.assertIn("finally", candidate["evidence"])
                     self.assertIn("Counterweight", candidate["verify"])
+
+    def test_same_class_stash_needs_an_immediate_return_and_a_sibling_reader(self):
+        made = "payload = compose()\n"
+        stash = "self._last = payload\nreturn payload"
+        for writer, reader, span in [
+            (made + stash, "return self._last", [4, 7]),
+            (
+                made + "if ready:\n    self._last = payload\n    return payload\n"
+                "return None",
+                "return self._last",
+                [5, 9],
+            ),
+            (made + stash, "self._last = None", None),
+            (made + "print(self._last)\n" + stash, "return None", None),
+            (
+                made + "self._last = payload\nlog(payload)\nreturn payload",
+                "return self._last",
+                None,
+            ),
+            (
+                made + "self._last = payload\nreturn compose()",
+                "return self._last",
+                None,
+            ),
+            ("global payload\n" + made + stash, "return self._last", None),
+            (
+                "print([payload for payload in compose()])\n" + stash,
+                "return self._last",
+                None,
+            ),
+            (
+                made + stash,
+                "class View:\n    def show(self):\n        return self._last\n"
+                "return View",
+                None,
+            ),
+        ]:
+            with self.subTest(writer=writer, reader=reader):
+                self.put(
+                    "state.py",
+                    "class Provider:\n    def build(self):\n"
+                    + textwrap.indent(writer, "        ")
+                    + "\n    def dump(self):\n"
+                    + textwrap.indent(reader, "        ")
+                    + "\n",
+                )
+                candidates = self.scan("--paths", "state.py")["candidates"]
+                self.assertEqual(len(candidates), int(span is not None))
+                if span is not None:
+                    candidate = candidates[0]
+                    self.assertEqual(candidate["rule"], "PY07_state_smuggling")
+                    self.assertEqual(candidate["symbol"], "Provider.build")
+                    self.assertEqual(candidate["span"], span)
+                    self.assertIn("self._last", candidate["evidence"])
+                    self.assertIn(f"dump at line {span[1]}", candidate["evidence"])
 
     def test_dict_dependency_smuggling_requires_final_key_token_and_object_value(self):
         for key, expected in [
@@ -1505,25 +1451,6 @@ class ScanPythonTests(unittest.TestCase):
                     self.assertEqual(
                         candidates[0]["rule"], "PY03_default_shadows_check"
                     )
-
-    def test_typed_parameter_rhs_check_precedes_assignment_binding(self):
-        for assignment in [
-            "item = item if item is not None else make_widget()",
-            "item: Widget = item if item is not None else make_widget()",
-            "item += item if item is not None else make_widget()",
-            "(item := item if item is not None else make_widget())",
-        ]:
-            with self.subTest(assignment=assignment):
-                self.put(
-                    "typed.py",
-                    f"def load(item: Widget):\n    {assignment}\n"
-                    "    return item is None\n",
-                )
-                candidates = self.scan("--paths", "typed.py")["candidates"]
-                self.assertEqual(len(candidates), 1)
-                self.assertEqual(candidates[0]["rule"], "PY06_revalidated_typed_param")
-                self.assertEqual(candidates[0]["span"], [2, 2])
-                self.assertEqual(candidates[0]["code"], "item is not None")
 
     def test_error_washing_in_exception_group_handler(self):
         self.put(
@@ -2129,113 +2056,6 @@ class ScanPythonTests(unittest.TestCase):
                         [2 + len(before.splitlines()), 3 + len(before.splitlines())],
                     )
 
-    def test_typed_parameter_revalidation_respects_annotations_and_rebinding(self):
-        for annotation, default, before, check, expected in [
-            ("Widget", "", "", "item is None", True),
-            ("pkg.Widget", "", "", "item is not None", True),
-            ("Widget", "", "", "isinstance(item, Widget)", True),
-            ("pkg.Widget", "", "", "isinstance(item, (str, other.Widget))", True),
-            ("list[int]", "", "", "isinstance(item, list)", True),
-            ("ManyObjects", "", "", "item is None", True),
-            ("OptionalThing", "", "", "item is None", True),
-            ("UnionMember", "", "", "item is None", True),
-            ("object_record", "", "", "item is None", True),
-            ("Optional[Widget]", "", "", "item is None", False),
-            ("typing.Optional[Widget]", "", "", "item is None", False),
-            ("Widget | None", "", "", "item is None", False),
-            ("Union[Widget, str]", "", "", "item is None", False),
-            ("Widget", "=None", "", "item is None", False),
-            ("Any", "", "", "item is None", False),
-            ("typing.Any", "", "", "item is None", False),
-            ("object", "", "", "item is None", False),
-            ("list[Any]", "", "", "item is None", False),
-            ("None", "", "", "item is None", False),
-            ("Widget", "", "item = normalize(item)\n", "item is None", False),
-            (
-                "Widget",
-                "",
-                "if ready:\n    item = normalize(item)\n",
-                "item is None",
-                False,
-            ),
-            ("Widget", "", "", "isinstance(item, Other)", False),
-            ("Widget", "", "", "isinstance(other, Widget)", False),
-        ]:
-            with self.subTest(
-                annotation=annotation, default=default, before=before, check=check
-            ):
-                self.put(
-                    "typed.py",
-                    f"def load(item: {annotation}{default}):\n"
-                    + textwrap.indent(before, "    ")
-                    + f"    if {check}:\n        return 1\n    return item\n",
-                )
-                candidates = self.scan("--paths", "typed.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    candidate = candidates[0]
-                    self.assertEqual(candidate["rule"], "PY06_revalidated_typed_param")
-                    self.assertEqual(candidate["span"], [2, 2])
-                    self.assertIn(annotation, candidate["evidence"])
-                    self.assertIn("line 1", candidate["evidence"])
-                    self.assertIn("line 2", candidate["evidence"])
-                    self.assertIn("Counterweight", candidate["verify"])
-        self.put(
-            "typed.py",
-            """
-            class Model:
-                async def load(self, item: Widget, /, *, option: list[int]):
-                    if item is None:
-                        return 1
-                    if isinstance(option, list):
-                        return 2
-                    item = normalize(item)
-                    if item is None:
-                        return 3
-                def outer(self, item: Widget, *args: Widget, **kwargs: Widget):
-                    def nested():
-                        return item is None
-                    reader = lambda: item is None
-                    class Inner:
-                        value = item is None
-                    return args is None or kwargs is None
-            """,
-        )
-        candidates = self.scan("--paths", "typed.py")["candidates"]
-        self.assertEqual(
-            [c["symbol"] for c in candidates], ["Model.load", "Model.load"]
-        )
-
-    def test_string_annotations_use_tokens_and_skip_unparseable_types(self):
-        for annotation, check, expected in [
-            ("pkg.Widget", "isinstance(item, Widget)", True),
-            ("list[int]", "isinstance(item, (tuple, list))", True),
-            ("ManyObjects", "item is None", True),
-            ("OptionalThing", "item is not None", True),
-            ("Widget", "isinstance(item, Other)", False),
-            ("typing.Optional[Widget]", "item is None", False),
-            ("Widget | None", "item is None", False),
-            ("list[Any]", "item is None", False),
-            ("Union[Widget, str]", "item is None", False),
-            ("object", "item is None", False),
-            ("None", "item is None", False),
-            ("Widget[", "item is None", False),
-            ("", "item is None", False),
-        ]:
-            with self.subTest(annotation=annotation, check=check):
-                self.put(
-                    "typed.py",
-                    f"def load(item: {annotation!r}):\n    return {check}\n",
-                )
-                candidates = self.scan("--paths", "typed.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    self.assertEqual(
-                        candidates[0]["rule"], "PY06_revalidated_typed_param"
-                    )
-                    self.assertIn(annotation, candidates[0]["evidence"])
-                    self.assertEqual(candidates[0]["span"], [2, 2])
-
     def test_diff_eligibility_excludes_noncontributing_else_branches(self):
         self.init_repo()
         original = textwrap.dedent("""
@@ -2273,10 +2093,12 @@ class ScanPythonTests(unittest.TestCase):
             def discarded(old):
                 _ = old
                 return 1
-            def typed(item: Widget):
+            def lint_owned_typed(item: Widget):
                 return item is None
-            def smuggled(item):
+            def lint_owned_private_write(item):
                 item._context = state
+            def packed(data, dep):
+                data['service'] = dep
             def converted(item):
                 return int(float(item))
             def locked():
@@ -2287,7 +2109,7 @@ class ScanPythonTests(unittest.TestCase):
         self.put("tests/helpers.py", source)
         result = self.scan("--paths", ".")
         self.assertEqual(result["summary"]["files_scanned"], 2)
-        self.assertEqual(result["summary"]["candidate_count"], 8)
+        self.assertEqual(result["summary"]["candidate_count"], 7)
         self.assertEqual(
             [c["rule"] for c in result["candidates"]],
             [
@@ -2295,7 +2117,6 @@ class ScanPythonTests(unittest.TestCase):
                 "PY03_default_shadows_check",
                 "PY04_lossy_falsy_coalesce",
                 "PY05_dead_param_evasion",
-                "PY06_revalidated_typed_param",
                 "PY07_state_smuggling",
                 "PY08_roundtrip_and_copy",
                 "PY09_io_or_tx_in_lock",
@@ -2319,10 +2140,9 @@ class ScanPythonTests(unittest.TestCase):
             )
             self.assertEqual(candidate["change_tag"], "path-audit")
             self.assertLessEqual(len(candidate["code"]), 200)
-            self.assertIn("Counterweight", candidate["verify"])
         compact = self.cli("--paths", ".", "--format", "compact")
         self.assertIn(
-            "Scanned 2 files (2 cross-checked); 8 candidates, 0 parse errors", compact
+            "Scanned 2 files (2 cross-checked); 7 candidates, 0 parse errors", compact
         )
         for candidate in result["candidates"]:
             self.assertIn(f"— {candidate['rule']} [path-audit]", compact)

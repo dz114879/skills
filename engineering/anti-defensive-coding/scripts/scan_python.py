@@ -6,6 +6,7 @@ import ast
 from dataclasses import dataclass, field
 import fnmatch
 import io
+from itertools import pairwise
 import json
 import os
 from pathlib import Path
@@ -498,25 +499,6 @@ def prefix_boundary(node):
     )
 
 
-def concrete_annotation(node):
-    if node is None:
-        return None
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        try:
-            node = ast.parse(node.value, mode="eval").body
-        except SyntaxError:
-            return None
-    excluded = {"Any", "object", "Optional", "Union", "None"}
-    if any(
-        terminal_name(child) in excluded
-        or is_none(child)
-        or (isinstance(child, ast.BinOp) and isinstance(child.op, ast.BitOr))
-        for child in ast.walk(node)
-    ):
-        return None
-    return terminal_name(node)
-
-
 def binding_names(node):
     if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
         return {node.id}
@@ -573,18 +555,6 @@ def write_targets(node):
     return []
 
 
-def constructed_here(node):
-    if not isinstance(node, ast.Call):
-        return False
-    name = terminal_name(node.func)
-    return name is not None and (
-        name[:1].isupper()
-        or name_path(node.func)
-        in {"cls", "copy", "deepcopy", "copy.copy", "copy.deepcopy"}
-        or (isinstance(node.func, ast.Attribute) and name in {"__new__", "__class__"})
-    )
-
-
 def self_state_writes(body, *, reset):
     writes = {}
     for statement in body:
@@ -594,13 +564,108 @@ def self_state_writes(body, *, reset):
             if child.value is None or is_none(child.value) != reset:
                 continue
             for target in write_targets(child):
-                if (
-                    isinstance(target, ast.Attribute)
-                    and isinstance(target.value, ast.Name)
-                    and target.value.id == "self"
-                ):
+                if self_attribute(target):
                     writes.setdefault(target.attr, []).append(child)
     return writes
+
+
+def self_attribute(node):
+    return (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    )
+
+
+def adjacent_statements(nodes):
+    """Adjacent statement pairs of every statement list owned by same-scope nodes."""
+    for node in nodes:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        for _, body in ast.iter_fields(node):
+            if (
+                isinstance(body, list)
+                and body
+                and all(isinstance(item, ast.stmt) for item in body)
+            ):
+                yield from pairwise(body)
+
+
+def scope_bindings(function, nodes):
+    """Names local to function: parameters and stores among its same-scope nodes."""
+    # Comprehension targets bind in the comprehension's own scope.
+    comprehension_names = {
+        name
+        for node in nodes
+        if isinstance(node, ast.comprehension)
+        for name in ast.walk(node.target)
+    }
+    external = {
+        name
+        for node in nodes
+        if isinstance(node, (ast.Global, ast.Nonlocal))
+        for name in node.names
+    }
+    return {
+        param.arg
+        for param in [*parameters(function), function.args.vararg, function.args.kwarg]
+        if param is not None
+    }.union(
+        *(binding_names(node) for node in nodes if node not in comprehension_names)
+    ) - external
+
+
+def same_class_stashes(tree):
+    """Map `self._a = n` directly followed by `return n` to sibling-method readers."""
+    stashes = {}
+    for cls in ast.walk(tree):
+        if not isinstance(cls, ast.ClassDef):
+            continue
+        methods = [
+            node
+            for node in cls.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        scopes = {
+            method: [
+                child for statement in method.body for child in local_walk(statement)
+            ]
+            for method in methods
+        }
+        loads = {}
+        for method, nodes in scopes.items():
+            for node in nodes:
+                if self_attribute(node) and isinstance(node.ctx, ast.Load):
+                    loads.setdefault(node.attr, []).append((method, node))
+        for method, nodes in scopes.items():
+            local = scope_bindings(method, nodes)
+            for statement, following in [
+                *pairwise(method.body),
+                *adjacent_statements(nodes),
+            ]:
+                if not (
+                    isinstance(statement, (ast.Assign, ast.AnnAssign))
+                    and isinstance(statement.value, ast.Name)
+                    and statement.value.id in local
+                    and isinstance(following, ast.Return)
+                    and isinstance(following.value, ast.Name)
+                    and following.value.id == statement.value.id
+                ):
+                    continue
+                for target in write_targets(statement):
+                    if not (self_attribute(target) and target.attr.startswith("_")):
+                        continue
+                    readers = sorted(
+                        (
+                            (other.name, load)
+                            for other, load in loads.get(target.attr, [])
+                            if other is not method
+                        ),
+                        key=lambda reader: (reader[1].lineno, reader[1].col_offset),
+                    )
+                    if readers:
+                        stashes[statement] = (target.attr, following, readers)
+    return stashes
 
 
 def context_tokens(node):
@@ -720,7 +785,7 @@ class CandidateProbes(CandidateRecords):
         super().__init__(source)
         self.attributes = declarations(tree)
         self.imported = import_bindings(ast.walk(tree))
-        self.module_imported = import_bindings(local_walk(tree))
+        self.stashes = same_class_stashes(tree)
         self.iterations = {}
         self.lock_contexts = {}
         self.transaction_contexts = set()
@@ -863,7 +928,6 @@ class CandidateProbes(CandidateRecords):
         self.functions.add(".".join(self.symbols))
         self.function_depth += 1
         self.dead_parameters(node)
-        self.typed_parameters(node)
         self.state_smuggling(node)
         self.transaction_checks(node)
         self.generic_visit(node)
@@ -911,31 +975,23 @@ class CandidateProbes(CandidateRecords):
 
     def state_smuggling(self, node):
         nodes = [child for statement in node.body for child in local_walk(statement)]
-        external_bindings = {
-            name
-            for child in nodes
-            if isinstance(child, (ast.Global, ast.Nonlocal))
-            for name in child.names
-        }
-        bindings = {
-            param.arg: param.lineno
-            for param in [*parameters(node), node.args.vararg, node.args.kwarg]
-            if param is not None
-        }
-        owned = set()
         for child in nodes:
-            for name in binding_names(child):
-                bindings.setdefault(name, child.lineno)
-            for target in write_targets(child):
-                if (
-                    isinstance(target, ast.Name)
-                    and target.id not in external_bindings
-                    and not isinstance(child, ast.AugAssign)
-                    and constructed_here(child.value)
-                ):
-                    owned.add(target.id)
-        imported = import_bindings(nodes) | (self.module_imported - bindings.keys())
-        for child in nodes:
+            if child in self.stashes:
+                attr, returned, readers = self.stashes[child]
+                name = returned.value.id
+                self.add(
+                    "PY07_state_smuggling",
+                    child,
+                    f"self.{attr} = {name} at line {child.lineno} precedes return "
+                    f"{name}; read in "
+                    + ", ".join(
+                        f"{method} at line {load.lineno}" for method, load in readers
+                    ),
+                    "Could each reader receive this value as an explicit argument from "
+                    f"a caller that already holds the return, or does self.{attr} "
+                    "memoize it across calls (Counterweight)? See python.md §8.",
+                    related=(returned, *(load for _, load in readers)),
+                )
             if isinstance(child, ast.Dict):
                 for key, value in zip(child.keys, child.values, strict=True):
                     self.dict_dependency(key, value)
@@ -961,28 +1017,6 @@ class CandidateProbes(CandidateRecords):
                         target, ast.Subscript
                     ):
                         self.dict_dependency(target.slice, child.value, child)
-                    if (
-                        isinstance(target, ast.Attribute)
-                        and target.attr.startswith("_")
-                        and not target.attr.startswith("__")
-                        and isinstance(target.value, ast.Name)
-                        and target.value.id not in {"self", "cls"} | imported | owned
-                    ):
-                        name = target.value.id
-                        binding = (
-                            f"bound at line {bindings[name]}"
-                            if name in bindings
-                            else "has no binding in this function"
-                        )
-                        self.add(
-                            "PY07_state_smuggling",
-                            child,
-                            f"Foreign '{name}' ({binding}) receives '{target.attr}' "
-                            f"at line {target.lineno}",
-                            f"Does the immediate producer own '{name}' and require this "
-                            "private mutation, or can state be passed explicitly; is a "
-                            "documented extension/lifecycle protocol a Counterweight?",
-                        )
 
     def dict_dependency(self, key, value, assignment=None):
         if not (
@@ -1013,75 +1047,6 @@ class CandidateProbes(CandidateRecords):
             "a Counterweight?",
             related=() if assignment is not None else (value,),
         )
-
-    def typed_parameters(self, node):
-        defaults = parameter_defaults(node)
-        concrete = {
-            param.arg: (param, concrete_annotation(param.annotation))
-            for param in parameters(node)
-            if not is_none(defaults[param.arg])
-        }
-        concrete = {
-            name: value for name, value in concrete.items() if value[1] is not None
-        }
-        if not concrete:
-            return
-        nodes = [child for statement in node.body for child in local_walk(statement)]
-        unbound_annotations = {
-            child.target
-            for child in nodes
-            if isinstance(child, ast.AnnAssign) and child.value is None
-        }
-        deferred_bindings = {}
-        for child in nodes:
-            for target in write_targets(child):
-                for bound in bound_targets(target):
-                    # RHS checks still observe the parameter before the store.
-                    deferred_bindings[bound] = (
-                        child.end_lineno,
-                        child.end_col_offset,
-                    )
-        first_bind = {}
-        for child in nodes:
-            if child in unbound_annotations:
-                continue
-            for name in binding_names(child) & concrete.keys():
-                position = deferred_bindings.get(
-                    child, (child.lineno, child.col_offset)
-                )
-                first_bind[name] = min(first_bind.get(name, position), position)
-        for child in nodes:
-            name = none_check(child)
-            checked_types = None
-            if (
-                isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Name)
-                and child.func.id == "isinstance"
-                and len(child.args) == 2
-                and not child.keywords
-                and isinstance(child.args[0], ast.Name)
-            ):
-                name = child.args[0].id
-                checked_types = terminal_names(child.args[1])
-            if name not in concrete:
-                continue
-            param, annotation_type = concrete[name]
-            if checked_types is not None and annotation_type not in checked_types:
-                continue
-            if (
-                name in first_bind
-                and (child.lineno, child.col_offset) >= first_bind[name]
-            ):
-                continue
-            self.add(
-                "PY06_revalidated_typed_param",
-                child,
-                f"Parameter '{name}' annotated {ast.unparse(param.annotation)} at line "
-                f"{param.lineno} is checked at line {child.lineno} before rebinding",
-                f"Does the immediate caller or type definition establish '{name}' as "
-                f"{annotation_type} already, or is this an untrusted/public entry point "
-                "(Counterweight)?",
-            )
 
     def dead_parameters(self, node):
         params = {
