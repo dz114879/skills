@@ -3,6 +3,7 @@
 
 import argparse
 import ast
+import builtins
 from dataclasses import dataclass, field
 import fnmatch
 import io
@@ -259,12 +260,47 @@ def bound_targets(target):
         yield target
 
 
-def declarations(tree):
+def absent_self_attribute(test):
+    if not isinstance(test, ast.UnaryOp) or not isinstance(test.op, ast.Not):
+        return None
+    call = test.operand
+    if (
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "hasattr"
+        and len(call.args) == 2
+        and isinstance(call.args[0], ast.Name)
+        and call.args[0].id == "self"
+        and isinstance(call.args[1], ast.Constant)
+        and isinstance(call.args[1].value, str)
+    ):
+        return call.args[1].value
+    return None
+
+
+def guarded_self_writes(node):
+    if not isinstance(node, ast.If):
+        return
+    attr = absent_self_attribute(node.test)
+    if attr is None:
+        return
+    for statement in node.body:
+        for write in local_walk(statement):
+            if (
+                not isinstance(write, (ast.Assign, ast.AnnAssign))
+                or write.value is None
+            ):
+                continue
+            for target in write_targets(write):
+                for attribute in bound_targets(target):
+                    if self_attribute(attribute) and attribute.attr == attr:
+                        yield attribute, write.value
+
+
+def class_declarations(classes):
     attributes = {}
-    for cls in ast.walk(tree):
-        if not isinstance(cls, ast.ClassDef):
-            continue
-        for statement in cls.body:
+    for cls in classes:
+        for statement in lexical_nodes(cls.body):
             if isinstance(statement, (ast.Assign, ast.AnnAssign)):
                 targets = (
                     [statement.target]
@@ -274,27 +310,81 @@ def declarations(tree):
                 for target in targets:
                     for name in bound_targets(target):
                         if isinstance(name, ast.Name):
-                            attributes.setdefault(name.id, []).append(
-                                (cls.name, statement.lineno)
+                            attributes.setdefault((cls, name.id), set()).add(
+                                statement.lineno
                             )
-            elif (
-                isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and statement.name == "__init__"
-            ):
-                for child in statement.body:
-                    for target in assignments(child):
-                        for attribute in bound_targets(target):
-                            if (
-                                isinstance(attribute, ast.Attribute)
-                                and isinstance(attribute.value, ast.Name)
-                                and attribute.value.id == "self"
-                            ):
-                                attributes.setdefault(attribute.attr, []).append(
-                                    (cls.name, attribute.lineno)
-                                )
-    for clues in attributes.values():
-        clues.sort(key=lambda clue: (clue[1], clue[0]))
+        methods = [
+            method
+            for method in lexical_nodes(cls.body)
+            if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        helpers = {
+            node.func.attr
+            for initializer in methods
+            if initializer.name == "__init__"
+            for node in lexical_nodes(initializer.body)
+            if isinstance(node, ast.Call) and self_attribute(node.func)
+        }
+        for method in methods:
+            if method.name not in {"__init__", *helpers}:
+                continue
+            # Lazy presence-guarded writes do not establish a construction invariant.
+            lazy_targets = {
+                attribute
+                for node in lexical_nodes(method.body)
+                for attribute, _ in guarded_self_writes(node)
+            }
+            for statement in method.body:
+                for target in assignments(statement):
+                    for attribute in bound_targets(target):
+                        if self_attribute(attribute) and attribute not in lazy_targets:
+                            attributes.setdefault((cls, attribute.attr), set()).add(
+                                attribute.lineno
+                            )
     return attributes
+
+
+def named_class(node, classes):
+    name = node.id if isinstance(node, ast.Name) else None
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        name = node.value
+    matches = classes.get(name, [])
+    return matches[0] if len(matches) == 1 else None
+
+
+def undeclared_attribute(cls, attr, classes, attributes):
+    pending = [cls]
+    seen = set()
+    while pending:
+        owner = pending.pop()
+        if owner in seen:
+            continue
+        seen.add(owner)
+        if (owner, attr) in attributes:
+            return False
+        for base in owner.bases:
+            if isinstance(base, ast.Name) and base.id == "object":
+                continue
+            parent = named_class(base, classes)
+            if parent is None:
+                return False
+            pending.append(parent)
+    return True
+
+
+def zero_arg_constructor(node, classes):
+    if not isinstance(node, ast.Call) or node.args or node.keywords:
+        return False
+    name = terminal_name(node.func)
+    return name is not None and (
+        name[:1].isupper()
+        or (
+            isinstance(node.func, ast.Name)
+            and isinstance(vars(builtins).get(name), type)
+        )
+        or name in {"cls", "__new__", "__class__"}
+        or named_class(node.func, classes) is not None
+    )
 
 
 def local_walk(node):
@@ -783,7 +873,13 @@ class CandidateRecords(ast.NodeVisitor):
 class CandidateProbes(CandidateRecords):
     def __init__(self, source, tree):
         super().__init__(source)
-        self.attributes = declarations(tree)
+        classes = [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
+        self.classes = {}
+        for cls in local_walk(tree):
+            if isinstance(cls, ast.ClassDef):
+                self.classes.setdefault(cls.name, []).append(cls)
+        self.attributes = class_declarations(classes)
+        self.parents = []
         self.imported = import_bindings(ast.walk(tree))
         self.stashes = same_class_stashes(tree)
         self.iterations = {}
@@ -809,6 +905,7 @@ class CandidateProbes(CandidateRecords):
         self.functions = set()
 
     def generic_visit(self, node):
+        self.parents.append(node)
         for _, value in ast.iter_fields(node):
             if (
                 isinstance(value, list)
@@ -817,6 +914,7 @@ class CandidateProbes(CandidateRecords):
             ):
                 self.default_shadows(value)
         super().generic_visit(node)
+        self.parents.pop()
 
     def default_shadows(self, body):
         for index, statement in enumerate(body):
@@ -1222,6 +1320,110 @@ class CandidateProbes(CandidateRecords):
 
     visit_AsyncWith = visit_With
 
+    def receiver_binding(self, receiver):
+        root = receiver
+        while isinstance(root, (ast.Attribute, ast.Subscript)):
+            root = root.value
+        if not isinstance(root, ast.Name):
+            return [], None
+        for scope in reversed(self.parents):
+            if isinstance(
+                scope, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+            ) and any(
+                isinstance(name, ast.Name) and name.id == root.id
+                for generator in scope.generators
+                for name in bound_targets(generator.target)
+            ):
+                break
+            if not isinstance(
+                scope, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+            ):
+                continue
+            body = [] if isinstance(scope, ast.Lambda) else scope.body
+            nodes = lexical_nodes(body)
+            for statement in reversed(nodes):
+                targets = (
+                    [statement.target]
+                    if isinstance(statement, ast.AnnAssign)
+                    else write_targets(statement)
+                )
+                if (
+                    targets
+                    and (statement.end_lineno, statement.end_col_offset)
+                    <= (receiver.lineno, receiver.col_offset)
+                    and any(
+                        isinstance(name, ast.Name) and name.id == root.id
+                        for target in targets
+                        for name in bound_targets(target)
+                    )
+                ):
+                    annotation = (
+                        statement.annotation
+                        if isinstance(statement, ast.AnnAssign)
+                        else None
+                    )
+                    return [
+                        f"local binding {ast.unparse(statement)} at line {statement.lineno} "
+                        "(control-flow unresolved)"
+                    ], annotation if receiver is root else None
+            if not isinstance(scope, ast.Module):
+                for param in (*parameters(scope), scope.args.vararg, scope.args.kwarg):
+                    if param is not None and param.arg == root.id:
+                        annotation = (
+                            ast.unparse(param.annotation)
+                            if param.annotation is not None
+                            else "<unannotated>"
+                        )
+                        return [
+                            f"parameter {param.arg}: {annotation} at line {param.lineno}"
+                        ], param.annotation if receiver is root else None
+            if any(
+                root.id in binding_names(child)
+                for statement in body
+                for child in local_walk(statement)
+            ):
+                break
+        return [], None
+
+    def reflection_evidence(self, receiver, cls, attr):
+        facts = [f"Receiver {ast.unparse(receiver)}"]
+        if isinstance(receiver, ast.Name) and receiver.id == "self" and cls is not None:
+            facts.append(f"enclosing class {cls.name} at line {cls.lineno}")
+        else:
+            binding, annotation = self.receiver_binding(receiver)
+            facts.extend(binding)
+            cls = named_class(annotation, self.classes)
+        if cls is None:
+            facts.append("receiver class unknown")
+        else:
+            bases = (
+                ", ".join(ast.unparse(base) for base in cls.bases)
+                or "object (implicit)"
+            )
+            facts.append(f"receiver class {cls.name}; bases: {bases}")
+            facts.extend(
+                f"Same-file class {cls.name} declares attribute '{attr}' at line {line}"
+                for line in sorted(self.attributes.get((cls, attr), []))
+            )
+        return "; ".join(facts)
+
+    def memo_guard(self, cls, attr):
+        if cls is None:
+            return False
+        test, guard = self.parents[-1], self.parents[-2]
+        if not (
+            isinstance(guard, ast.If)
+            and absent_self_attribute(test) == attr
+            and undeclared_attribute(cls, attr, self.classes, self.attributes)
+        ):
+            return False
+        return any(
+            not is_none(value)
+            and literal_truth(value) is None
+            and not zero_arg_constructor(value, self.classes)
+            for _, value in guarded_self_writes(guard)
+        )
+
     def visit_Call(self, node):
         self.roundtrip(node)
         if (
@@ -1263,20 +1465,25 @@ class CandidateProbes(CandidateRecords):
             )
         ):
             attr = node.args[1].value
-            evidence = (
-                "; ".join(
-                    f"Same-file class {cls} declares attribute '{attr}' at line {line}"
-                    for cls, line in self.attributes.get(attr, [])
-                )
-                or f"No same-file class declaration found for attribute '{attr}'"
+            cls = next(
+                (
+                    parent
+                    for parent in reversed(self.parents)
+                    if isinstance(parent, ast.ClassDef)
+                ),
+                None,
             )
+            if self.memo_guard(cls, attr):
+                self.generic_visit(node)
+                return
             self.add(
                 "PY01_reflect_default",
                 node,
-                evidence,
-                f"Does the immediate producer or type definition prove the receiver "
-                f"is owned here and guaranteed to define '{attr}', or is it a "
-                "dynamic proxy/plugin/external object (Counterweight)?",
+                self.reflection_evidence(node.args[0], cls, attr),
+                "Does the immediate producer or governing type (including third-party classes) "
+                "guarantee the attribute, even if nullable, or is it an optional capability? "
+                "For owned state, do construction/lifecycle writes or constructor-bypassing "
+                "callers/tests explain absence? See python.md §1.",
                 signature=attr,
             )
         self.generic_visit(node)

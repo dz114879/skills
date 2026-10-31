@@ -1515,15 +1515,216 @@ class ScanPythonTests(unittest.TestCase):
         self.assertEqual(candidate["symbol"], "Record.read")
         self.assertEqual(candidate["change_tag"], "path-audit")
         self.assertEqual(candidate["code"], 'getattr(self, "value", 0)')
-        self.assertEqual(
-            candidate["evidence"],
-            "Same-file class Record declares attribute 'value' at line 3",
-        )
-        self.assertIn("owned", candidate["verify"])
-        self.assertIn("'value'", candidate["verify"])
-        self.assertIn("Counterweight", candidate["verify"])
+        self.assertIn("Receiver self", candidate["evidence"])
+        self.assertIn("class Record", candidate["evidence"])
+        self.assertIn("'value' at line 3", candidate["evidence"])
 
-    def test_reflection_pairs_and_all_same_file_declarations(self):
+    def test_memo_guard_requires_an_undeclared_attribute_and_a_derived_write(self):
+        memo = 'if not hasattr(self, "cache"):\n    self.cache = build(self.source)'
+        for declaration, bases, guard in (
+            (
+                "",
+                "object",
+                'if hasattr(self, "cache"):\n    self.cache = build(self.source)',
+            ),
+            (
+                "",
+                "object",
+                'if not hasattr(self, "cache"):\n    self.other = build(self.source)',
+            ),
+            ("cache: bytes", "object", memo),
+            ("cache = None", "object", memo),
+            ("def __init__(self):\n    self.cache = seed", "object", memo),
+            (
+                "def __init__(self):\n    self.prepare()\n"
+                "def prepare(self):\n    self.cache = seed",
+                "object",
+                memo,
+            ),
+            ("", "Middle", memo),
+            ("", "External", memo),
+            ("", "ExternalMiddle", memo),
+            ("", "object", 'if not hasattr(self, "cache"):\n    self.cache = {}'),
+            ("", "object", 'if not hasattr(self, "cache"):\n    self.cache = Cache()'),
+        ):
+            with self.subTest(declaration=declaration, bases=bases, guard=guard):
+                self.put(
+                    "memo.py",
+                    "from foreign import External\n"
+                    "class Base:\n    cache: bytes\n"
+                    "class Middle(Base):\n    pass\n"
+                    "class ExternalMiddle(External):\n    pass\n"
+                    "class Memo(object):\n    def read(self):\n"
+                    + textwrap.indent(memo, "        ")
+                    + f"\nclass Hedge({bases}):\n"
+                    + textwrap.indent(declaration, "    ")
+                    + "\n    def read(self):\n"
+                    + textwrap.indent(guard, "        ")
+                    + "\n",
+                )
+                candidates = [
+                    candidate
+                    for candidate in self.scan("--paths", ".")["candidates"]
+                    if candidate["rule"] == "PY01_reflect_default"
+                ]
+                self.assertEqual([c["symbol"] for c in candidates], ["Hedge.read"])
+
+    def test_reflection_class_names_resolve_only_at_module_scope(self):
+        for wrapper, suffix, visible in (
+            ("def factory():", "", False),
+            ("class Factory:", "", False),
+            ("if supported:", "", True),
+            ("try:", "except ImportError:\n    pass\n", True),
+        ):
+            with self.subTest(wrapper=wrapper):
+                self.put(
+                    "classes.py",
+                    "from external import Base, Record\n"
+                    + wrapper
+                    + "\n    class Base:\n        pass\n"
+                    "    class Record:\n        cache: bytes\n"
+                    + suffix
+                    + "class Model(Base):\n    def read(self):\n"
+                    '        if not hasattr(self, "cache"):\n'
+                    "            self.cache = derive(self.source)\n"
+                    "def inspect(item: Record):\n"
+                    '    return getattr(item, "cache", None)\n',
+                )
+                candidates = {
+                    c["symbol"]: c
+                    for c in self.scan("--paths", ".")["candidates"]
+                    if c["rule"] == "PY01_reflect_default"
+                }
+                self.assertEqual("Model.read" in candidates, not visible)
+                evidence = candidates["inspect"]["evidence"]
+                self.assertIn("item: Record", evidence)
+                if visible:
+                    self.assertIn("'cache' at line 6", evidence)
+                else:
+                    self.assertIn("class unknown", evidence)
+                    self.assertNotIn("'cache' at line 6", evidence)
+
+    def test_constructor_helpers_distinguish_lazy_writes_from_declarations(self):
+        for body, expected in (
+            ('if not hasattr(self, "cache"):\n    self.cache = build(self.source)', []),
+            (
+                'if not hasattr(self, "cache"):\n    self.cache, other = derive(self.source)',
+                [],
+            ),
+            ("self.cache = build(self.source)", ["Model.read"]),
+            (
+                'if not hasattr(self, "other"):\n    self.cache = build(self.source)',
+                ["Model.prepare", "Model.read"],
+            ),
+            (
+                'if not hasattr(self, "cache"):\n    pass\nelse:\n    self.cache = build(self.source)',
+                ["Model.prepare", "Model.read"],
+            ),
+        ):
+            with self.subTest(body=body):
+                self.put(
+                    "helpers.py",
+                    "class Model:\n"
+                    "    def __init__(self):\n"
+                    "        if ready:\n            self.prepare()\n"
+                    "    def prepare(self):\n"
+                    + textwrap.indent(body, "        ")
+                    + "\n    def read(self):\n"
+                    '        if not hasattr(self, "cache"):\n'
+                    "            self.cache = build(self.source)\n",
+                )
+                candidates = [
+                    c
+                    for c in self.scan("--paths", ".")["candidates"]
+                    if c["rule"] == "PY01_reflect_default"
+                ]
+                self.assertEqual([c["symbol"] for c in candidates], expected)
+
+    def test_conditional_initializer_and_helper_definitions_all_contribute_declarations(
+        self,
+    ):
+        for methods in (
+            "def __init__(self):\n    self.prepare()\n"
+            "if enabled:\n    def prepare(self):\n        self.cache = seed\n"
+            "else:\n    def prepare(self):\n        pass\n",
+            "if enabled:\n    def __init__(self):\n        self.prepare()\n"
+            "else:\n    def __init__(self):\n        pass\n"
+            "def prepare(self):\n    self.cache = seed\n",
+            "def __init__(self):\n    self.prepare()\n"
+            "try:\n    def prepare(self):\n        self.cache = seed\n"
+            "except ImportError:\n    def prepare(self):\n        pass\n",
+        ):
+            with self.subTest(methods=methods):
+                self.put(
+                    "conditional.py",
+                    "class Model:\n"
+                    + textwrap.indent(methods, "    ")
+                    + "    def read(self):\n"
+                    '        if not hasattr(self, "cache"):\n'
+                    "            self.cache = derive(self.source)\n",
+                )
+                candidates = [
+                    c
+                    for c in self.scan("--paths", ".")["candidates"]
+                    if c["rule"] == "PY01_reflect_default"
+                ]
+                self.assertEqual([c["symbol"] for c in candidates], ["Model.read"])
+
+    def test_memo_guard_uses_any_derived_write_but_only_in_the_guarded_body(self):
+        for body, expected in (
+            ("self.cache = None", True),
+            ("self.cache, other = derive(self.source)", False),
+            ("self.cache, other = (None, False)", True),
+            ("self.cache = -1", True),
+            ("self.cache = list()", True),
+            ("self.cache = bytearray()", True),
+            ("self.cache = complex()", True),
+            ("self.cache = self.compute()", False),
+            ("self.cache = Cache(source=self.source)", False),
+            (
+                "if empty:\n    self.cache = ''\nelse:\n    self.cache = derive(self.source)",
+                False,
+            ),
+            (
+                "if empty:\n    self.cache = Cache()\nelse:\n    self.cache = derive(self.source)",
+                False,
+            ),
+            ("def deferred():\n    self.cache = derive(self.source)", True),
+        ):
+            with self.subTest(body=body):
+                self.put(
+                    "memo.py",
+                    "class Model:\n    def read(self):\n"
+                    '        if not hasattr(self, "cache"):\n'
+                    + textwrap.indent(body, "            ")
+                    + "\n",
+                )
+                candidates = [
+                    c
+                    for c in self.scan("--paths", ".")["candidates"]
+                    if c["rule"] == "PY01_reflect_default"
+                ]
+                self.assertEqual(len(candidates), int(expected))
+
+    def test_memo_guard_distinguishes_builtin_constructor_from_same_named_method(self):
+        for value, expected in (("self.bytes()", []), ("bytes()", ["Model.read"])):
+            with self.subTest(value=value):
+                self.put(
+                    "memo.py",
+                    "class Model:\n"
+                    "    def bytes(self):\n        return self.source\n"
+                    "    def read(self):\n"
+                    '        if not hasattr(self, "cache"):\n'
+                    f"            self.cache = {value}\n",
+                )
+                candidates = [
+                    c
+                    for c in self.scan("--paths", ".")["candidates"]
+                    if c["rule"] == "PY01_reflect_default"
+                ]
+                self.assertEqual([c["symbol"] for c in candidates], expected)
+
+    def test_reflection_pairs_only_cite_the_receivers_class(self):
         self.put(
             "model.py",
             """
@@ -1557,17 +1758,99 @@ class ScanPythonTests(unittest.TestCase):
         self.assertEqual(len(result["candidates"]), 3)
         first, second, third = result["candidates"]
         self.assertEqual(first["symbol"], "Second.read.nested")
-        self.assertEqual(
-            first["evidence"],
-            (
-                "Same-file class First declares attribute 'value' at line 6; "
-                "Same-file class Second declares attribute 'value' at line 8; "
-                "Same-file class Second declares attribute 'value' at line 10"
-            ),
-        )
+        self.assertIn("Receiver self", first["evidence"])
+        self.assertIn("class Second", first["evidence"])
+        self.assertNotIn("First", first["evidence"])
+        self.assertIn("'value' at line 8", first["evidence"])
+        self.assertIn("'value' at line 10", first["evidence"])
         self.assertIn("'other' at line 11", second["evidence"])
         self.assertEqual(third["symbol"], "<module>")
-        self.assertIn("No same-file", third["evidence"])
+        self.assertIn("Receiver local", third["evidence"])
+        self.assertIn("class unknown", third["evidence"])
+        self.assertNotIn("Second", third["evidence"])
+
+    def test_receiver_evidence_stops_at_inner_bindings_but_preserves_closure_annotations(
+        self,
+    ):
+        for body, known in (
+            ('return [getattr(item, "value", None) for item in values]', False),
+            (
+                "def nested():\n    try:\n        run()\n"
+                "    except Exception as item:\n"
+                '        return getattr(item, "value", None)',
+                False,
+            ),
+            ('def nested():\n    return getattr(item, "value", None)', True),
+        ):
+            with self.subTest(body=body):
+                self.put(
+                    "shadowing.py",
+                    "class Record:\n    value: int\n"
+                    "def inspect(item: Record, values):\n"
+                    + textwrap.indent(body, "    ")
+                    + "\n",
+                )
+                candidates = [
+                    c
+                    for c in self.scan("--paths", ".")["candidates"]
+                    if c["rule"] == "PY01_reflect_default"
+                ]
+                self.assertEqual(len(candidates), 1)
+                evidence = candidates[0]["evidence"]
+                if known:
+                    self.assertRegex(evidence, r"item: Record.*line 3")
+                    self.assertIn("'value' at line 2", evidence)
+                else:
+                    self.assertIn("class unknown", evidence)
+                    self.assertNotIn("Record", evidence)
+
+    def test_receiver_evidence_reports_annotations_bindings_and_owning_class(self):
+        self.put(
+            "receivers.py",
+            "class Base:\n    pass\n"
+            "class Record(Base, external.Mixin):\n"
+            "    value: int\n"
+            "    def __init__(self):\n        self.prepare()\n"
+            "    def prepare(self):\n        self.cache = seed\n"
+            "    def read(self):\n        return getattr(self, 'cache', None)\n"
+            "class Unrelated:\n    value = 0\n"
+            "def typed(item: Record):\n    return getattr(item, 'value', None)\n"
+            "def unknown(item: Any):\n    return getattr(item, 'value', None)\n"
+            "def member(item: Record):\n    return getattr(item.child, 'value', None)\n"
+            "def plugin():\n    cls = load_plugin()\n"
+            "    return getattr(cls, 'value', None)\n"
+            "def assigned():\n    item = Record()\n"
+            "    return getattr(item, 'value', None)\n"
+            "def forward(item: 'Record'):\n    return hasattr(item, 'value')\n",
+        )
+        evidence = {
+            candidate["symbol"]: candidate["evidence"]
+            for candidate in self.scan("--paths", ".")["candidates"]
+            if candidate["rule"] == "PY01_reflect_default"
+        }
+        self.assertIn("Receiver self", evidence["Record.read"])
+        self.assertIn("class Record", evidence["Record.read"])
+        self.assertRegex(evidence["Record.read"], r"bases:.*Base.*external.Mixin")
+        self.assertIn("'cache' at line 8", evidence["Record.read"])
+        self.assertRegex(evidence["typed"], r"item: Record.*line 13")
+        self.assertIn("'value' at line 4", evidence["typed"])
+        self.assertIn("'value' at line 4", evidence["forward"])
+        self.assertRegex(evidence["unknown"], r"item: Any.*line 15")
+        self.assertIn("class unknown", evidence["unknown"])
+        self.assertIn("Receiver item.child", evidence["member"])
+        self.assertRegex(evidence["member"], r"item: Record.*line 17")
+        self.assertIn("class unknown", evidence["member"])
+        self.assertNotIn("'value' at line 4", evidence["member"])
+        self.assertRegex(
+            evidence["plugin"], r"local binding cls = load_plugin\(\).*line 20"
+        )
+        self.assertIn("control-flow unresolved", evidence["plugin"])
+        self.assertIn("class unknown", evidence["plugin"])
+        self.assertRegex(evidence["assigned"], r"item = Record\(\).*line 23")
+        self.assertIn("control-flow unresolved", evidence["assigned"])
+        self.assertIn("class unknown", evidence["assigned"])
+        for facts in evidence.values():
+            self.assertNotIn("Unrelated", facts)
 
     def test_error_washing_broad_handlers_follow_control_flow(self):
         cases = [
@@ -2476,22 +2759,23 @@ class ScanPythonTests(unittest.TestCase):
                     if ready:
                         self.real = 1
                     self.uninitialized: int
-            hasattr(item, "foreign")
-            hasattr(item, "child")
-            hasattr(item, "nested")
-            hasattr(item, "real")
-            hasattr(item, "one")
-            hasattr(item, "two")
-            hasattr(item, "uninitialized")
+            def inspect(item: Model):
+                hasattr(item, "foreign")
+                hasattr(item, "child")
+                hasattr(item, "nested")
+                hasattr(item, "real")
+                hasattr(item, "one")
+                hasattr(item, "two")
+                hasattr(item, "uninitialized")
         """,
         )
         candidates = self.scan("--paths", ".")["candidates"]
         for candidate in candidates[:3]:
-            self.assertIn("No same-file", candidate["evidence"])
+            self.assertNotIn("declares attribute", candidate["evidence"])
         self.assertIn("'real' at line 9", candidates[3]["evidence"])
         self.assertIn("'one' at line 3", candidates[4]["evidence"])
         self.assertIn("'two' at line 3", candidates[5]["evidence"])
-        self.assertIn("No same-file", candidates[6]["evidence"])
+        self.assertNotIn("declares attribute", candidates[6]["evidence"])
 
     def test_checkout_ancestors_do_not_affect_relative_path_rules(self):
         for ancestor in ("build", "tests"):

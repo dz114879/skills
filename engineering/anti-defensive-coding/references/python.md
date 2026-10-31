@@ -4,9 +4,9 @@
 
 ### Owned attribute hedging
 
-**Pattern Name & Grade Condition:** Owned attribute hedging — `[Simplify]`, **Revalidation**, when the receiver's constructor or immediate producer already guarantees the attribute.
+**Pattern Name & Grade Condition:** Owned attribute hedging — `[Simplify]`, **Revalidation**, when the receiver's construction or immediate producer guarantees the attribute; `[Hard]` when the fallback masks a broken mock or a test-only state that diverges from production (see `tests.md` §5).
 
-**Signal (Bad):** A known local type is treated as a partially initialized dynamic object.
+**Signal (Bad):** A receiver whose governing type guarantees the attribute, including a third-party class, is treated as a partially initialized dynamic object.
 
 ```python
 def read_total(reader):
@@ -15,7 +15,7 @@ def read_total(reader):
     return getattr(reader, "count", 0)
 ```
 
-**1-Hop Verify & Fix (Good):** Inspect the receiver's constructor/dataclass and the immediate producer: are `totals` and `count` part of its owned contract? Initialize them at construction and read them directly, keeping real optional *values* distinct from missing attributes.
+**1-Hop Verify & Fix (Good):** Inspect the receiver's governing type and immediate producer, then its construction and lifecycle writes: are `totals` and `count` guaranteed here? For owned state, inventory immediate callers and tests, including `object.__new__` and spec'd mocks that bypass construction. If only an incomplete fixture relies on absence, repair the fixture and remove the accommodation (`tests.md` §5). Initialize ordinary owned fields at construction and read them directly. A guaranteed attribute with a nullable *value* still supports direct access and a value check; a receiver union or an optional capability may require a presence check.
 
 ```python
 class Reader:
@@ -28,11 +28,11 @@ def read_total(reader: Reader):
     return reader.count
 ```
 
-**Counterweight (When to Keep):** A dynamic proxy, plugin, or externally owned object may genuinely omit an optional capability. An optional protocol member or versioned third-party API can require reflection; a same-file attribute with the same name alone proves nothing about that receiver.
+**Counterweight (When to Keep):** A dynamic proxy, plugin, or versioned third-party API may genuinely omit an optional capability; external ownership alone does not establish that exception. A same-file attribute with the same name proves nothing about the receiver. For an owned object, absence can deliberately mean unread, unopened, uncomputed, or not yet established by a setter (for example, `ResponseNotRead` or an unset elapsed time). Check every same-class writer and constructor path before replacing that state model. Preserve presence checks when `""` or `b""` are valid materialized values: truthiness would confuse an empty result with an unread one.
 
 ### Required model fields disguised as optional or rechecked at runtime
 
-**Pattern Name & Grade Condition:** Required-field reflection and type revalidation — `[Simplify]`, **Revalidation**, when the admission boundary already guarantees the field and its type.
+**Pattern Name & Grade Condition:** Required-field reflection and type revalidation — `[Simplify]`, **Revalidation**, when the admission boundary or owned writers already guarantee the field, its type, or a field correlation.
 
 **Signal (Bad):** An admission boundary guarantees a non-null typed field, but a partial internal `SimpleNamespace`, `Optional` field annotation, or runtime `is None` / `isinstance` guard treats the established contract as untrusted.
 
@@ -61,6 +61,20 @@ def project(accepted: AcceptedItem) -> str:
 def describe(item: AcceptedItem) -> str:
     return item.category
 ```
+
+**Correlated owned-field variant:** A constructor establishes `host_regex = None` exactly when `host` is empty, and all later writers preserve that relation. The first conjunct below repeats the second (as in httpx's `URLPattern.matches`):
+
+```python
+# Bad: rechecks the same owned invariant twice.
+if self.host and self.host_regex is not None and not self.host_regex.match(other.host):
+    return False
+
+# Good: use the field that controls the operation.
+if self.host_regex is not None and not self.host_regex.match(other.host):
+    return False
+```
+
+Inspect the constructor and setters at 1 hop; keep both guards when supported writers can vary the fields independently.
 
 **Counterweight (When to Keep):** Sparse external payloads, public partial-update models, `Union` / `Optional` / `Any` inputs, and versioned plugin records can legitimately omit fields or vary by runtime type. Verify the upstream admission guarantee before tightening annotations or removing runtime type checks.
 
