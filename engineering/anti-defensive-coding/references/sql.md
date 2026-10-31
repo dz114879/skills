@@ -368,6 +368,36 @@ def commit_import(self, batch_id: str, rows: list[dict]) -> dict:
 
 ## 8. Backup Verification, Schema Init & Lock Recovery Safety
 
+### Catch-all around idempotent `ALTER TABLE … ADD COLUMN`
+
+**Pattern Name & Grade Condition:** Migration failure washing — `[Hard]`, **Error Washing**, when a failed schema change is reported as successful initialization and callers proceed against missing columns.
+
+**Signal (Bad):** Startup unconditionally adds columns and treats every exception as “already exists.”
+
+```python
+try:
+    conn.execute("ALTER TABLE jobs ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0")
+except Exception:
+    pass
+```
+
+**1-Hop Verify & Fix (Good):** Inspect the startup caller and the table's schema. Duplicate-column, locked/read-only database, and I/O failures can all be `sqlite3.OperationalError`; narrowing to that class still washes real migration failures. Read `PRAGMA table_info` once for the table, add only missing columns, and propagate failures from those additions.
+
+```python
+columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+additions = {
+    "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+    "last_error": "TEXT",
+}
+for name, declaration in additions.items():  # Owned schema constants.
+    if name not in columns:
+        conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {declaration}")
+```
+
+The read-then-add remedy requires a single migration owner. When multiple processes may migrate concurrently, acquire one write transaction with `BEGIN IMMEDIATE` **before** the `PRAGMA` read and keep all additions inside it; commit together or roll back on failure. This prevents another migrator from invalidating the inspected schema between the read and the `ALTER`s.
+
+**Counterweight (When to Keep):** A migration runner may catch at its outer boundary to roll back and report an explicit failed migration. Preserve that failure outcome; initialization succeeds only after the required schema exists.
+
 ### `PRAGMA integrity_check == 'ok'` treated as valid backup or falling through to `schema.sql` initialization
 
 **Pattern Name & Grade Condition:** Empty-backup wash via `integrity_check` / first-boot init fallthrough — `[Hard]`, **Error Washing**, when an empty or truncated backup can pass verification and fall through to first-boot initialization (false success that wipes production data on swap).

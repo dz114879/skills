@@ -232,9 +232,9 @@ def get_header_spec(name: str) -> HeaderSpec:
 
 ### Broad or migrated internal exception washing
 
-**Pattern Name & Grade Condition:** Internal exception washing / **Moved Defense** — `[Hard]`, **Error Washing**, when an internal defect the guarded code can raise becomes a fallback value or false success at the caller; add **Half-Moves & Zombie Scaffolding** when the catch was relocated into callees during a refactor.
+**Pattern Name & Grade Condition:** Internal exception washing / **Moved Defense** — `[Hard]`, **Error Washing**, when a reachable internal defect or corrupt input becomes false success, omitted required work, or fail-open behavior at the caller; `[Simplify]`, **Revalidation**, when the immediate producer or governing type makes the caught failure unreachable. An established recovery contract is a **Counterweight**. Apply `SKILL.md` Step 4 to these three outcomes; add **Half-Moves & Zombie Scaffolding** when the catch was relocated into callees during a refactor.
 
-**Signal (Bad):** Internal typed computation is wrapped in `except Exception:` or a multi-exception tuple (`KeyError`, `TypeError`, `AttributeError`, `ValueError`, `OverflowError`) that returns a fallback value or gets copy-pasted/migrated into downstream constructors and helpers when an upstream catch is removed.
+**Signal (Bad):** Internal typed computation is wrapped in `except Exception:` or a multi-exception tuple (`KeyError`, `TypeError`, `AttributeError`, `ValueError`, `OverflowError`) that returns a fallback value or gets copy-pasted/migrated into downstream constructors and helpers when an upstream catch is removed. The exception set is a review trigger: `TypeError` and `ValueError` also occur in legitimate boundary parsers.
 
 ```python
 def compute_allocation(plan: ValidatedPlan) -> dict[str, int]:
@@ -244,14 +244,50 @@ def compute_allocation(plan: ValidatedPlan) -> dict[str, int]:
         return {}
 ```
 
-**1-Hop Verify & Fix (Good):** Inspect `ValidatedPlan` and the immediate callers (including any surviving caller that lost the catch in the same diff). Internal `KeyError`, `TypeError`, and `AttributeError` indicate code defects, not recoverable runtime conditions. Remove the internal catch so bugs surface immediately; confine `try/except` to exact external boundary operations.
+**1-Hop Verify & Fix (Good):** Inspect `ValidatedPlan` and the immediate callers (including any surviving caller that lost the catch in the same diff). Which failure outcome reaches the caller or operator: false success, omitted required work, or fail-open behavior? Identify the producer's actual failure contract and the consumer's response before choosing recovery. Remove catches around established internal invariants; confine boundary recovery to the operation and failure it can handle. A handler ending in a same-file `NoReturn` helper still needs review: the immediate producer may already translate that failure, leaving a duplicate translation layer.
 
 ```python
 def compute_allocation(plan: ValidatedPlan) -> dict[str, int]:
     return {item.id: item.units * plan.rate for item in plan.items}
 ```
 
-**Counterweight (When to Keep):** Parsing untrusted wire/file input with exact exception types (such as `json.JSONDecodeError` or `ValueError` around a single `int(raw_text)` call), top-level worker/request isolation boundaries that log full tracebacks and return structured failure responses, or best-effort shutdown cleanup where the contract requires logging and continuing.
+**Exact-handler lint ownership:** Apply the **Lint-Owned** test in `SKILL.md` Step 3 to the actual handler header (`BLE001`) or handler statement (`S110`, `TRY400`); a diagnostic inside a nested handler does not own the outer one. Name the remedy: narrow a best-effort Discord acknowledgement to `discord.HTTPException` and retain the appropriate traceback, for example. Check the outcome after that remedy. An imported framework call may mutate a local registry rather than perform external I/O.
+
+| Narrowing leaves an established recovery outcome | Narrowing leaves Error Washing |
+| --- | --- |
+| A secondary lease-renewal POST can catch `httpx.RequestError` while the primary heartbeat remains authoritative. | Catching `JSONDecodeError` still conflates malformed nonempty request JSON with an absent body when both become `{}`. |
+| A preparatory unarchive can catch HTTP failures when the delivery caller separately records delivery failure and cleans partial evidence. | Catching `OSError` around a failed backup still falsely claims “backed up” before returning empty state. |
+| A failed refusal edit can fall back to a send while remaining fail-closed; a failed `defer()` can return before mutation. | Catching documented command-registration errors still hides an omitted local registry entry. |
+| Expected transport failures can be reported without claiming that the operation succeeded. | Catching HTTP/NotFound still hides an ephemeral message edited through the wrong, guaranteed-to-fail channel route. |
+
+Duplicate-column and real migration failures both use `sqlite3.OperationalError`; apply the schema-inspection remedy in `sql.md` §8 instead of narrowing alone.
+
+**Multi-exception pair:** Heterogeneous wire status may legitimately become an explicit “unrecognized” sentinel; malformed supplied configuration must not become a valid priority/channel `0` or retention `30`. An “unknown” display label preserves uncertainty rather than fabricating valid state.
+
+```python
+def parse_wire_status(raw):
+    try:
+        return Status(int(raw))
+    except (TypeError, ValueError):
+        return UNRECOGNIZED  # The wire/display contract exposes this outcome.
+
+
+def configured_channel(raw):
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0  # Bad: malformed supplied config silently disables reporting.
+```
+
+Keep the documented absent-configuration default separate; reject or report a malformed supplied value instead of inventing a valid one.
+
+**Counterweight (When to Keep):** Recovery must preserve the failure outcome or the data the immediate consumer relies on. Logging alone does not establish recovery.
+
+- Boundary parsing of untrusted wire/file input with exact exception types and an explicit invalid/unknown result, or a consumed failed future/structured result, preserves failure as failure. Fail-closed rejection and best-effort shutdown cleanup can likewise satisfy their contracts.
+- Worker/request/scheduler/listener isolation records full tracebacks for unexpected failures and exposes the failed outcome. A top catch in a coroutine already detached by its caller (`asyncio.create_task` with no result consumer) adds no isolation; keeping it requires full-traceback logging or compensation for partial side effects, and the outcome test above still applies.
+- Per-item best-effort delivery to an external service returns an outcome the caller acts on: for example, the caller raises when neither voice nor text landed, or records each failed delivery. A blanket `continue` that silently omits required work does not supply that outcome.
+- Fail-safe merge/I/O recovery reports failure (such as `None`) and the immediate caller keeps the original branch/data instead of deleting it. Check that the failed operation is not later reported as successful.
+- Documented in-process transport/test-client modes may surface the application's failure as an HTTP 500 response behind a public flag that defaults to re-raise, such as ASGI `raise_app_exceptions`.
 
 ### `json.loads(..., object_pairs_hook=...)` washed under `except ValueError`
 

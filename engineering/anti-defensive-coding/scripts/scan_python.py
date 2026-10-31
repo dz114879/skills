@@ -537,6 +537,184 @@ def simple_assignment(node):
     return None
 
 
+def statement_neighbors(node, parent):
+    body = next(
+        value
+        for _, value in ast.iter_fields(parent)
+        if isinstance(value, list) and node in value
+    )
+    index = body.index(node)
+    return body[:index], body[index + 1 :]
+
+
+def saved_exception(handler):
+    assignment = simple_assignment(handler.body[-1])
+    if (
+        assignment is not None
+        and isinstance(assignment[1], ast.Name)
+        and assignment[1].id == handler.name
+    ):
+        return assignment[0]
+    return None
+
+
+def exception_save_targets(handlers, slot):
+    return {
+        target
+        for handler in handlers
+        if saved_exception(handler) == slot
+        for target in write_targets(handler.body[-1])
+    }
+
+
+def raises_name(node, name):
+    return (
+        isinstance(node, ast.Raise)
+        and isinstance(node.exc, ast.Name)
+        and node.exc.id == name
+    )
+
+
+def saved_retry(node, handler, parents):
+    slot = saved_exception(handler)
+    if slot is None:
+        return False
+    loop = parents[-1]
+    if (
+        not isinstance(loop, (ast.For, ast.While))
+        or loop.orelse
+        or (isinstance(loop, ast.While) and literal_truth(loop.test))
+        or exits(handler.body) & {"return", "break", "continue"}
+        or any(isinstance(child, ast.Break) for child in local_walk(loop))
+    ):
+        return False
+    before, after = statement_neighbors(node, loop)
+    if any("return" in statement_exits(statement) for statement in before + after):
+        return False
+    saves = exception_save_targets(node.handlers, slot)
+    if any(
+        slot in binding_names(child) and child not in saves
+        for child in local_walk(loop)
+    ):
+        return False
+    _, following = statement_neighbors(loop, parents[-2])
+    if following and isinstance(following[0], ast.Assert):
+        if any(slot in binding_names(child) for child in local_walk(following[0])):
+            return False
+        following = following[1:]
+    return bool(following) and raises_name(following[0], slot)
+
+
+def final_attempt(test, name, count):
+    if not (
+        isinstance(test, ast.Compare)
+        and isinstance(test.left, ast.Name)
+        and test.left.id == name
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], ast.Eq)
+    ):
+        return False
+    value = test.comparators[0]
+    return (isinstance(value, ast.Constant) and value.value == count - 1) or (
+        isinstance(value, ast.BinOp)
+        and isinstance(value.op, ast.Sub)
+        and isinstance(value.left, ast.Constant)
+        and value.left.value == count
+        and isinstance(value.right, ast.Constant)
+        and value.right.value == 1
+    )
+
+
+def bounded_retry(node, handler, parent):
+    if not (
+        isinstance(parent, ast.For)
+        and parent.body == [node]
+        and isinstance(parent.target, ast.Name)
+        and isinstance(parent.iter, ast.Call)
+        and isinstance(parent.iter.func, ast.Name)
+        and parent.iter.func.id == "range"
+        and len(parent.iter.args) == 1
+        and not parent.iter.keywords
+    ):
+        return False
+    count = parent.iter.args[0]
+    if not (
+        isinstance(count, ast.Constant) and type(count.value) is int and count.value > 0
+    ):
+        return False
+    success = exits(node.body)
+    if "return" not in success or not success <= {"return", "bare", "raise"}:
+        return False
+    if any(parent.target.id in binding_names(child) for child in local_walk(node)):
+        return False
+    guard = handler.body[-1]
+    return (
+        isinstance(guard, ast.If)
+        and final_attempt(guard.test, parent.target.id, count.value)
+        and exits(guard.body) == {"bare"}
+        and not guard.orelse
+        and not exits(handler.body) & {"return", "break", "continue"}
+    )
+
+
+def stored_primary_cleanup(node, handler, parents):
+    guard = handler.body[-1]
+    if not (
+        isinstance(guard, ast.If)
+        and none_check(guard.test) is not None
+        and isinstance(guard.test.ops[0], ast.Is)
+        and exits(guard.body) == {"bare"}
+        and not guard.orelse
+        and not exits(handler.body) & {"return", "break", "continue"}
+    ):
+        return False
+    slot = none_check(guard.test)
+    primary = parents[-1]
+    if not (
+        isinstance(primary, ast.Try)
+        and node in primary.finalbody
+        and not statement_exits(primary) & {"return", "break", "continue"}
+    ):
+        return False
+    before, after = statement_neighbors(primary, parents[-2])
+    if not before or not after:
+        return False
+    initial = simple_assignment(before[-1])
+    propagate = after[0]
+    if not (
+        initial is not None
+        and initial[0] == slot
+        and is_none(initial[1])
+        and isinstance(propagate, ast.If)
+        and none_check(propagate.test) == slot
+        and isinstance(propagate.test.ops[0], ast.IsNot)
+        and len(propagate.body) == 1
+        and raises_name(propagate.body[0], slot)
+        and not propagate.orelse
+    ):
+        return False
+    saves = exception_save_targets(primary.handlers, slot)
+    return bool(saves) and all(
+        child in saves for child in local_walk(primary) if slot in binding_names(child)
+    )
+
+
+def last_noreturn_call(body, helpers):
+    last = body[-1]
+    if not isinstance(last, ast.Expr) or "next" not in exits(body[:-1]):
+        return None
+    call = last.value.value if isinstance(last.value, ast.Await) else last.value
+    if not isinstance(call, ast.Call) or terminal_name(call.func) not in helpers:
+        return None
+    if isinstance(call.func, ast.Name) or (
+        isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id in {"self", "cls"}
+    ):
+        return ast.unparse(call.func)
+    return None
+
+
 def get_call(node):
     return (
         isinstance(node, ast.Call)
@@ -885,7 +1063,10 @@ class CandidateProbes(CandidateRecords):
         self.iterations = {}
         self.lock_contexts = {}
         self.transaction_contexts = set()
+        returns = {}
         for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                returns.setdefault(node.name, []).append(terminal_name(node.returns))
             if isinstance(node, (ast.With, ast.AsyncWith)):
                 self.transaction_contexts.update(
                     item.context_expr
@@ -902,6 +1083,11 @@ class CandidateProbes(CandidateRecords):
                     for child in local_walk(part):
                         if isinstance(child, ast.expr):
                             self.lock_contexts.setdefault(child, []).append(context)
+        self.noreturn_helpers = {
+            name
+            for name, annotations in returns.items()
+            if all(annotation in {"NoReturn", "Never"} for annotation in annotations)
+        }
         self.functions = set()
 
     def generic_visit(self, node):
@@ -1514,11 +1700,24 @@ class CandidateProbes(CandidateRecords):
             broad = caught is None or bool(names & {"Exception", "BaseException"})
             outcomes = exits(handler.body)
             facts = []
-            if (broad or len(names & internal) >= 2) and not outcomes <= {
-                "bare",
-                "raise",
-            }:
-                facts.append("broad/multi-exception handler has a non-raising exit")
+            if (
+                (broad or len(names & internal) >= 2)
+                and not outcomes <= {"bare", "raise"}
+                and not (
+                    not exits(node.finalbody) & {"return", "break", "continue"}
+                    and (
+                        saved_retry(node, handler, self.parents)
+                        or bounded_retry(node, handler, self.parents[-1])
+                        or stored_primary_cleanup(node, handler, self.parents)
+                    )
+                )
+            ):
+                helper = last_noreturn_call(handler.body, self.noreturn_helpers)
+                effective = (outcomes - {"next"}) | {"raise"} if helper else outcomes
+                if not effective <= {"bare", "raise"}:
+                    facts.append("broad/multi-exception handler has a non-raising exit")
+                if helper:
+                    facts.append(f"re-raises via `{helper}` (NoReturn)")
             washes_hook = (
                 hooks and (broad or "ValueError" in names) and outcomes != {"bare"}
             )
@@ -1534,8 +1733,9 @@ class CandidateProbes(CandidateRecords):
                     "Does the immediate hook's rejection contract require preserving its "
                     "diagnostic, or is replacement documented boundary translation (Counterweight)?"
                     if washes_hook
-                    else "Does the immediate producer's error contract require these failures "
-                    "to propagate, or is this documented boundary recovery (Counterweight)?"
+                    else "Which failure outcome reaches the immediate caller: false success, "
+                    "omitted work, or fail-open, versus an established recovery contract "
+                    "(Counterweight)? Is this handler Lint-Owned? See python.md §4."
                 )
                 self.add(
                     "PY02_error_washing",
