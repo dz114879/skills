@@ -46,6 +46,8 @@ When Python is in scope, run the extractor once using the matching scope:
 
 Use `--help` for root, filtering, classification, and output controls. Capture the summary, candidates, and parse errors. Current extraction covers `PY01`–`PY10c`, including moved defenses, test smells, and cross-test reachability. `PY06` is retired because pyright strict (`reportUnnecessaryIsInstance`, `reportUnnecessaryComparison`) owns typed-parameter revalidation; recognize that shape by hand. A declaration clue does not prove the receiver's type, and an empty extraction does not establish a clean review.
 
+**Diff scope:** Pre-existing defenses inside a definition the diff modifies are in scope. An untouched definition reached only by name, through a deleted or rewritten call or a same-named definition (a `PY10c` candidate whose evidence says "definition unchanged"), is in scope only when the diff changed its callers' behavior.
+
 **Completion criterion:** Full file inventory and `scan_python.py` output (when Python is in scope) are captured, and all in-scope diff hunks or target files have been read.
 
 ### 2. Disclose Matching Reference Catalogues
@@ -72,7 +74,7 @@ For every extractor candidate and manually spotted family pattern, inspect its i
 
 **Lint-Owned:** When a standard linter or typechecker rule already reports the candidate's exact node, confirm the candidate only when a 1-hop defect survives that rule's prescribed fix; otherwise dismiss it as **Lint-Owned**.
 
-**Completion criterion:** Every candidate is either confirmed with a concrete 1-hop proof (`file:line` of producer/caller/schema/dispatch source) or dismissed as a Counterweight, an unresolved contract, or Lint-Owned.
+**Completion criterion:** Every candidate is either confirmed with a concrete 1-hop proof (`file:line` of producer/caller/schema/dispatch source) or dismissed as a Counterweight, an unresolved contract, Lint-Owned, or out of diff scope (Step 1).
 
 ### 4. Grade & Report
 

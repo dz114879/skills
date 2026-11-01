@@ -4,6 +4,7 @@
 import argparse
 import ast
 import builtins
+from collections import Counter
 from dataclasses import dataclass, field
 import fnmatch
 import io
@@ -2290,6 +2291,51 @@ def target_name(name):
     return name is not None and len(name) >= 4 and not name.startswith("__")
 
 
+@dataclass(frozen=True)
+class CallSite:
+    """A target-named call on a changed line of the diff."""
+
+    name: str
+    role: str
+    source: str
+    path: str
+    line: int
+
+
+def call_sites(tree, lines, path, file_role):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and intersects(node, lines):
+            name = terminal_name(node.func)
+            if target_name(name):
+                yield CallSite(name, file_role, ast.unparse(node), path, node.lineno)
+
+
+def lost_calls(deleted, added):
+    """Sorted base sites, by call name, of the (role, source) keys lost on balance."""
+    losing = Counter((site.role, site.source) for site in deleted) - Counter(
+        (site.role, site.source) for site in added
+    )
+    lost = {}
+    for site in deleted:
+        if (site.role, site.source) in losing:
+            lost.setdefault(site.name, set()).add((site.path, site.line, site.role))
+    return {name: sorted(sites) for name, sites in lost.items()}
+
+
+def lost_call_clause(sites, changed):
+    """Evidence clause naming the lost calls that triggered a definition."""
+    if not sites:
+        return ""
+    clause = "; lost call(s): " + ", ".join(
+        f"base {path}:{line} ({file_role})" for path, line, file_role in sites
+    )
+    return (
+        clause
+        if changed
+        else clause + "; definition unchanged; triggered by deleted call"
+    )
+
+
 def framework_hook(node):
     return any(
         context_tokens(decorator)
@@ -2506,7 +2552,7 @@ def effective_arguments(node, call):
     }
 
 
-def constant_defaults(definition, calls, change_tag, base_clause):
+def constant_defaults(definition, calls, change_tag, clauses):
     path, source, node, symbol, recursive_calls = definition
     if framework_hook(node):
         return []
@@ -2523,7 +2569,7 @@ def constant_defaults(definition, calls, change_tag, base_clause):
             record.add(
                 "PY10c_cross_test_reachability",
                 default,
-                f"Parameter '{name}': {len(calls)} resolved prod call sites; uniform value: {values.pop()}{base_clause}",
+                f"Parameter '{name}': {len(calls)} resolved prod call sites; uniform value: {values.pop()}{clauses}",
                 "Does every immediate production binding, recursion included, fix this value, "
                 "so the override is dead while the default's policy stays? Is it an export or "
                 "extension contract (Counterweight)? See tests.md §4.",
@@ -2632,7 +2678,10 @@ def external_base_clause(enclosing_class, classes):
     )
 
 
-def cross_reachability(root, tip, args, targets, deleted_calls, active_trees, errors):
+def cross_reachability(root, tip, args, selected, lost, active_trees, errors):
+    """`selected` maps changed (path, line) definitions to names; `lost` maps
+    net-lost call names to their base sites."""
+    targets = {*selected.values(), *lost}
     if not targets:
         return [], 0
     # Re-exporting modules (`from .core import Client; __all__ = [...]`) may not
@@ -2678,6 +2727,17 @@ def cross_reachability(root, tip, args, targets, deleted_calls, active_trees, er
                     (path, source, node, symbol, refs.recursive_calls.get(node, []))
                 )
     public = public_contracts(scopes, paths)
+
+    def emitted(path, node):
+        # A diff emits changed definitions plus every namesake of a lost call;
+        # a path audit keeps every same-named definition.
+        return not args.base or (path, node.lineno) in selected or node.name in lost
+
+    def clauses(path, node):
+        return lost_call_clause(
+            lost.get(node.name), (path, node.lineno) in selected
+        ) + external_base_clause(method_classes.get(node), classes)
+
     candidates = []
     for name, defs in definitions.items():
         prod = counts[name]["prod"]
@@ -2688,13 +2748,14 @@ def cross_reachability(root, tip, args, targets, deleted_calls, active_trees, er
             and defs[0][2] not in public
             and not prod.non_calls
             and bindings
+            and emitted(defs[0][0], defs[0][2])
         ):
             candidates.extend(
                 constant_defaults(
                     defs[0],
                     bindings,
                     "changed" if args.base else "path-audit",
-                    external_base_clause(method_classes.get(defs[0][2]), classes),
+                    clauses(defs[0][0], defs[0][2]),
                 )
             )
         if prod.calls or prod.non_calls:
@@ -2703,7 +2764,7 @@ def cross_reachability(root, tip, args, targets, deleted_calls, active_trees, er
             "cross-test"
             if test.calls or test.non_calls
             else "orphaned"
-            if name in deleted_calls
+            if name in lost
             else None
         )
         if tag is None:
@@ -2718,14 +2779,14 @@ def cross_reachability(root, tip, args, targets, deleted_calls, active_trees, er
         if len(defs) > 1:
             evidence += f"; ambiguous_defs: {len(defs)}"
         for path, source, node, symbol, _ in defs:
-            if framework_hook(node) or node in public:
+            if framework_hook(node) or node in public or not emitted(path, node):
                 continue
             record = CandidateRecords(source)
             record.symbols = symbol.split(".")
             record.add(
                 "PY10c_cross_test_reachability",
                 node,
-                evidence + external_base_clause(method_classes.get(node), classes),
+                evidence + clauses(path, node),
                 "Does a registration API, by-name loader, inherited external-base hook "
                 "or export reach this definition, with dispatch checked both ways? "
                 "See tests.md §4.",
@@ -2740,7 +2801,7 @@ def scan(root, files, base, tip, args):
     scanned = set()
     before, after = {}, {}
     active_trees = {}
-    targets, deleted_calls = set(), set()
+    selected, deleted_calls, added_calls = {}, [], []
     for change in sorted(files, key=lambda item: item.path):
         relative = change.path
         if change.old_path is not None:
@@ -2749,17 +2810,16 @@ def scan(root, files, base, tip, args):
                 scanned.add(relative)
                 parsed = parse_source(raw, change.old_path, parse_errors, base=True)
                 if parsed:
-                    deleted_calls.update(
-                        terminal_name(node.func)
-                        for node in ast.walk(parsed[1])
-                        if isinstance(node, ast.Call)
-                        and intersects(node, change.deleted_lines)
-                        and target_name(terminal_name(node.func))
+                    base_role = role(Path(change.old_path), args.test_glob)
+                    deleted_calls.extend(
+                        call_sites(
+                            parsed[1], change.deleted_lines, change.old_path, base_role
+                        )
                     )
-                if parsed and role(Path(change.old_path), args.test_glob) == "prod":
-                    probes = CandidateProbes(*parsed)
-                    probes.visit(parsed[1])
-                    before[relative] = probes
+                    if base_role == "prod":
+                        probes = CandidateProbes(*parsed)
+                        probes.visit(parsed[1])
+                        before[relative] = probes
         path = root / relative
         if change.deleted or (tip is None and path.is_symlink()):
             continue
@@ -2771,13 +2831,17 @@ def scan(root, files, base, tip, args):
         active_trees[relative] = parsed
         if not parsed:
             continue
-        is_test = role(Path(relative), args.test_glob) == "test"
-        probes = (TestProbes if is_test else CandidateProbes)(*parsed)
+        file_role = role(Path(relative), args.test_glob)
+        if args.base:
+            added_calls.extend(
+                call_sites(parsed[1], change.added_lines, relative, file_role)
+            )
+        probes = (TestProbes if file_role == "test" else CandidateProbes)(*parsed)
         probes.visit(parsed[1])
-        if not is_test:
+        if file_role == "prod":
             after[relative] = probes
-            targets.update(
-                node.name
+            selected.update(
+                ((relative, node.lineno), node.name)
                 for node in ast.walk(parsed[1])
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                 and target_name(node.name)
@@ -2803,8 +2867,8 @@ def scan(root, files, base, tip, args):
         root,
         tip,
         args,
-        targets | deleted_calls,
-        deleted_calls,
+        selected,
+        lost_calls(deleted_calls, added_calls),
         active_trees,
         parse_errors,
     )

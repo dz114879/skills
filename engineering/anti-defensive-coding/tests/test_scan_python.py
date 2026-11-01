@@ -1100,6 +1100,95 @@ class ScanPythonTests(unittest.TestCase):
             self.scan("--base", base)["candidates"][0]["change_tag"], "cross-test"
         )
 
+    def test_cross_diff_emits_changed_definitions_not_unchanged_namesakes(self):
+        self.init_repo()
+        panel = "class Panel:\n    def shared(self):\n        return 2\n"
+        self.put("app.py", "def shared():\n    return 1\n" + panel)
+        self.put("other.py", "def shared():\n    return 3\n")
+        self.put("tests/test_app.py", "shared()\n")
+        base = self.commit()
+        self.put("app.py", "def shared():\n    return 4\n" + panel)
+        for other, flagged in [
+            ("def shared():\n    return 3\n", ["app.py"]),
+            ("def shared():\n    return 5\n", ["app.py", "other.py"]),
+        ]:
+            with self.subTest(other=other):
+                self.put("other.py", other)
+                candidates = self.scan("--base", base)["candidates"]
+                self.assertEqual(
+                    [(c["path"], c["symbol"], c["change_tag"]) for c in candidates],
+                    [(path, "shared", "cross-test") for path in flagged],
+                )
+                for candidate in candidates:
+                    self.assertIn("test calls: 1", candidate["evidence"])
+                    self.assertIn("ambiguous_defs: 3", candidate["evidence"])
+
+    def test_cross_diff_deleted_calls_trigger_on_net_loss_naming_lost_sites(self):
+        self.init_repo()
+        self.put("app.py", "def helper(value, retries=3):\n    return value, retries\n")
+        base_files = {
+            "caller.py": "helper(1)\nresult = helper(2)\n",
+            "extra.py": "helper(5)\n",
+        }
+        cases = [
+            (
+                "re-added on the next line",
+                {"caller.py": "helper(1)\nresult = None\nhelper(2)\n"},
+                None,
+            ),
+            (
+                "re-added reformatted",
+                {"caller.py": "helper(1)\nresult = helper(\n    2,\n)\n"},
+                None,
+            ),
+            (
+                "re-added in another prod file",
+                {"caller.py": "helper(1)\n", "other.py": "helper(2)\n"},
+                None,
+            ),
+            (
+                "lost",
+                {"caller.py": "helper(1)\n", "extra.py": None},
+                "base caller.py:2 (prod), base extra.py:1 (prod)",
+            ),
+            (
+                "replaced by a test call",
+                {"caller.py": "helper(1)\n", "tests/test_app.py": "helper(2)\n"},
+                "base caller.py:2 (prod)",
+            ),
+            (
+                "arguments changed",
+                {"caller.py": "helper(1)\nresult = helper(3)\n"},
+                "base caller.py:2 (prod)",
+            ),
+        ]
+        tip_only = {path for _, changes, _ in cases for path in changes} - set(
+            base_files
+        )
+        for label, changes, lost in cases:
+            with self.subTest(label):
+                for path in tip_only:
+                    (self.root / path).unlink(missing_ok=True)
+                for path, source in base_files.items():
+                    self.put(path, source)
+                base = self.commit()
+                for path, source in changes.items():
+                    if source is None:
+                        (self.root / path).unlink()
+                    else:
+                        self.put(path, source)
+                tip = self.commit()
+                candidates = self.scan("--base", base, "--tip", tip)["candidates"]
+                self.assertEqual(
+                    [(c["path"], c["symbol"], c["code"]) for c in candidates],
+                    [("app.py", "helper", "3")] if lost else [],
+                )
+                if lost:
+                    evidence = candidates[0]["evidence"]
+                    self.assertIn("uniform value: <DEFAULT>", evidence)
+                    self.assertIn(f"lost call(s): {lost}", evidence)
+                    self.assertIn("definition unchanged", evidence)
+
     def test_cross_snapshot_isolation_exact_tip_and_default_merge_base(self):
         self.init_repo()
         self.put("app.py", "def reachable():\n    return 1\n")
@@ -1263,16 +1352,24 @@ class ScanPythonTests(unittest.TestCase):
         self.assertEqual(
             [(c["symbol"], c["change_tag"]) for c in orphaned], [("idle", "orphaned")]
         )
+        lost = "lost call(s): base tests/test_app.py:2 (test)"
+        self.assertIn(lost, orphaned[0]["evidence"])
+        self.assertIn("definition unchanged", orphaned[0]["evidence"])
         self.put(
             "app.py",
             "async def callback():\n    return 2\n"
             "def configure(flag=False, *, mode=None):\n    return flag, mode, 2\n"
-            "def idle():\n    return 1\n",
+            "def idle():\n    return 2\n",
         )
         candidates = self.scan("--base", base)["candidates"]
         callback = next(c for c in candidates if c["symbol"] == "callback")
         self.assertEqual(callback["change_tag"], "cross-test")
         self.assertIn("test calls: 0, test non-call refs: 1", callback["evidence"])
+        self.assertNotIn("lost call(s)", callback["evidence"])
+        idle = next(c for c in candidates if c["symbol"] == "idle")
+        self.assertEqual(idle["change_tag"], "orphaned")
+        self.assertIn(lost, idle["evidence"])
+        self.assertNotIn("definition unchanged", idle["evidence"])
         defaults = [c for c in candidates if c["symbol"] == "configure"]
         self.assertEqual(len(defaults), 2)
         self.assertEqual({c["change_tag"] for c in defaults}, {"changed"})
