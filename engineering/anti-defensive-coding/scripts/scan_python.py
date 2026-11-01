@@ -137,6 +137,8 @@ def diff_scope(args):
             *DIFF_FLAGS,
             "--unified=0",
             "--inter-hunk-context=0",
+            # Unlike `-w`, keeps indentation changes, which are semantic in Python.
+            "--ignore-space-at-eol",
             *endpoints,
             "--",
             *dict.fromkeys((old_path, path)),
@@ -1042,7 +1044,8 @@ class CandidateRecords(ast.NodeVisitor):
         self.function_depth = 0
         self.defenses = []
 
-    def add(self, rule, node, evidence, verify, related=(), signature=None):
+    def add(self, rule, node, evidence, verify, related=(), signature=None, scope=()):
+        """`scope` line ranges make the candidate diff-eligible outside its `span`."""
         nodes = (node, *related)
         spans = [(item.lineno, item.end_lineno) for item in nodes]
         code = "; ".join(ast.get_source_segment(self.source, item) for item in nodes)
@@ -1057,7 +1060,7 @@ class CandidateRecords(ast.NodeVisitor):
                 "code": " ".join(code.split())[:200],
                 "evidence": evidence,
                 "verify": verify,
-                "_spans": spans,
+                "_scope": [*spans, *scope],
             }
         )
         if signature is not None and self.function_depth:
@@ -1794,6 +1797,8 @@ class CandidateProbes(CandidateRecords):
                     signature=tuple(sorted(names - {None}))
                     if caught is not None
                     else ("bare",),
+                    # A rewritten try body widens what an unchanged handler swallows.
+                    scope=[(node.body[0].lineno, node.body[-1].end_lineno)],
                 )
         self.generic_visit(node)
 
@@ -2782,7 +2787,7 @@ def scan(root, files, base, tip, args):
         for candidate in probes.candidates:
             if change.added_lines is not None and not any(
                 line in change.added_lines
-                for start, end in candidate["_spans"]
+                for start, end in candidate["_scope"]
                 for line in range(start, end + 1)
             ):
                 continue
@@ -2806,7 +2811,7 @@ def scan(root, files, base, tip, args):
     candidates.extend(cross)
     candidates.sort(key=lambda item: (item["path"], item["span"][0], item["rule"]))
     for index, candidate in enumerate(candidates, 1):
-        candidate.pop("_spans")
+        candidate.pop("_scope")
         candidate["id"] = f"C{index:02d}"
     return {
         "summary": {

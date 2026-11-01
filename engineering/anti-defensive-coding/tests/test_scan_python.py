@@ -2702,9 +2702,9 @@ class ScanPythonTests(unittest.TestCase):
                 )
                 self.assertEqual(self.scan("--paths", "hook.py")["candidates"], [])
 
-    def test_error_washing_diff_uses_handler_span_not_try_body(self):
+    def test_error_washing_diff_scope_covers_handler_and_guarded_try_body(self):
         self.init_repo()
-        self.put(
+        path = self.put(
             "errors.py",
             """
             def load():
@@ -2712,27 +2712,38 @@ class ScanPythonTests(unittest.TestCase):
                     work()
                 except Exception:
                     log()
+                else:
+                    done()
+                finally:
+                    close()
             """,
         )
+        source = path.read_text()
         base = self.commit()
-        with (self.root / "errors.py").open("a") as source:
-            source.write("        return {}\n")
-        candidates = self.scan("--base", base)["candidates"]
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["rule"], "PY02_error_washing")
-        self.assertEqual(candidates[0]["span"], [4, 6])
-        self.assertEqual(candidates[0]["change_tag"], "changed")
-        self.put(
-            "errors.py",
-            """
-            def load():
-                try:
-                    changed_work()
-                except Exception:
-                    log()
-            """,
-        )
-        self.assertEqual(self.scan("--base", base)["candidates"], [])
+        for old, new, expected in [
+            (
+                "log()",
+                "log()\n        return {}",
+                [([4, 6], "except Exception: log() return {}")],
+            ),
+            ("work()", "rewritten_work()", [([4, 5], "except Exception: log()")]),
+            ("done()", "rewritten_done()", []),
+            ("close()", "rewritten_close()", []),
+        ]:
+            with self.subTest(edited=old):
+                path.write_text(source.replace(old, new))
+                tip = self.commit()
+                candidates = self.scan("--base", base, "--tip", tip)["candidates"]
+                self.assertEqual(
+                    [
+                        (c["rule"], c["span"], c["code"], c["change_tag"])
+                        for c in candidates
+                    ],
+                    [
+                        ("PY02_error_washing", span, code, "changed")
+                        for span, code in expected
+                    ],
+                )
 
     def test_default_shadows_required_guard_within_five_siblings(self):
         cases = [
@@ -3464,6 +3475,41 @@ class ScanPythonTests(unittest.TestCase):
                         ("textconv.py", [1, 1]),
                     ],
                 )
+
+    def test_diff_ignores_trailing_whitespace_but_counts_indentation(self):
+        self.init_repo()
+        path = self.put(
+            "edits.py",
+            """
+            def check(item):
+                return hasattr(item, "trailing")
+
+
+            def load():
+                try:
+                    work()
+                except Exception:
+                    return {}
+
+
+            def realign(item):
+                return hasattr(
+                    item, "indented")
+            """,
+        )
+        base = self.commit()
+        path.write_text(
+            path.read_text()
+            .replace('"trailing")\n', '"trailing")  \t\n')
+            .replace("work()\n", "work()   \n")
+            .replace('        item, "indented")', '            item, "indented")')
+        )
+        tip = self.commit()
+        candidates = self.scan("--base", base, "--tip", tip)["candidates"]
+        self.assertEqual(
+            [(c["rule"], c["span"], c["symbol"]) for c in candidates],
+            [("PY01_reflect_default", [13, 14], "realign")],
+        )
 
     def test_declaration_clues_respect_assignment_targets_and_lexical_scope(self):
         self.put(
