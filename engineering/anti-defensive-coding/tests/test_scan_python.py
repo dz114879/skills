@@ -915,25 +915,156 @@ class ScanPythonTests(unittest.TestCase):
 
     def test_module_all_mutations_suppress_constant_default_candidates(self):
         self.init_repo()
-        self.put("app.py", "def configure(flag=False):\n    return flag\n")
-        self.put("caller.py", "configure(True)\n")
-        for exports, expected in [
-            ('__all__.append("configure")', False),
-            ('__all__.extend(["configure"])', False),
-            ('__all__[0] = "configure"', False),
-            ('if exporting:\n    __all__.append("configure")', False),
-            ('declare(__all__, "configure")', False),
-            ('__all__.append("other")', True),
-            ('__all__ = []\nPUBLIC = ["configure"]', True),
-            ('def local_exports():\n    __all__.append("configure")', True),
-            ('class Fixture:\n    __all__.append("configure")', True),
+        definitions = (
+            "def configure(flag=False):\n    return flag\n"
+            "def sibling(flag=False):\n    return flag\n"
+        )
+        self.put("caller.py", "configure(True)\nsibling(True)\n")
+        for module, exports, exported in [
+            ("app.py", '__all__ = []\n__all__ += ["configure"]', True),
+            ("app.py", '__all__.append("configure")', True),
+            ("app.py", '__all__.extend(["configure"])', True),
+            ("app.py", '__all__[0] = "configure"', True),
+            ("app.py", 'if exporting:\n    __all__.append("configure")', True),
+            ("app.py", 'declare(__all__, "configure")', True),
+            ("app.py", '__all__.append("other")', False),
+            ("app.py", '__all__ = []\nPUBLIC = ["configure"]', False),
+            ("app.py", 'PUBLIC = ["configure"]\n__all__ = PUBLIC', False),
+            ("app.py", 'def local_exports():\n    __all__.append("configure")', False),
+            ("app.py", 'class Fixture:\n    __all__.append("configure")', False),
+            # `exports.py` never imports `configure`, so its `__all__` exports nothing.
+            ("exports.py", '__all__.append("configure")', False),
+        ]:
+            with self.subTest(module=module, exports=exports):
+                own = module == "app.py"
+                self.put("app.py", definitions + (exports + "\n" if own else ""))
+                self.put("exports.py", "" if own else exports + "\n")
+                candidates = self.scan("--paths", "app.py")["candidates"]
+                self.assertEqual(
+                    [(c["symbol"], c["code"]) for c in candidates],
+                    [("sibling", "False")]
+                    if exported
+                    else [("configure", "False"), ("sibling", "False")],
+                )
+
+    def test_cross_exported_function_skips_reach_but_not_unexported_namesake(self):
+        self.init_repo()
+        self.put("other.py", "def helper():\n    return 2\n")
+        self.put("tests/test_app.py", "helper()\n")
+        for exports, flagged in [
+            ('__all__ = ["helper"]\n', ["other.py"]),
+            ("", ["app.py", "other.py"]),
         ]:
             with self.subTest(exports=exports):
-                self.put("exports.py", exports + "\n")
-                candidates = self.scan("--paths", "app.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected), candidates)
-                if expected:
-                    self.assertIn("uniform value: True", candidates[0]["evidence"])
+                self.put("app.py", exports + "def helper():\n    return 1\n")
+                candidates = self.scan("--paths", "app.py", "other.py")["candidates"]
+                self.assertEqual(
+                    [(c["path"], c["symbol"], c["change_tag"]) for c in candidates],
+                    [(path, "helper", "cross-test") for path in flagged],
+                )
+
+    def test_cross_static_reexport_makes_definition_public(self):
+        self.init_repo()
+        self.put("pkg/core.py", "def helper():\n    return 1\n")
+        self.put("tests/test_core.py", "from pkg import helper\nhelper()\n")
+        for package, exported in [
+            ('from .core import helper\n__all__ = ["helper"]', True),
+            ('from pkg.core import helper\n__all__ = ["helper"]', True),
+            ('from .core import helper as public\n__all__ = ["public"]', True),
+            ('from .core import *\n__all__ = ["helper"]', False),
+            ('__all__ = ["helper"]', False),
+            ("from .core import helper", False),
+        ]:
+            with self.subTest(package=package):
+                self.put("pkg/__init__.py", package + "\n")
+                candidates = self.scan("--paths", "pkg/core.py")["candidates"]
+                self.assertEqual(
+                    [(c["symbol"], c["change_tag"]) for c in candidates],
+                    [] if exported else [("helper", "cross-test")],
+                )
+
+    def test_cross_exported_class_public_methods_skip_both_arms(self):
+        self.init_repo()
+        self.put(
+            "pkg/_client.py",
+            "class Client:\n"
+            "    def send(self, request, retries=3):\n"
+            "        return request, retries\n"
+            "    def _prepare(self, request, retries=3):\n"
+            "        return request, retries\n"
+            "    def fetch(self):\n"
+            "        return 1\n"
+            "    def _fetch_raw(self):\n"
+            "        return 1\n",
+        )
+        self.put("caller.py", "Client().send(1)\nClient()._prepare(1)\n")
+        self.put("tests/test_client.py", "Client().fetch()\nClient()._fetch_raw()\n")
+        private = [
+            ("Client._prepare", "path-audit", "3"),
+            ("Client._fetch_raw", "cross-test", "def _fetch_raw(self): return 1"),
+        ]
+        public = [
+            ("Client.send", "path-audit", "3"),
+            ("Client.fetch", "cross-test", "def fetch(self): return 1"),
+        ]
+        # The package module mentions no method name; `__all__` admits it.
+        for package, expected in [
+            ('from ._client import Client\n__all__ = ["Client"]', private),
+            ("from ._client import Client", sorted(public + private)),
+        ]:
+            with self.subTest(package=package):
+                self.put("pkg/__init__.py", package + "\n")
+                candidates = self.scan("--paths", "pkg/_client.py")["candidates"]
+                self.assertEqual(
+                    sorted(
+                        (c["symbol"], c["change_tag"], c["code"]) for c in candidates
+                    ),
+                    sorted(expected),
+                )
+
+    def test_cross_evidence_labels_aggregates_and_external_bases(self):
+        self.init_repo()
+        self.put("models.py", "class Local:\n    pass\n")
+        self.put(
+            "app.py",
+            "from discord import ui\n"
+            "from models import Local\n"
+            "class Panel(ui.View, Local, object):\n"
+            "    def refresh(self):\n"
+            "        return 1\n"
+            "    def resize(self, width=10):\n"
+            "        return width\n"
+            "def refresh():\n"
+            "    return 2\n"
+            "def lonely():\n"
+            "    return 3\n",
+        )
+        self.put("caller.py", "Panel().resize()\n")
+        self.put("tests/test_app.py", "refresh()\nlonely()\n")
+        candidates = self.scan("--paths", "app.py")["candidates"]
+        self.assertEqual(
+            [(c["symbol"], c["change_tag"]) for c in candidates],
+            [
+                ("Panel.refresh", "cross-test"),
+                ("Panel.resize", "path-audit"),
+                ("refresh", "cross-test"),
+                ("lonely", "cross-test"),
+            ],
+        )
+        method, default, function, lonely = (c["evidence"] for c in candidates)
+        external = "enclosing class bases: ui.View (not defined in repo)"
+        for evidence in (method, function):
+            self.assertIn("aggregates across 2 prod definitions", evidence)
+            self.assertIn("not attributed to this definition", evidence)
+            self.assertIn("test calls: 1, test non-call refs: 0", evidence)
+            self.assertIn("ambiguous_defs: 2", evidence)
+        self.assertIn("aggregates across 1 prod definition;", lonely)
+        self.assertNotIn("ambiguous_defs", lonely)
+        self.assertIn(external, method)
+        self.assertIn(external, default)
+        self.assertIn("uniform value: <DEFAULT>", default)
+        self.assertNotIn("enclosing class bases", function)
+        self.assertNotIn("enclosing class bases", lonely)
 
     def test_cross_orphaned_deleted_calls_and_deleted_file_inventory(self):
         self.init_repo()
@@ -1146,7 +1277,7 @@ class ScanPythonTests(unittest.TestCase):
         self.assertEqual(len(defaults), 2)
         self.assertEqual({c["change_tag"] for c in defaults}, {"changed"})
         self.assertEqual({c["code"] for c in defaults}, {"False", "None"})
-        self.put("exports.py", '__all__ = ["configure"]\n')
+        self.put("exports.py", 'from app import configure\n__all__ = ["configure"]\n')
         self.assertFalse(
             [
                 c

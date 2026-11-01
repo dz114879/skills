@@ -226,7 +226,7 @@ def test_order_batch_apply(updater):
     assert receipt.committed is True
 ```
 
-**1-Hop Verify & Fix (Good):** Use the **Candidate Extractor**'s `PY10c_cross_test_reachability` candidate to locate the entry point, then verify its immediate caller and export contract. When production callers exclusively use `stage()` + `commit_staged()` and `.apply()` (or an orphaned repository/helper method individually surfaced by `PY10c`) has zero production callers and no external export obligation, delete `.apply()` and confirmed orphaned helpers, and migrate the test to `stage()` + `commit_staged()`. When `PY10c` instead reports a live function whose default parameter has a uniform production value while tests pass other values, verify the immediate callers and inline or remove the dead parameter branch.
+**1-Hop Verify & Fix (Good):** Use the **Candidate Extractor**'s `PY10c_cross_test_reachability` candidate to locate the entry point, then apply the **Empty caller inventory** check in `SKILL.md` Step 3 and run the dispatch check both ways: confirm whether the mechanism reaches the definition, and whether it provably skips it. A loader that ignores a `deprecated/` directory holding the definition is such a skip, and it serves as the dispatch proof. When production callers exclusively use `stage()` + `commit_staged()` and `.apply()` (or an orphaned repository/helper method individually surfaced by `PY10c`) has zero production callers and no dispatch reaches it, delete `.apply()` and confirmed orphaned helpers, and migrate the test to `stage()` + `commit_staged()`.
 
 ```python
 def test_order_batch_stage_and_commit(updater):
@@ -235,7 +235,12 @@ def test_order_batch_stage_and_commit(updater):
     assert receipt.committed is True
 ```
 
-**Counterweight (When to Keep):** Public SDK convenience methods, CLI entry points, `__all__` exports, framework-registered hooks, or documented backward-compatibility methods and default parameters with live external consumers remain valid contracts even when internal callers use two-phase primitives or omit the default parameter.
+**Uniform default variant:** When `PY10c` reports a default parameter with one uniform production value, list every immediate production binding, recursive calls included. Once all of them fix the value, remove the unused override and keep the default's policy (limits, retry policy, work factors, clock semantics, persisted formats) as a constant in the body. Only the export and dispatch checks establish a contract: a descriptive default name or a single call site leaves the finding Dead Plumbing.
+
+**Counterweight (When to Keep):** Public SDK convenience methods, CLI entry points, exported library members, framework-dispatched hooks, or documented backward-compatibility methods and default parameters with live external consumers remain valid contracts even when internal callers use two-phase primitives or omit the default parameter. A dispatch proven at its source is such a contract.
+
+- **Exported library members:** a name in its defining module's `__all__` or explicitly re-exported (`from .core import helper` plus `__all__`), and the public methods of an exported class, need no internal caller. The extractor skips these static forms; confirm other exports by hand, for example `__all__` built from non-literal values, a module `__getattr__`, star re-exports, a class re-exported through an intermediate module without `__all__`, or an absolute import that is not rooted at the repository root (a `src/` layout).
+- **Framework-dispatched hooks:** registration decorators, and overrides of an external base class that inheritance binds without a decorator (discord.py `Cog.cog_load`/`cog_unload`, `ui.View.interaction_check`). `PY10c` evidence names such bases as `enclosing class bases: … (not defined in repo)`; open the base to confirm it dispatches this method name.
 
 ### Single-user `*_support.py` wrappers and private `._legacy_*` access
 

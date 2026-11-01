@@ -10,7 +10,7 @@ import io
 from itertools import pairwise
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
@@ -43,6 +43,7 @@ DIFF_FLAGS = (
     "--src-prefix=a/",
     "--dst-prefix=b/",
 )
+CLASS_DEFINITION = re.compile(rb"^[ \t]*class[ \t]+(\w+)", re.MULTILINE)
 
 
 class ScanError(Exception):
@@ -2323,7 +2324,7 @@ class CrossReferences(ast.NodeVisitor):
         self.targets = targets
         self.symbols = []
         self.enclosing_functions = []
-        self.methods = set()
+        self.methods = {}
         self.aliases = {}
         self.definitions = []
         self.references = {name: ReferenceCounts() for name in targets}
@@ -2381,7 +2382,7 @@ class CrossReferences(ast.NodeVisitor):
         for expr in (*node.decorator_list, *node.bases, *node.keywords):
             self.visit(expr)
         self.methods.update(
-            child
+            (child, node)
             for child in node.body
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
         )
@@ -2500,7 +2501,7 @@ def effective_arguments(node, call):
     }
 
 
-def constant_defaults(definition, calls, change_tag):
+def constant_defaults(definition, calls, change_tag, base_clause):
     path, source, node, symbol, recursive_calls = definition
     if framework_hook(node):
         return []
@@ -2517,9 +2518,10 @@ def constant_defaults(definition, calls, change_tag):
             record.add(
                 "PY10c_cross_test_reachability",
                 default,
-                f"Parameter '{name}': {len(calls)} resolved prod call sites; uniform value: {values.pop()}",
-                "Can the immediate production callers remove or inline this parameter/branch, "
-                "or is it a public/external knob (Counterweight)?",
+                f"Parameter '{name}': {len(calls)} resolved prod call sites; uniform value: {values.pop()}{base_clause}",
+                "Does every immediate production binding, recursion included, fix this value, "
+                "so the override is dead while the default's policy stays? Is it an export or "
+                "extension contract (Counterweight)? See tests.md §4.",
             )
     return [
         {**candidate, "path": path, "change_tag": change_tag}
@@ -2527,21 +2529,126 @@ def constant_defaults(definition, calls, change_tag):
     ]
 
 
+@dataclass
+class ModuleScope:
+    """Module-level `__all__` export names, definitions and static `from` imports."""
+
+    exports: set[str] = field(default_factory=set)
+    definitions: dict[str, list[ast.stmt]] = field(default_factory=dict)
+    imports: dict[str, list[tuple[ast.ImportFrom, str]]] = field(default_factory=dict)
+
+
+def module_scope(tree):
+    scope = ModuleScope()
+    for statement in local_walk(tree):
+        if not isinstance(statement, ast.stmt):
+            continue
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            scope.definitions.setdefault(statement.name, []).append(statement)
+        elif isinstance(statement, ast.ImportFrom):
+            for alias in statement.names:
+                if alias.name != "*":
+                    scope.imports.setdefault(alias.asname or alias.name, []).append(
+                        (statement, alias.name)
+                    )
+        parts = list(local_walk(statement))
+        if any(
+            isinstance(child, ast.Name) and child.id == "__all__" for child in parts
+        ):
+            scope.exports.update(
+                child.value
+                for child in parts
+                if isinstance(child, ast.Constant) and isinstance(child.value, str)
+            )
+    return scope
+
+
+def import_origin(path, statement, paths):
+    """Snapshot path of the module that `statement` in module `path` imports from."""
+    # A module's package is its directory, for `a/b.py` and `a/b/__init__.py` alike.
+    package = PurePosixPath(path).parent.parts
+    if statement.level > len(package) + 1:
+        return None
+    base = package[: len(package) + 1 - statement.level] if statement.level else ()
+    module = "/".join(
+        (*base, *(statement.module.split(".") if statement.module else ()))
+    )
+    return next(
+        (
+            candidate
+            for candidate in (f"{module}/__init__.py", f"{module}.py")
+            if candidate in paths
+        ),
+        None,
+    )
+
+
+def public_contracts(scopes, paths):
+    """Exported module-scope functions and public methods of exported classes."""
+    public = set()
+    pending = [(path, name) for path, scope in scopes.items() for name in scope.exports]
+    seen = set()
+    while pending:
+        path, name = pending.pop()
+        if (path, name) in seen or path not in scopes:
+            continue
+        seen.add((path, name))
+        scope = scopes[path]
+        for node in scope.definitions.get(name, []):
+            if isinstance(node, ast.ClassDef):
+                public.update(
+                    child
+                    for child in node.body
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and not child.name.startswith("_")
+                )
+            else:
+                public.add(node)
+        for statement, original in scope.imports.get(name, []):
+            origin = import_origin(path, statement, paths)
+            if origin is not None:
+                pending.append((origin, original))
+    return public
+
+
+def external_base_clause(enclosing_class, classes):
+    """Evidence clause listing enclosing-class bases the snapshot never defines."""
+    if enclosing_class is None:
+        return ""
+    bases = [
+        ast.unparse(base)
+        for base in enclosing_class.bases
+        if terminal_name(base) != "object" and terminal_name(base) not in classes
+    ]
+    return (
+        f"; enclosing class bases: {', '.join(bases)} (not defined in repo)"
+        if bases
+        else ""
+    )
+
+
 def cross_reachability(root, tip, args, targets, deleted_calls, active_trees, errors):
     if not targets:
         return [], 0
+    # Re-exporting modules (`from .core import Client; __all__ = [...]`) may not
+    # mention a target name, so `__all__` admits them to the parsed set.
     pattern = re.compile(
-        r"\b(?:" + "|".join(re.escape(name) for name in sorted(targets)) + r")\b"
+        r"\b(?:"
+        + "|".join(re.escape(name) for name in ["__all__", *sorted(targets)])
+        + r")\b"
     )
     definitions = {name: [] for name in targets}
     counts = {
         name: {"prod": ReferenceCounts(), "test": ReferenceCounts()} for name in targets
     }
-    checked = 0
-    exported = set()
+    paths, classes = set(), set()
+    scopes, method_classes = {}, {}
     delegations = set()
     for path, raw in snapshot_sources(root, tip, args.exclude):
-        checked += 1
+        paths.add(path)
+        # Raw text avoids a parse per file; a `class X` inside a string only
+        # hides an external-base clue.
+        classes.update(name.decode() for name in CLASS_DEFINITION.findall(raw))
         if path in active_trees:
             parsed = active_trees[path]
             if parsed and not pattern.search(parsed[0]):
@@ -2559,33 +2666,30 @@ def cross_reachability(root, tip, args, targets, deleted_calls, active_trees, er
             total.non_calls += refs.references[name].non_calls
         delegations.update(refs.delegations)
         if file_role == "prod":
-            for statement in local_walk(tree):
-                if not isinstance(statement, ast.stmt):
-                    continue
-                parts = list(local_walk(statement))
-                if any(
-                    isinstance(child, ast.Name) and child.id == "__all__"
-                    for child in parts
-                ):
-                    exported.update(
-                        child.value
-                        for child in parts
-                        if isinstance(child, ast.Constant)
-                        and isinstance(child.value, str)
-                    )
+            scopes[path] = module_scope(tree)
+            method_classes.update(refs.methods)
             for node, symbol in refs.definitions:
                 definitions[node.name].append(
                     (path, source, node, symbol, refs.recursive_calls.get(node, []))
                 )
+    public = public_contracts(scopes, paths)
     candidates = []
     for name, defs in definitions.items():
         prod = counts[name]["prod"]
         test = counts[name]["test"]
         bindings = [call for call in prod.calls if call not in delegations]
-        if len(defs) == 1 and name not in exported and not prod.non_calls and bindings:
+        if (
+            len(defs) == 1
+            and defs[0][2] not in public
+            and not prod.non_calls
+            and bindings
+        ):
             candidates.extend(
                 constant_defaults(
-                    defs[0], bindings, "changed" if args.base else "path-audit"
+                    defs[0],
+                    bindings,
+                    "changed" if args.base else "path-audit",
+                    external_base_clause(method_classes.get(defs[0][2]), classes),
                 )
             )
         if prod.calls or prod.non_calls:
@@ -2600,26 +2704,29 @@ def cross_reachability(root, tip, args, targets, deleted_calls, active_trees, er
         if tag is None:
             continue
         evidence = (
+            f"Terminal-name aggregates across {len(defs)} prod "
+            f"{'definition' if len(defs) == 1 else 'definitions'}; test references are "
+            "not attributed to this definition. "
             f"Observed prod calls: {len(prod.calls)}, prod non-call refs: {prod.non_calls}; "
             f"test calls: {len(test.calls)}, test non-call refs: {test.non_calls}"
         )
         if len(defs) > 1:
             evidence += f"; ambiguous_defs: {len(defs)}"
         for path, source, node, symbol, _ in defs:
-            if framework_hook(node):
+            if framework_hook(node) or node in public:
                 continue
             record = CandidateRecords(source)
             record.symbols = symbol.split(".")
             record.add(
                 "PY10c_cross_test_reachability",
                 node,
-                evidence,
-                "Does the immediate caller inventory confirm this production entry point "
-                "serves only tests or is orphaned; is a public/dynamic framework contract "
-                "a Counterweight?",
+                evidence + external_base_clause(method_classes.get(node), classes),
+                "Does a registration API, by-name loader, inherited external-base hook "
+                "or export reach this definition, with dispatch checked both ways? "
+                "See tests.md §4.",
             )
             candidates.append({**record.candidates[0], "path": path, "change_tag": tag})
-    return candidates, checked
+    return candidates, len(paths)
 
 
 def scan(root, files, base, tip, args):
