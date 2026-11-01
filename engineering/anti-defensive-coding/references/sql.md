@@ -358,7 +358,7 @@ def commit_import(self, batch_id: str, rows: list[dict]) -> dict:
     return {"batch_id": batch_id, "marker": state_marker}
 ```
 
-**1-Hop Verify & Fix (Good):** Inspect the resolved lock/transaction context manager, the immediate caller's consumption of the returned receipt, and any precondition/error-boundary scope. Delete file reads whose output (`"marker"`) is unconsumed by the caller (or move a genuinely consumed file read after database precondition checks inside the storage error boundary), hoist pure CPU serialization/hashing (`digest`) before entering `BEGIN IMMEDIATE` (or after closing a read transaction), and allocate sequence numbers in a single batch query (`reserve_seq_range(len(rows))`) inside the write transaction.
+**1-Hop Verify & Fix (Good):** Inspect the resolved lock/transaction context manager, the immediate caller's consumption of the returned receipt, and any precondition/error-boundary scope. Delete file reads whose output (`"marker"`) is unconsumed by the caller (or move a genuinely consumed file read after database precondition checks inside the storage error boundary), hoist pure CPU serialization/hashing (`digest`) before entering `BEGIN IMMEDIATE` (or after closing a read transaction), and allocate sequence numbers in a single batch query (`reserve_seq_range(len(rows))`) inside the write transaction. For file I/O, network sends, or hashing inside in-process `threading` or `asyncio` locks, see `python.md` §11.
 
 ```python
 def commit_import(self, batch_id: str, rows: list[dict]) -> dict:

@@ -1360,9 +1360,14 @@ class ScanPythonTests(unittest.TestCase):
                     self.assertIn("Counterweight", candidate["verify"])
 
     def test_lock_io_and_hashing_use_context_tokens_and_stop_at_nested_scopes(self):
+        prompts = {True: set(), False: set()}
         for context, expected in [
             ("lock", True),
+            ("locks", True),
             ("self._lock", True),
+            ("user_locks[user_id]", True),
+            ("self.user_challenge_locks[user_id]", True),
+            ("user_locks[guild_id][user_id]", True),
             ("conn.transaction()", True),
             ("db.begin_immediate()", True),
             ("db.savepoint()", True),
@@ -1373,6 +1378,8 @@ class ScanPythonTests(unittest.TestCase):
             ("self.block_writer()", False),
             ("open(lock_path)", False),
             ("manager(transaction=lock)", False),
+            ("sessions[user_id]", False),
+            ("sessions[lock_id]", False),
         ]:
             for keyword in ["with", "async with"]:
                 with self.subTest(context=context, keyword=keyword):
@@ -1390,6 +1397,10 @@ class ScanPythonTests(unittest.TestCase):
                         self.assertIn("line 2", candidate["evidence"])
                         self.assertIn(context, candidate["evidence"])
                         self.assertIn("Counterweight", candidate["verify"])
+                        prompts[context.startswith(("conn.", "db."))].add(
+                            candidate["verify"]
+                        )
+        self.assertTrue(prompts[True].isdisjoint(prompts[False]))
         for expression, expected in [
             ("open(path)", True),
             ("path.open()", True),
@@ -1408,9 +1419,13 @@ class ScanPythonTests(unittest.TestCase):
             ("hashlib.sha256(data).hexdigest()", True),
             ("sha256(data)", True),
             ("hashlib.blake2b(data)", True),
+            ("interaction.followup.send(message)", True),
+            ("self.interaction.followup.send(message)", True),
             ("os.fspath(path)", False),
             ("path.exists()", False),
             ("consume(data)", False),
+            ("followup.send(message)", False),
+            ("interaction.response.send_message(message)", False),
         ]:
             with self.subTest(expression=expression):
                 self.put(
@@ -1433,6 +1448,26 @@ class ScanPythonTests(unittest.TestCase):
                 self.put("locking.py", "with lock:\n" + textwrap.indent(body, "    "))
                 self.assertEqual(self.scan("--paths", "locking.py")["candidates"], [])
         self.put("locking.py", "open(path)\nhashlib.sha256(data)\n")
+        self.assertEqual(self.scan("--paths", "locking.py")["candidates"], [])
+        self.put(
+            "locking.py",
+            "async def run(user_locks, user_id, interaction):\n"
+            "    async with user_locks[user_id]:\n"
+            "        await interaction.followup.send('inside')\n",
+        )
+        candidates = self.scan("--paths", "locking.py")["candidates"]
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["rule"], "PY09_io_or_tx_in_lock")
+        self.assertEqual(candidates[0]["span"], [2, 3])
+        self.assertIn("interaction.followup.send", candidates[0]["evidence"])
+        self.assertIn("user_locks[user_id]", candidates[0]["evidence"])
+        self.put(
+            "locking.py",
+            "async def run(user_locks, user_id, interaction):\n"
+            "    async with user_locks[user_id]:\n"
+            "        reply = 'outside'\n"
+            "    await interaction.followup.send(reply)\n",
+        )
         self.assertEqual(self.scan("--paths", "locking.py")["candidates"], [])
 
     def test_nested_transaction_contexts_are_reported_once_in_acquisition_order(self):

@@ -937,6 +937,8 @@ def same_class_stashes(tree):
 
 
 def context_tokens(node):
+    while isinstance(node, ast.Subscript):
+        node = node.value
     return set(
         identifier_tokens(name_path(node.func if isinstance(node, ast.Call) else node))
     )
@@ -951,6 +953,7 @@ def lock_context_parts(node):
             "immediate",
             "savepoint",
             "lock",
+            "locks",
         }:
             yield (
                 item.context_expr,
@@ -967,6 +970,7 @@ def io_or_hash_call(node):
         terminal_name(node.func)
         in {"open", "read_text", "write_text", "read_bytes", "write_bytes"}
         or path.startswith(("shutil.", "hashlib."))
+        or path.endswith(".followup.send")
         or path in {"os.remove", "os.unlink", "os.replace", "sha256"}
     )
 
@@ -1486,6 +1490,14 @@ class CandidateProbes(CandidateRecords):
 
     def lock_candidate(self, node, fact):
         contexts = self.lock_contexts[node]
+        catalogue = (
+            "sql.md §7"
+            if any(
+                context_tokens(context) & {"transaction", "immediate", "savepoint"}
+                for context in contexts
+            )
+            else "python.md §11"
+        )
         self.add(
             "PY09_io_or_tx_in_lock",
             node,
@@ -1496,7 +1508,7 @@ class CandidateProbes(CandidateRecords):
             ),
             "Does the immediate lock/transaction owner require this work in the protected "
             "region, or can it move outside; is atomicity, isolation, or data-loss "
-            "prevention a Counterweight?",
+            f"prevention a Counterweight? See {catalogue}.",
             related=tuple(contexts),
         )
 

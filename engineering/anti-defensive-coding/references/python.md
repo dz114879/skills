@@ -742,3 +742,43 @@ def evaluate_batch(items: list[Entry], cache: dict) -> list[int]:
 ```
 
 **Counterweight (When to Keep):** When the computation genuinely depends on per-item identity (such as a memoized per-item recursive traversal within a DAG where the same `entry_id` is visited multiple times across paths), `entry_id` belongs in the cache key.
+
+## 11. In-Process Lock Critical Section Discipline
+
+### File I/O, network sends, or hashing inside `threading` or `asyncio` locks
+
+**Pattern Name & Grade Condition:** In-process lock I/O, network send, or hashing bleed — `[Hard]`, **Redundant Churn**, when file I/O, network sends, or heavy hashing inside a `threading` or `asyncio` lock causes lock or concurrency-isolation safety failures or contention timeouts at supported load; `[Simplify]`, **Redundant Churn**, for movable work inside the lock that causes none of those failures.
+
+**Signal (Bad):** While holding an in-process `threading.Lock` / `threading.RLock` or `asyncio.Lock` (including per-key lock maps such as `async with self.user_locks[user_id]:`), code sends awaited network replies (`await interaction.followup.send(...)`) on early rejection or after state updates, reads static files from disk, writes a snapshot whose inputs are already captured in local scalars, or runs heavy hashing (`hashlib.sha256(...)`) that does not depend on lock-protected state.
+
+```python
+async def submit_answer(self, interaction, user_id: int, choice: str) -> None:
+    async with self.user_locks[user_id]:
+        session = self.sessions.get(user_id)
+        if session is None or session.expired:
+            await interaction.followup.send("Session has ended.", ephemeral=True)
+            return
+        if session.answered:
+            await interaction.followup.send("Already answered.", ephemeral=True)
+            return
+        session.record(choice)
+        await interaction.followup.send("Answer recorded.", ephemeral=True)
+```
+
+**1-Hop Verify & Fix (Good):** Inspect the lock's critical section and every same-owner reader/writer of the state it guards (`self.sessions` or the shared resource). Keep only the state read, decision, and mutation (or scalar snapshot capture) inside the `with` / `async with` block; move awaited network replies (`await interaction.followup.send(...)`), static file reads, independent snapshot writes, and pure CPU hashing before lock acquisition or after lock release. For database write transactions (`BEGIN IMMEDIATE`), see `sql.md` §7.
+
+```python
+async def submit_answer(self, interaction, user_id: int, choice: str) -> None:
+    async with self.user_locks[user_id]:
+        session = self.sessions.get(user_id)
+        if session is None or session.expired:
+            reply = "Session has ended."
+        elif session.answered:
+            reply = "Already answered."
+        else:
+            session.record(choice)
+            reply = "Answer recorded."
+    await interaction.followup.send(reply, ephemeral=True)
+```
+
+**Counterweight (When to Keep):** Keep the operation inside the lock when removing it breaks serialization or state consistency: (1) writer-serialized temp-file write plus `os.replace` publication, especially when writers share a fixed `.tmp` path that concurrent writers would overwrite or unlink before replacement; (2) append-log ordering where in-memory sequence allocation, disk append, and in-memory log append share one critical section so file order matches sequence order; (3) a file or stream sink that the lock exists specifically to protect (with payload serialization already done outside the lock); or (4) persisting state and resetting its `_dirty` flag atomically under the same lock so concurrent updates between the write and the flag reset are not lost.
