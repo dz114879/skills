@@ -104,12 +104,21 @@ def decode_required_int(raw: object, *, field: str) -> int:
 
 ### Double-copying fresh repository row mappings
 
-**Pattern Name & Grade Condition:** Redundant row-dict copy churn — `[Simplify]`, **Redundant Churn**, when the base helper already returns fresh, unaliased `dict` objects.
+**Pattern Name & Grade Condition:** Redundant row-dict copy churn — `[Simplify]`, **Redundant Churn**, when the copied rows are already fresh, unaliased `dict` objects: built by a base helper, or produced by a cursor whose row factory builds dicts.
 
-**Signal (Bad):** A repository base helper (`self.fetchall(...)` / `self.fetchone(...)`) already materializes fresh `dict` instances from `sqlite3.Row`, and the calling repository method or service immediately wraps the result in `[dict(row) for row in self.fetchall(...)]` or `dict(row)`.
+**Signal (Bad):** A repository base helper (`self.fetchall(...)` / `self.fetchone(...)`) already materializes fresh `dict` instances from `sqlite3.Row`, and the calling repository method or service immediately wraps the result in `[dict(row) for row in self.fetchall(...)]` or `dict(row)`; or a function installs a dict-building factory (`conn.row_factory = dict_row`) and still copies every fetched row, often after the connection has closed.
 
 ```python
+def dict_row(cursor: sqlite3.Cursor, row: tuple) -> dict:
+    return {column[0]: value for column, value in zip(cursor.description, row)}
+
+
 class RowStore:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.conn = sqlite3.connect(path)
+        self.conn.row_factory = sqlite3.Row
+
     def fetchall(self, sql: str, params: tuple = ()) -> list[dict]:
         cursor = self.conn.execute(sql, params)
         return [dict(row) for row in cursor.fetchall()]
@@ -119,17 +128,29 @@ class InvoiceStore(RowStore):
     def list_open(self) -> list[dict]:
         rows = self.fetchall("SELECT invoice_id, total_cents FROM invoices WHERE paid = 0")
         return [dict(row) for row in rows]
+
+    def list_overdue(self) -> list[dict]:
+        with closing(sqlite3.connect(self.path)) as conn:
+            conn.row_factory = dict_row
+            rows = conn.execute("SELECT invoice_id FROM invoices WHERE overdue = 1").fetchall()
+        return [dict(row) for row in rows]
 ```
 
-**1-Hop Verify & Fix (Good):** Inspect `self.fetchall` / `self.fetchone`. When the base helper already returns freshly allocated `dict` objects with no shared aliasing, return or iterate the list directly.
+**1-Hop Verify & Fix (Good):** Find what produced the rows. For a base helper, inspect `self.fetchall` / `self.fetchone`. For a cursor, only its own row factory counts: a cursor copies its connection's `row_factory` when it is created, so the deciding assignment is the last one on the same connection before that cursor was created, or a direct `cursor.row_factory` assignment. When the helper or factory already yields freshly allocated `dict` objects, return or iterate the rows directly; a consumer that mutates them still needs no copy (`python.md` §10). A fetched row stays valid after its cursor and connection close (`sqlite3.Row` and `aiosqlite.Row` hold their values), so rows fetched inside a `with` block are returned directly after it.
 
 ```python
 class InvoiceStore(RowStore):
     def list_open(self) -> list[dict]:
         return self.fetchall("SELECT invoice_id, total_cents FROM invoices WHERE paid = 0")
+
+    def list_overdue(self) -> list[dict]:
+        with closing(sqlite3.connect(self.path)) as conn:
+            conn.row_factory = dict_row
+            rows = conn.execute("SELECT invoice_id FROM invoices WHERE overdue = 1").fetchall()
+        return rows
 ```
 
-**Counterweight (When to Keep):** Keep `[dict(row) for row in cursor.fetchall()]` at the single raw cursor boundary where mapping-like driver row objects (`sqlite3.Row` or cursor-backed lazy mappings; positional tuple rows require a `row_factory` or pairing with `cursor.description`) are converted into owned `dict` instances, or when caching a baseline list that callers will mutate in place across multiple passes.
+**Counterweight (When to Keep):** Keep `[dict(row) for row in cursor.fetchall()]` at the single raw cursor boundary where driver row objects (`sqlite3.Row`, `aiosqlite.Row`, or another driver's immutable row mapping) are first materialized into owned `dict` instances (`RowStore.fetchall` above; positional tuple rows need a `row_factory` or pairing with `cursor.description` instead), or when caching a baseline list that callers will mutate in place across multiple passes.
 
 ## 4. Snapshot Consistency, Metadata Queries & Relational Closure
 

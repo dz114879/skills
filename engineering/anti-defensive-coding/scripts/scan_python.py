@@ -823,6 +823,17 @@ def write_targets(node):
     return []
 
 
+def row_factory_facts(function):
+    """`<x>.row_factory = <expr>` facts among function's own statements."""
+    return [
+        f"{ast.unparse(target)} = {ast.unparse(node.value)} at line {node.lineno}"
+        for node in lexical_nodes(function.body)
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for target in write_targets(node)
+        if isinstance(target, ast.Attribute) and target.attr == "row_factory"
+    ]
+
+
 def self_state_writes(body, *, reset):
     writes = {}
     for statement in body:
@@ -1447,13 +1458,34 @@ class CandidateProbes(CandidateRecords):
                     isinstance(generator.target, ast.Name)
                     and generator.target.id == element.args[0].id
                 ):
+                    name = generator.target.id
+                    function = next(
+                        (
+                            scope
+                            for scope in reversed(self.parents)
+                            if isinstance(
+                                scope, (ast.FunctionDef, ast.AsyncFunctionDef)
+                            )
+                        ),
+                        None,
+                    )
+                    factory_facts = row_factory_facts(function) if function else []
                     self.add(
                         "PY08_roundtrip_and_copy",
                         element,
-                        f"Comprehension at line {node.lineno} rewraps its target "
-                        f"'{generator.target.id}' in dict at line {element.lineno}",
-                        "Does the immediate row producer already return suitable mappings, "
-                        "or is independent mutation/ownership of each copy a Counterweight?",
+                        "; ".join(
+                            [
+                                f"Comprehension at line {node.lineno} rewraps its "
+                                f"target '{name}' in dict at line {element.lineno}",
+                                *factory_facts,
+                            ]
+                        ),
+                        f"Is each '{name}' already a fresh mapping? For a DB row, its "
+                        "cursor's factory decides (set on the cursor, or last set on its "
+                        "connection before cursor creation): a dict factory makes this "
+                        "copy churn; sqlite3.Row/aiosqlite.Row makes it the first "
+                        "materialization (Counterweight at the owning boundary). "
+                        "See sql.md §3.",
                         related=(generator.target,),
                     )
                     break

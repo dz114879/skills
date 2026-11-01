@@ -663,7 +663,7 @@ def next_sequence(base_count: int) -> int:
     return int(base_count or 0) + 1
 ```
 
-**1-Hop Verify & Fix (Good):** Check the producer and consumer types and whether any 1-hop consumer mutates `payload` in place. Parse external strings once at entry, pass strong types (`int`, `datetime`, `dict`, `set`) internally, parse integers directly via `int(value)` (after excluding `bool`) or `Decimal` to preserve full 64-bit precision, and pass `payload` directly when consumers only read it. For a same-type reparse, inspect what each immediate caller actually constructs (a caller that only forwards its own annotated value proves nothing), and use the value directly once every caller builds that exact type.
+**1-Hop Verify & Fix (Good):** Check the producer and consumer types and, for a copying round-trip, whether another owner retains `payload` while one side mutates it (**Freshness before mutation** in the copy-churn entry below). Parse external strings once at entry, pass strong types (`int`, `datetime`, `dict`, `set`) internally, parse integers directly via `int(value)` (after excluding `bool`) or `Decimal` to preserve full 64-bit precision, and pass `payload` directly when it is fresh or only read. For a same-type reparse, inspect what each immediate caller actually constructs (a caller that only forwards its own annotated value proves nothing), and use the value directly once every caller builds that exact type.
 
 ```python
 def parse_entity_id(value: int | str) -> int:
@@ -680,11 +680,11 @@ def next_sequence(base_count: int) -> int:
     return base_count + 1
 ```
 
-**Counterweight (When to Keep):** When a downstream consumer genuinely mutates a nested structure and requires detached copy isolation, preserve isolation with `copy.deepcopy(payload)` or a targeted shallow copy. Keep explicit wire-contract round-trip assertions in serialization tests, and use `Decimal` when an external numeric string contract explicitly permits scientific notation while requiring exact integer conversion. Keep a same-type reparse at public, SDK, route, or plugin entry points, on values read from `Any` configuration, and where it deliberately converts a `str` subclass or enum to its base type or crosses the numeric tower (`bool` to `int`, `int` to `float`).
+**Counterweight (When to Keep):** When another owner retains `payload` and one side mutates a nested structure, preserve isolation with `copy.deepcopy(payload)` or a targeted shallow copy. Keep explicit wire-contract round-trip assertions in serialization tests, and use `Decimal` when an external numeric string contract explicitly permits scientific notation while requiring exact integer conversion. Keep a same-type reparse at public, SDK, route, or plugin entry points, on values read from `Any` configuration, and where it deliberately converts a `str` subclass or enum to its base type or crosses the numeric tower (`bool` to `int`, `int` to `float`).
 
 ### Redundant `[dict(r)]`, `dataclasses.asdict()`, and defensive container copies
 
-**Pattern Name & Grade Condition:** Unaliased copy churn — `[Simplify]`, **Redundant Churn**, when no consumer mutates or retains the copied value.
+**Pattern Name & Grade Condition:** Unaliased copy churn — `[Simplify]`, **Redundant Churn**, when the source is fresh (retained by no other owner) or neither side mutates after the copy.
 
 **Signal (Bad):** Code wraps `[dict(row) for row in self.fetchall()]` when `fetchall()` already materializes fresh dicts, calls `dataclasses.asdict(item)` or `deepcopy(item)` inside a loop over immutable scalar dataclasses, or copies a list at both caller and callee when neither mutates it in place.
 
@@ -695,7 +695,7 @@ def summarize_results(repo, results: list[OutcomeRecord]) -> list[dict]:
     return rows + serialized
 ```
 
-**1-Hop Verify & Fix (Good):** Inspect `repo.fetchall` and the loop body consuming `results`. When `fetchall()` already returns new `dict` instances and `OutcomeRecord` is read without mutation, consume `repo.fetchall(...)` and dataclass attributes directly; if a downstream step needs a remapped dict, construct the new dict once at that transformation step.
+**1-Hop Verify & Fix (Good):** Inspect `repo.fetchall`, the loop body consuming `results`, and any other owner that retains a copied source. When `fetchall()` already returns new `dict` instances and `OutcomeRecord` is read without mutation, consume `repo.fetchall(...)` and dataclass attributes directly; if a downstream step needs a remapped dict, construct the new dict once at that transformation step.
 
 ```python
 def summarize_results(repo, results: list[OutcomeRecord]) -> list[dict]:
@@ -704,7 +704,14 @@ def summarize_results(repo, results: list[OutcomeRecord]) -> list[dict]:
     return rows + serialized
 ```
 
-**Counterweight (When to Keep):** Keep an explicit copy when the caller retains and mutates the collection across iterations, when converting `sqlite3.Row` objects at the single repository boundary that owns dict materialization, or when a documented public API contract promises a detached mutable copy.
+**Recognition shapes:**
+
+- **Freshness before mutation.** A value produced for this caller and retained by no other owner is fresh: rows from a dict-building row factory, a `model_dump()` or `json.loads(...)` result, a subtree of an earlier `deepcopy`. A consumer may mutate a fresh value in place without copying it.
+- **Row factory.** For `dict(row)`, the row factory of the cursor that produced the row separates churn from the first materialization; `sql.md` §3 holds the cursor rule.
+- **Deep copy of an already-detached value.** After `source = copy.deepcopy(payload)`, `normalize(copy.deepcopy(source["request"]))` copies a subtree of the fresh `source`; when nothing reads the un-normalized subtree afterwards, normalize `source["request"]` directly.
+- **Deep copy fed straight to `json.dumps`.** `snapshot = {"tools": copy.deepcopy(tools)}` serialized by `json.dumps(snapshot)`, with no mutation or `await` in between and `snapshot` not kept afterwards, copies a value that `json.dumps` only reads; put `tools` in the snapshot directly.
+
+**Counterweight (When to Keep):** Keep an explicit copy when another owner retains the source and one side mutates: entries copied out of a lock-guarded registry and mutated after release, a merged value cached for later calls and handed out per call, source and target trees kept side by side. Also keep it at the first materialization of driver rows (`sql.md` §3), or when a documented public API contract promises a detached mutable copy.
 
 ### Hot-loop `copy(obj)` busting `id(obj)` caches and unique row IDs in shared cache keys
 

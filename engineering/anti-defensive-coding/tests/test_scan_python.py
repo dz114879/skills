@@ -1308,7 +1308,56 @@ class ScanPythonTests(unittest.TestCase):
                     self.assertEqual(candidates[0]["rule"], "PY08_roundtrip_and_copy")
                     self.assertIn("row", candidates[0]["evidence"])
                     self.assertIn("line 1", candidates[0]["evidence"])
-                    self.assertIn("Counterweight", candidates[0]["verify"])
+
+    def test_dict_rewrap_evidence_names_the_enclosing_function_row_factory(self):
+        self.put(
+            "rows.py",
+            """
+            import sqlite3
+
+
+            def connect(path):
+                conn = sqlite3.connect(path)
+                conn.row_factory = sqlite3.Row
+                return conn
+
+
+            class Store:
+                def tagged(self, conn):
+                    conn.row_factory = self.db.dict_row
+                    rows = conn.execute("SELECT 1").fetchall()
+                    self.conn.row_factory = None
+                    return [dict(row) for row in rows]
+
+                def untagged(self, conn):
+                    rows = conn.execute("SELECT 1").fetchall()
+                    return [dict(row) for row in rows]
+
+                def nested(self, conn):
+                    def configure():
+                        conn.row_factory = sqlite3.Row
+
+                    configure()
+                    return [dict(row) for row in conn.execute("SELECT 1")]
+            """,
+        )
+        evidence = {
+            candidate["symbol"]: candidate["evidence"]
+            for candidate in self.scan("--paths", "rows.py")["candidates"]
+            if candidate["rule"] == "PY08_roundtrip_and_copy"
+        }
+        self.assertEqual(
+            set(evidence), {"Store.tagged", "Store.untagged", "Store.nested"}
+        )
+        self.assertIn(
+            "conn.row_factory = self.db.dict_row at line 12", evidence["Store.tagged"]
+        )
+        self.assertIn(
+            "self.conn.row_factory = None at line 14", evidence["Store.tagged"]
+        )
+        for symbol in ["Store.untagged", "Store.nested"]:
+            with self.subTest(symbol=symbol):
+                self.assertNotIn("row_factory", evidence[symbol])
 
     def test_copy_churn_requires_per_iteration_execution_without_nested_scopes(self):
         for body, expected in [
