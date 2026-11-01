@@ -30,6 +30,10 @@ _Avoid_: custom linter, ratchet scanner, baseline gate
 A legitimate boundary validation, data-loss recovery path, security check, concurrency guarantee, or externally consumed compatibility shim that resembles defensive code structurally and must be preserved.
 _Avoid_: whitelist, exception rule
 
+**Public Contract**:
+A definition a module declares as its public interface through its export surface (an exported name, or a public method of an exported class), together with its documented signature and behavior. Callers outside the reviewed code may rely on it, so it needs no internal caller to stay live.
+_Avoid_: export obligation, exported symbol
+
 **Lint-Owned**:
 A candidate whose exact shape a standard linter or typechecker rule already reports on the same node, and whose defect that rule's prescribed fix fully resolves.
 _Avoid_: linter overlap, too-fine
