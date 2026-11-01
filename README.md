@@ -22,8 +22,17 @@ engineering/
 │   ├── SKILL.md            # Three-axis review: Standards, Spec, and Lean (anti-over-defense)
 │   └── agents/
 │       └── openai.yaml     # Interface metadata
-└── implement-orchestrated/
-    ├── SKILL.md            # Orchestrator: ticket/spec implementation + three-axis review
+├── implement-orchestrated/
+│   ├── SKILL.md            # Orchestrator: ticket/spec implementation + three-axis review
+│   └── agents/
+│       └── openai.yaml     # Interface metadata (display name, implicit invocation)
+└── plan-review/
+    ├── SKILL.md            # Elephant: four-axis Goldfish review of a Plan before implementation
+    ├── GOLDFISH.md         # Rules every Goldfish Reviewer follows
+    ├── READER.md           # Reader axis: self-containment via paraphrase
+    ├── IMPLEMENTER.md      # Implementer axis: Open Decisions, False Premises, coverage, blocking edges
+    ├── CRITIC.md           # Critic axis: premortem and proportion
+    ├── REUSE.md            # Reuse axis: build-vs-buy
     └── agents/
         └── openai.yaml     # Interface metadata (display name, implicit invocation)
 ```
@@ -34,6 +43,8 @@ engineering/
 
 - `code-review-lean`
 - `tdd` / `diagnosing-bugs` (when applicable)
+
+`plan-review` requires subagents; its Critic axis loads `codebase-design`.
 
 ## Development
 

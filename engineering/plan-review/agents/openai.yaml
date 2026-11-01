@@ -1,0 +1,5 @@
+interface:
+  display_name: "Plan Review"
+  short_description: "Review a plan or ticket set with fresh-context reviewers"
+policy:
+  allow_implicit_invocation: false
