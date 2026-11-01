@@ -1046,7 +1046,8 @@ class CandidateRecords(ast.NodeVisitor):
         self.defenses = []
 
     def add(self, rule, node, evidence, verify, related=(), signature=None, scope=()):
-        """`scope` line ranges make the candidate diff-eligible outside its `span`."""
+        """`scope` line ranges make the candidate diff-eligible outside its `span`;
+        `signature` is a tuple of display strings that `PY10a` pairs and prints."""
         nodes = (node, *related)
         spans = [(item.lineno, item.end_lineno) for item in nodes]
         code = "; ".join(ast.get_source_segment(self.source, item) for item in nodes)
@@ -1722,7 +1723,7 @@ class CandidateProbes(CandidateRecords):
                 "guarantee the attribute, even if nullable, or is it an optional capability? "
                 "For owned state, do construction/lifecycle writes or constructor-bypassing "
                 "callers/tests explain absence? See python.md §1.",
-                signature=attr,
+                signature=(repr(attr),),
             )
         self.generic_visit(node)
 
@@ -1797,7 +1798,7 @@ class CandidateProbes(CandidateRecords):
                     verify,
                     signature=tuple(sorted(names - {None}))
                     if caught is not None
-                    else ("bare",),
+                    else ("bare except",),
                     # A rewritten try body widens what an unchanged handler swallows.
                     scope=[(node.body[0].lineno, node.body[-1].end_lineno)],
                 )
@@ -2159,10 +2160,15 @@ def render(result, output_format):
         print(f"  Verify: {candidate['verify']}")
 
 
-def intersects(node, lines):
+def touches(spans, lines):
+    """`lines is None` marks a file whose every line counts as added."""
     return lines is None or any(
-        line in lines for line in range(node.lineno, node.end_lineno + 1)
+        line in lines for start, end in spans for line in range(start, end + 1)
     )
+
+
+def intersects(node, lines):
+    return touches([(node.lineno, node.end_lineno)], lines)
 
 
 def parse_source(raw, path, errors, *, base=False, pattern=None):
@@ -2180,8 +2186,12 @@ def parse_source(raw, path, errors, *, base=False, pattern=None):
         return None
 
 
-def moved_defenses(before, after):
-    """Compare signature presence per function, rather than defense multiplicity."""
+def moved_defenses(before, after, changes):
+    """Compare signature presence per function, rather than defense multiplicity.
+
+    `before` and `after` map post-change paths to probes; `changes` maps them to
+    their `FileChange`.
+    """
 
     def index(snapshots):
         return {
@@ -2197,26 +2207,38 @@ def moved_defenses(before, after):
     lost = {}
     for (path, symbol, signature), candidate in pre.items():
         if (path, symbol) in surviving and (path, symbol, signature) not in post:
-            lost.setdefault(signature, []).append((path, symbol, candidate["span"][0]))
-    for identity, candidate in post.items():
-        path, symbol, signature = identity
-        if identity in pre or signature not in lost:
+            lost.setdefault(signature, []).append(
+                f"base {changes[path].old_path}:{candidate['span'][0]} ({symbol})"
+            )
+    destinations = {}
+    for path, probes in after.items():
+        for signature, candidate in probes.defenses:
+            identity = (path, candidate["symbol"], signature)
+            if (
+                signature in lost
+                and identity not in pre
+                and touches([candidate["span"]], changes[path].added_lines)
+            ):
+                destinations.setdefault(signature, {})[identity] = candidate
+    for signature, found in destinations.items():
+        # More new locations than functions that lost the signature is a coincidence.
+        if len(found) > len(lost[signature]):
             continue
-        origins = [
-            f"{old_path}:{line} ({old_symbol}, pre-change line {line})"
-            for old_path, old_symbol, line in lost[signature]
-            if (old_path, old_symbol) != (path, symbol)
-        ]
-        if origins:
+        rule, parts = signature
+        for (path, _, _), candidate in found.items():
             yield {
                 **candidate,
                 "rule": "PY10a_moved_defense",
                 "path": path,
                 "change_tag": "moved-defense",
-                "evidence": "Equivalent defense removed from " + "; ".join(origins),
-                "verify": "Did the immediate callee become the owner of this validation, "
-                "or is this a relocated hedge; is the new location a genuine boundary "
-                "(Counterweight)?",
+                "evidence": f"Same {rule} signature {', '.join(parts)} lost from "
+                + ", ".join(lost[signature])
+                + " (signature match only)",
+                "verify": "Open the origin first: did it guard the same producer, "
+                "receiver or exception source? If not, dismiss as a signature "
+                "coincidence. If so, did this callee become the owner, or is it a "
+                "relocated hedge (a genuine boundary is a Counterweight)? "
+                "See python.md §4.",
             }
 
 
@@ -2849,11 +2871,7 @@ def scan(root, files, base, tip, args):
                 and intersects(node, change.added_lines)
             )
         for candidate in probes.candidates:
-            if change.added_lines is not None and not any(
-                line in change.added_lines
-                for start, end in candidate["_scope"]
-                for line in range(start, end + 1)
-            ):
+            if not touches(candidate["_scope"], change.added_lines):
                 continue
             candidates.append(
                 {
@@ -2862,7 +2880,9 @@ def scan(root, files, base, tip, args):
                     "change_tag": "changed" if args.base else "path-audit",
                 }
             )
-    candidates.extend(moved_defenses(before, after))
+    candidates.extend(
+        moved_defenses(before, after, {change.path: change for change in files})
+    )
     cross, checked = cross_reachability(
         root,
         tip,

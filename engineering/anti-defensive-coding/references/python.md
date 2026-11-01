@@ -315,6 +315,32 @@ def parse_payload(raw: str) -> dict:
 
 **Counterweight (When to Keep):** When `json.loads` is called without custom hooks (or the hook raises `KeyError` and the caller intentionally normalizes all syntax errors into one contract-specified error code without distinct hook diagnostics), catching `json.JSONDecodeError` / `TypeError` at the parse boundary is appropriate.
 
+### Moved and copied defenses across a refactor
+
+**Pattern Name & Grade Condition:** **Moved Defense** / copied defense — grade a moved defense by the condition of its own entry (§1, §4 or §6), adding **Half-Moves & Zombie Scaffolding** when a hedge was relocated unchanged into a nested helper or extracted function; `[Simplify]`, **Revalidation**, for a copied guard whose owner performs the same check on the same argument.
+
+**Signal (Bad):** A refactor deletes a reflection probe, broad catch, or falsy fallback from a surviving function and adds one with the same signature to another function (`PY10a_moved_defense`), or a callee takes ownership of a guard while its callers keep wrapping the call in that guard. A copied guard loses nothing, so `PY10a` stays silent on it.
+
+```python
+async def close_async_iterator(iterator):
+    if hasattr(iterator, "aclose"):
+        await iterator.aclose()
+
+
+async def finish(stream):
+    if hasattr(stream, "aclose"):  # Repeats the guard the helper now owns.
+        await close_async_iterator(stream)
+```
+
+**1-Hop Verify & Fix (Good):** A `PY10a` candidate is a signature match only: the same rule with the same caught exception names or attribute/key literals, receiver dropped. First open each origin it names at the base and confirm it guarded the same producer, receiver, or exception source as the destination; otherwise dismiss the pair as a signature coincidence. Once the origin matches, ask whether the callee became the owner of the rule, then check the owner's callers for a copied guard and call the owner directly.
+
+```python
+async def finish(stream):
+    await close_async_iterator(stream)
+```
+
+**Counterweight (When to Keep):** A genuine ownership transfer, where the callee now owns the rule for every caller, leaves only the defense itself to judge under its own entry. A caller keeps its guard when the guard also selects a different branch, such as an `else` that releases a synchronous source.
+
 ## 5. Premature Defaults & Corrupt-State `None` Sentinels
 
 ### Premature default shadowing a required-value guard
