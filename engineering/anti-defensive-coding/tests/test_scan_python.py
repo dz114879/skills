@@ -657,6 +657,73 @@ class ScanPythonTests(unittest.TestCase):
                     ]
                 )
 
+    def test_cross_own_body_suppresses_only_self_recursion(self):
+        self.init_repo()
+        self.put("tests/test_app.py", "Runner().execute(None)\n")
+        for method, flagged in [
+            ("def execute(self, other):\n        return other.execute(other)", False),
+            ("def execute(self, other):\n        return super().execute(other)", False),
+            ("def execute(self, other):\n        return self.execute(other)", True),
+            (
+                "@classmethod\n    def execute(cls, other):\n        return cls.execute(other)",
+                True,
+            ),
+        ]:
+            with self.subTest(method=method):
+                self.put("app.py", f"class Runner(Base):\n    {method}\n")
+                candidates = self.scan("--paths", "app.py")["candidates"]
+                self.assertEqual(
+                    [(c["symbol"], c["change_tag"]) for c in candidates],
+                    [("Runner.execute", "cross-test")] if flagged else [],
+                )
+
+    def test_cross_super_delegation_reaches_without_binding_parameters(self):
+        self.init_repo()
+        self.put(
+            "app.py",
+            "class Runner(Base):\n"
+            "    def execute(self, other, retries=3):\n"
+            "        return super().execute(other, retries=5)\n",
+        )
+        for caller, flagged in [("", False), ("Runner().execute(1)", True)]:
+            with self.subTest(caller=caller):
+                self.put("caller.py", caller + "\n")
+                candidates = self.scan("--paths", "app.py")["candidates"]
+                self.assertEqual(
+                    [c["code"] for c in candidates], ["3"] if flagged else []
+                )
+
+    def test_cross_default_counts_recursive_bindings(self):
+        self.init_repo()
+        function = (
+            "def walk(node, depth=0):\n"
+            "    for child in node.children:\n"
+            "        {}\n"
+            "    return depth\n"
+        )
+        method = (
+            "class Tree:\n"
+            "    def walk(self, node, depth=0):\n"
+            "        for child in node.children:\n"
+            "            {}\n"
+            "        return depth\n"
+        )
+        for definition, caller, recursion, flagged in [
+            (function, "walk(tree)", "walk(child, depth=depth + 1)", False),
+            (function, "walk(tree)", "walk(child)", True),
+            (method, "Tree().walk(tree)", "self.walk(child, depth=depth + 1)", False),
+            (method, "Tree().walk(tree)", "self.walk(child)", True),
+            # A bare name inside a method resolves outside the class, never to it.
+            (method, "Tree().walk(tree)", "walk(child, depth=depth + 1)", True),
+        ]:
+            with self.subTest(caller=caller, recursion=recursion):
+                self.put("app.py", definition.format(recursion))
+                self.put("caller.py", caller + "\n")
+                candidates = self.scan("--paths", "app.py")["candidates"]
+                self.assertEqual(
+                    [c["code"] for c in candidates], ["0"] if flagged else []
+                )
+
     def test_rebound_import_aliases_are_escapes_instead_of_resolved_calls(self):
         self.init_repo()
         self.put("app.py", "def configure(flag=False):\n    return flag\n")

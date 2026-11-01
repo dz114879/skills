@@ -2322,10 +2322,13 @@ class CrossReferences(ast.NodeVisitor):
     def __init__(self, tree, targets):
         self.targets = targets
         self.symbols = []
-        self.own_bodies = []
+        self.enclosing_functions = []
+        self.methods = set()
         self.aliases = {}
         self.definitions = []
         self.references = {name: ReferenceCounts() for name in targets}
+        self.recursive_calls = {}
+        self.delegations = set()
         self.call_funcs = {
             node.func: node for node in ast.walk(tree) if isinstance(node, ast.Call)
         }
@@ -2367,9 +2370,9 @@ class CrossReferences(ast.NodeVisitor):
         self.symbols.append(node.name)
         if node.name in self.targets:
             self.definitions.append((node, ".".join(self.symbols)))
-        self.own_bodies.append(node.name)
+        self.enclosing_functions.append(node)
         self.visit_scope(node)
-        self.own_bodies.pop()
+        self.enclosing_functions.pop()
         self.symbols.pop()
 
     visit_AsyncFunctionDef = visit_FunctionDef
@@ -2377,12 +2380,36 @@ class CrossReferences(ast.NodeVisitor):
     def visit_ClassDef(self, node):
         for expr in (*node.decorator_list, *node.bases, *node.keywords):
             self.visit(expr)
+        self.methods.update(
+            child
+            for child in node.body
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
         self.symbols.append(node.name)
         self.visit_scope(node)
         self.symbols.pop()
 
+    def enclosing(self, name):
+        return next(
+            (
+                function
+                for function in reversed(self.enclosing_functions)
+                if function.name == name
+            ),
+            None,
+        )
+
+    def record_recursion(self, node, owner):
+        # Self-recursion never counts as a reachability reference. A call that
+        # reaches `owner` itself (a bare name outside a class body, `self.`/`cls.`
+        # on a method) still binds its parameters for `constant_defaults`.
+        if node in self.call_funcs and isinstance(node, ast.Attribute) == (
+            owner in self.methods
+        ):
+            self.recursive_calls.setdefault(owner, []).append(self.call_funcs[node])
+
     def reference(self, node, name, *, ambiguous=False):
-        if name in self.targets and name not in self.own_bodies:
+        if name in self.targets:
             refs = self.references[name]
             if node in self.call_funcs and not ambiguous:
                 refs.calls.append(self.call_funcs[node])
@@ -2391,7 +2418,10 @@ class CrossReferences(ast.NodeVisitor):
 
     def visit_Name(self, node):
         if isinstance(node.ctx, ast.Load):
-            if node.id in self.aliases:
+            owner = self.enclosing(node.id)
+            if owner is not None:
+                self.record_recursion(node, owner)
+            elif node.id in self.aliases:
                 alias = self.aliases[node.id]
                 for name in alias.targets:
                     self.reference(node, name, ambiguous=alias.ambiguous)
@@ -2399,7 +2429,25 @@ class CrossReferences(ast.NodeVisitor):
                 self.reference(node, node.id)
 
     def visit_Attribute(self, node):
-        self.reference(node, node.attr)
+        owner = self.enclosing(node.attr)
+        receiver = node.value
+        if (
+            owner is not None
+            and isinstance(receiver, ast.Name)
+            and receiver.id in {"self", "cls"}
+        ):
+            self.record_recursion(node, owner)
+        else:
+            if (
+                owner is not None
+                and node in self.call_funcs
+                and isinstance(receiver, ast.Call)
+                and isinstance(receiver.func, ast.Name)
+                and receiver.func.id == "super"
+            ):
+                # A `super()` delegation reaches a base definition, never `owner`.
+                self.delegations.add(self.call_funcs[node])
+            self.reference(node, node.attr)
         self.generic_visit(node)
 
 
@@ -2453,10 +2501,10 @@ def effective_arguments(node, call):
 
 
 def constant_defaults(definition, calls, change_tag):
-    path, source, node, symbol = definition
+    path, source, node, symbol, recursive_calls = definition
     if framework_hook(node):
         return []
-    bound = [effective_arguments(node, call) for call in calls]
+    bound = [effective_arguments(node, call) for call in (*calls, *recursive_calls)]
     if any(arguments is None for arguments in bound):
         return []
     record = CandidateRecords(source)
@@ -2491,6 +2539,7 @@ def cross_reachability(root, tip, args, targets, deleted_calls, active_trees, er
     }
     checked = 0
     exported = set()
+    delegations = set()
     for path, raw in snapshot_sources(root, tip, args.exclude):
         checked += 1
         if path in active_trees:
@@ -2508,6 +2557,7 @@ def cross_reachability(root, tip, args, targets, deleted_calls, active_trees, er
             total = counts[name][file_role]
             total.calls.extend(refs.references[name].calls)
             total.non_calls += refs.references[name].non_calls
+        delegations.update(refs.delegations)
         if file_role == "prod":
             for statement in local_walk(tree):
                 if not isinstance(statement, ast.stmt):
@@ -2524,20 +2574,18 @@ def cross_reachability(root, tip, args, targets, deleted_calls, active_trees, er
                         and isinstance(child.value, str)
                     )
             for node, symbol in refs.definitions:
-                definitions[node.name].append((path, source, node, symbol))
+                definitions[node.name].append(
+                    (path, source, node, symbol, refs.recursive_calls.get(node, []))
+                )
     candidates = []
     for name, defs in definitions.items():
         prod = counts[name]["prod"]
         test = counts[name]["test"]
-        if (
-            len(defs) == 1
-            and name not in exported
-            and not prod.non_calls
-            and prod.calls
-        ):
+        bindings = [call for call in prod.calls if call not in delegations]
+        if len(defs) == 1 and name not in exported and not prod.non_calls and bindings:
             candidates.extend(
                 constant_defaults(
-                    defs[0], prod.calls, "changed" if args.base else "path-audit"
+                    defs[0], bindings, "changed" if args.base else "path-audit"
                 )
             )
         if prod.calls or prod.non_calls:
@@ -2557,7 +2605,7 @@ def cross_reachability(root, tip, args, targets, deleted_calls, active_trees, er
         )
         if len(defs) > 1:
             evidence += f"; ambiguous_defs: {len(defs)}"
-        for path, source, node, symbol in defs:
+        for path, source, node, symbol, _ in defs:
             if framework_hook(node):
                 continue
             record = CandidateRecords(source)
