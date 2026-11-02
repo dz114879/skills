@@ -1047,7 +1047,8 @@ class CandidateRecords(ast.NodeVisitor):
 
     def add(self, rule, node, evidence, verify, related=(), signature=None, scope=()):
         """`scope` line ranges make the candidate diff-eligible outside its `span`;
-        `signature` is a tuple of display strings that `PY10a` pairs and prints."""
+        `signature` is a tuple of display strings that `PY10a` pairs and prints.
+        Code stays lossless for bundle evidence until final output truncation."""
         nodes = (node, *related)
         spans = [(item.lineno, item.end_lineno) for item in nodes]
         code = "; ".join(ast.get_source_segment(self.source, item) for item in nodes)
@@ -1059,7 +1060,7 @@ class CandidateRecords(ast.NodeVisitor):
                     max(end for _, end in spans),
                 ],
                 "symbol": ".".join(self.symbols) or "<module>",
-                "code": " ".join(code.split())[:200],
+                "code": " ".join(code.split()),
                 "evidence": evidence,
                 "verify": verify,
                 "_scope": [*spans, *scope],
@@ -1225,6 +1226,10 @@ class CandidateProbes(CandidateRecords):
                 f"Lookup coalesces to {ast.unparse(fallback)} at line {node.lineno}",
                 verify,
                 signature=lookup_signature(node.values[:-1]),
+            )
+            self.candidates[-1]["_coalesce"] = (
+                node.col_offset,
+                ast.unparse(fallback),
             )
         self.generic_visit(node)
 
@@ -2849,6 +2854,47 @@ def cross_reachability(root, tip, args, selected, lost, active_trees, errors):
     return candidates, len(paths)
 
 
+def bundle_coalesces(candidates):
+    groups = {}
+    bundled = []
+    for candidate in candidates:
+        if (
+            candidate["rule"] == "PY04_lossy_falsy_coalesce"
+            and candidate["symbol"] != "<module>"
+        ):
+            key = candidate["path"], candidate["symbol"], candidate["change_tag"]
+            groups.setdefault(key, []).append(candidate)
+        else:
+            bundled.append(candidate)
+    for members in groups.values():
+        members.sort(key=lambda item: (item["span"][0], item["_coalesce"][0]))
+        candidate = members[0]
+        if len(members) >= 2:
+            candidate["span"] = [
+                min(item["span"][0] for item in members),
+                max(item["span"][1] for item in members),
+            ]
+            candidate["evidence"] = (
+                f"{len(members)} coalescing lookups in {candidate['symbol']}: "
+                + "; ".join(
+                    f"line {item['span'][0]}: {item['code']} -> {item['_coalesce'][1]}"
+                    for item in members
+                )
+            )
+            candidate["code"] = "; ".join(item["code"] for item in members)
+            if len({item["verify"] for item in members}) > 1:
+                candidate["verify"] = (
+                    "Can the immediate producer or governing type deliver a falsy value "
+                    "at each site? If not, the fallback is dead; if it delivers "
+                    'a legitimate 0/""/False or a distinct falsy value '
+                    '(None vs 0, 0 vs ""), the fallback rewrites it. '
+                    "Counterweight only if the boundary contract equates missing with "
+                    "empty or the producer already rejects empty. See python.md §6."
+                )
+        bundled.append(candidate)
+    return bundled
+
+
 def scan(root, files, base, tip, args):
     candidates = []
     parse_errors = set()
@@ -2919,9 +2965,12 @@ def scan(root, files, base, tip, args):
         parse_errors,
     )
     candidates.extend(cross)
+    candidates = bundle_coalesces(candidates)
     candidates.sort(key=lambda item: (item["path"], item["span"][0], item["rule"]))
     for index, candidate in enumerate(candidates, 1):
         candidate.pop("_scope")
+        candidate.pop("_coalesce", None)
+        candidate["code"] = candidate["code"][:200]
         candidate["id"] = f"C{index:02d}"
     return {
         "summary": {

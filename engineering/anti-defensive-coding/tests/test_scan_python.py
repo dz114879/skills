@@ -3216,6 +3216,272 @@ class ScanPythonTests(unittest.TestCase):
             },
         )
 
+    def test_lossy_coalesce_bundles_falsy_sites_but_keeps_singletons(self):
+        self.put(
+            "coalesce.py",
+            """
+            zero = data.get("zero") or 0
+            empty = data["empty"] or ""
+
+            def single(data):
+                return data.value or False
+
+            async def load(data):
+                first = data.get("count") or 0
+                return (
+                    data.items
+                    or []
+                )
+            """,
+        )
+        result = self.scan("--paths", "coalesce.py")
+        candidates = result["candidates"]
+        self.assertEqual(result["summary"]["candidate_count"], 4)
+        falsy_verify = (
+            "Can the immediate producer or governing type deliver a falsy value "
+            "here? If not, the fallback is dead; if it delivers a distinct "
+            'legitimate one (None vs 0, 0 vs ""), the fallback rewrites it. '
+            "Counterweight only if the boundary contract equates missing with "
+            "empty or the producer already rejects empty. See python.md §6."
+        )
+        self.assertEqual(
+            [
+                (c["symbol"], c["span"], c["code"], c["evidence"], c["verify"])
+                for c in candidates
+            ],
+            [
+                (
+                    "<module>",
+                    [1, 1],
+                    'data.get("zero") or 0',
+                    "Lookup coalesces to 0 at line 1",
+                    falsy_verify,
+                ),
+                (
+                    "<module>",
+                    [2, 2],
+                    'data["empty"] or ""',
+                    "Lookup coalesces to '' at line 2",
+                    falsy_verify,
+                ),
+                (
+                    "single",
+                    [5, 5],
+                    "data.value or False",
+                    "Lookup coalesces to False at line 5",
+                    falsy_verify,
+                ),
+                (
+                    "load",
+                    [8, 11],
+                    'data.get("count") or 0; data.items or []',
+                    "2 coalescing lookups in load: "
+                    'line 8: data.get("count") or 0 -> 0; '
+                    "line 10: data.items or [] -> []",
+                    falsy_verify,
+                ),
+            ],
+        )
+        for index, candidate in enumerate(candidates, 1):
+            self.assertEqual(
+                set(candidate),
+                {
+                    "id",
+                    "path",
+                    "span",
+                    "symbol",
+                    "rule",
+                    "change_tag",
+                    "code",
+                    "evidence",
+                    "verify",
+                },
+            )
+            self.assertEqual(candidate["id"], f"C{index:02d}")
+            self.assertEqual(candidate["path"], "coalesce.py")
+            self.assertEqual(candidate["rule"], "PY04_lossy_falsy_coalesce")
+            self.assertEqual(candidate["change_tag"], "path-audit")
+
+    def test_lossy_coalesce_bundles_keep_full_expressions_and_select_verify(self):
+        truthy_verify = (
+            "Can the immediate producer or governing type deliver a falsy value "
+            "here? If not, the fallback is dead; if it delivers "
+            'a legitimate 0/""/False, the fallback overwrites it. '
+            "Counterweight only if the boundary contract equates missing with "
+            "empty or the producer already rejects empty. See python.md §6."
+        )
+        mixed_verify = (
+            "Can the immediate producer or governing type deliver a falsy value "
+            "at each site? If not, the fallback is dead; if it delivers "
+            'a legitimate 0/""/False or a distinct falsy value '
+            '(None vs 0, 0 vs ""), the fallback rewrites it. '
+            "Counterweight only if the boundary contract equates missing with "
+            "empty or the producer already rejects empty. See python.md §6."
+        )
+        long_key = "x" * 220
+        for fallback, verify in [("'default'", truthy_verify), ("0", mixed_verify)]:
+            with self.subTest(fallback=fallback):
+                self.put(
+                    "coalesce.py",
+                    f"""
+                    def load(data):
+                        first = data.get("{long_key}") or 30
+                        return (
+                            data["name"]
+                            or {fallback}
+                        )
+                    """,
+                )
+                candidates = self.scan("--paths", "coalesce.py")["candidates"]
+                self.assertEqual(len(candidates), 1)
+                candidate = candidates[0]
+                self.assertEqual(candidate["rule"], "PY04_lossy_falsy_coalesce")
+                self.assertEqual(candidate["span"], [2, 5])
+                self.assertEqual(candidate["code"], 'data.get("' + "x" * 190)
+                self.assertEqual(
+                    candidate["evidence"],
+                    "2 coalescing lookups in load: "
+                    f'line 2: data.get("{long_key}") or 30 -> 30; '
+                    f'line 4: data["name"] or {fallback} -> {fallback}',
+                )
+                self.assertEqual(candidate["verify"], verify)
+
+    def test_lossy_coalesce_groups_emitted_symbols_and_paths_in_source_order(self):
+        self.put(
+            "a.py",
+            """
+            class Record:
+                entries = {
+                    data.get("key") or "default":
+                        data.get("value") or "",
+                    data.get("next") or 0:
+                        data.get("last") or [],
+                }
+
+                @property
+                def label(self):
+                    return self._row.get("label") or ""
+
+                @label.setter
+                def label(self, value):
+                    return self._row["setter"] or ""
+            """,
+        )
+        self.put(
+            "b.py",
+            """
+            class Record:
+                def label(self):
+                    return self._row.get("label") or ""
+            """,
+        )
+        candidates = self.scan("--paths", "b.py", "a.py")["candidates"]
+        self.assertEqual(
+            [(c["id"], c["path"], c["symbol"], c["span"]) for c in candidates],
+            [
+                ("C01", "a.py", "Record", [3, 6]),
+                ("C02", "a.py", "Record.label", [11, 15]),
+                ("C03", "b.py", "Record.label", [3, 3]),
+            ],
+        )
+        self.assertEqual(
+            candidates[0]["code"],
+            'data.get("key") or "default"; data.get("value") or ""; '
+            'data.get("next") or 0; data.get("last") or []',
+        )
+        self.assertEqual(
+            candidates[0]["evidence"],
+            "4 coalescing lookups in Record: "
+            'line 3: data.get("key") or "default" -> \'default\'; '
+            'line 4: data.get("value") or "" -> \'\'; '
+            'line 5: data.get("next") or 0 -> 0; '
+            'line 6: data.get("last") or [] -> []',
+        )
+        self.assertEqual(
+            candidates[1]["evidence"],
+            "2 coalescing lookups in Record.label: "
+            'line 11: self._row.get("label") or "" -> \'\'; '
+            'line 15: self._row["setter"] or "" -> \'\'',
+        )
+        self.assertEqual(candidates[2]["evidence"], "Lookup coalesces to '' at line 3")
+
+    def test_lossy_coalesce_bundles_only_eligible_sites_after_moved_promotion(self):
+        self.init_repo()
+        self.put(
+            "coalesce.py",
+            """
+            def original(data):
+                return data.get("moved") or 0
+
+            def destination(data):
+                ignored = data.get("unchanged") or ""
+                return data
+            """,
+        )
+        base = self.commit()
+        for remaining in [1, 2]:
+            with self.subTest(remaining=remaining):
+                extra = '    last = data["last"] or ""\n' if remaining == 2 else ""
+                self.put(
+                    "coalesce.py",
+                    "def original(data):\n"
+                    "    return data\n"
+                    "\n"
+                    "def destination(data):\n"
+                    '    ignored = data.get("unchanged") or ""\n'
+                    '    first = data.get("first") or []\n'
+                    '    moved = data.get("moved") or 30\n'
+                    + extra
+                    + "    return data\n",
+                )
+                result = self.scan("--base", base)
+                candidates = result["candidates"]
+                self.assertEqual(result["summary"]["candidate_count"], 2)
+                self.assertEqual(
+                    [(c["rule"], c["change_tag"], c["span"]) for c in candidates],
+                    [
+                        (
+                            "PY04_lossy_falsy_coalesce",
+                            "changed",
+                            [6, 6] if remaining == 1 else [6, 8],
+                        ),
+                        ("PY10a_moved_defense", "moved-defense", [7, 7]),
+                    ],
+                )
+                coalesced, moved = candidates
+                if remaining == 1:
+                    self.assertEqual(coalesced["code"], 'data.get("first") or []')
+                    self.assertEqual(
+                        coalesced["evidence"], "Lookup coalesces to [] at line 6"
+                    )
+                else:
+                    self.assertEqual(
+                        coalesced["code"],
+                        'data.get("first") or []; data["last"] or ""',
+                    )
+                    self.assertEqual(
+                        coalesced["evidence"],
+                        "2 coalescing lookups in destination: "
+                        'line 6: data.get("first") or [] -> []; '
+                        'line 8: data["last"] or "" -> \'\'',
+                    )
+                self.assertIn("distinct legitimate one", coalesced["verify"])
+                self.assertEqual(moved["code"], 'data.get("moved") or 30')
+                self.assertEqual(
+                    moved["evidence"],
+                    "Lookup coalesces to 30 at line 7; "
+                    "same PY04_lossy_falsy_coalesce signature 'moved' "
+                    "lost from base coalesce.py:2 (original) (signature match only)",
+                )
+                self.assertIn("under python.md §6.", moved["verify"])
+                for index, candidate in enumerate(candidates, 1):
+                    self.assertEqual(candidate["id"], f"C{index:02d}")
+                    self.assertEqual(candidate["symbol"], "destination")
+                    self.assertFalse(any(key.startswith("_") for key in candidate))
+                compact = self.cli("--base", base)
+                self.assertIn("PY04_lossy_falsy_coalesce [changed]", compact)
+                self.assertIn("PY10a_moved_defense [moved-defense]", compact)
+
     def test_lossy_coalesce_separates_truthy_and_falsy_fallback_prompts(self):
         prompts = {True: set(), False: set()}
         for lookup in [

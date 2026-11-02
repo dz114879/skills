@@ -66,6 +66,8 @@ Keep unmatched catalogues unloaded. Catalogue entries supply recognition example
 
 For every extractor candidate and manually spotted family pattern, inspect its immediate caller, immediate producer, or governing type/schema definition. Apply the four gates to establish the upstream guarantee and the consequence of retaining or removing the defense. Record the concrete `file:line` proof or the dismissal reason. Keep investigation to that **1 hop**, rather than an unguided whole-repository sweep.
 
+For a bundled candidate, check the 1-hop contract for each member site or parameter listed in `evidence`, and report only confirmed member lines or parameters in Step 4.
+
 **Unresolved contract:** Suppress a candidate when the 1-hop check cannot establish the upstream producer/type guarantee, or the consumer might rely on an external public/dynamic contract. Preserve any applicable Counterweight. Same-name declarations elsewhere in a file remain clues until tied to the actual receiver.
 
 **`Any` receiver:** An `Any` or unannotated receiver whose immediate supplier is also `Any`, or which arrives through a dynamic loader or registry, has no governing type at 1 hop. A class found further along the chain is a clue, so the candidate stays unresolved.
