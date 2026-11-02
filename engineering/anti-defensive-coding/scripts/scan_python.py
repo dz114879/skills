@@ -2618,25 +2618,39 @@ def constant_defaults(definition, calls, change_tag, clauses):
     ]
     if any(arguments is None for arguments in bound):
         return []
-    record = CandidateRecords(source)
-    record.symbols = symbol.split(".")
+    uniform = []
     for name, default in defaults.items():
         if default is None:
             continue
         values = {arguments[name] for arguments in bound if name in arguments}
         if len(values) == 1 and None not in values:
-            record.add(
-                "PY10c_cross_test_reachability",
-                default,
-                f"Parameter '{name}': {len(calls)} resolved prod call sites; uniform value: {values.pop()}{clauses}",
-                "Does every immediate production binding, recursion included, fix this value, "
-                "so the override is dead while the default's policy stays? Is it an export or "
-                "extension contract (Counterweight)? See tests.md §4.",
-            )
-    return [
-        {**candidate, "path": path, "change_tag": change_tag}
-        for candidate in record.candidates
-    ]
+            uniform.append((name, default, values.pop()))
+    if not uniform:
+        return []
+    name, default, value = uniform[0]
+    if len(uniform) == 1:
+        evidence = f"Parameter '{name}': {len(calls)} resolved prod call sites; uniform value: {value}{clauses}"
+        value_reference = "this value"
+    else:
+        params = ", ".join(
+            f"'{name}' (uniform value: {value})" for name, _, value in uniform
+        )
+        evidence = (
+            f"Parameters {params}: {len(calls)} resolved prod call sites{clauses}"
+        )
+        value_reference = "each value"
+    record = CandidateRecords(source)
+    record.symbols = symbol.split(".")
+    record.add(
+        "PY10c_cross_test_reachability",
+        default,
+        evidence,
+        f"Does every immediate production binding, recursion included, fix {value_reference}, "
+        "so the override is dead while the default's policy stays? Is it an export or "
+        "extension contract (Counterweight)? See tests.md §4.",
+        related=tuple(default for _, default, _ in uniform[1:]),
+    )
+    return [{**record.candidates[0], "path": path, "change_tag": change_tag}]
 
 
 @dataclass

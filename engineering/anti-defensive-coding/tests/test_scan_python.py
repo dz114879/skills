@@ -1147,6 +1147,131 @@ class ScanPythonTests(unittest.TestCase):
                     self.assertEqual(candidates[0]["code"], "False")
                     self.assertIn("Counterweight", candidates[0]["verify"])
 
+    def test_cross_default_keeps_single_uniform_parameter_format(self):
+        self.init_repo()
+        for signature, body, calls in [
+            (
+                "flag=False",
+                "flag",
+                "configure(True)\nconfigure(flag=True)\n",
+            ),
+            (
+                "flag=False, varying=None",
+                "flag, varying",
+                "configure(True, 1)\nconfigure(flag=True, varying=2)\n",
+            ),
+        ]:
+            with self.subTest(signature=signature):
+                self.put("app.py", f"def configure({signature}):\n    return {body}\n")
+                self.put("caller.py", calls)
+                self.assertEqual(
+                    self.scan("--paths", "app.py")["candidates"],
+                    [
+                        {
+                            "id": "C01",
+                            "path": "app.py",
+                            "symbol": "configure",
+                            "rule": "PY10c_cross_test_reachability",
+                            "change_tag": "path-audit",
+                            "span": [1, 1],
+                            "code": "False",
+                            "evidence": "Parameter 'flag': 2 resolved prod call sites; "
+                            "uniform value: True",
+                            "verify": "Does every immediate production binding, recursion included, "
+                            "fix this value, so the override is dead while the default's policy stays? "
+                            "Is it an export or extension contract (Counterweight)? See tests.md §4.",
+                        }
+                    ],
+                )
+
+    def test_cross_default_bundles_only_uniform_parameters_in_declaration_order(self):
+        self.init_repo()
+        self.put(
+            "app.py",
+            """\
+            def configure(
+                zulu=False,
+                /,
+                varying=None,
+                *,
+                alpha="policy",
+            ):
+                return zulu, varying, alpha
+            """,
+        )
+        self.put("caller.py", "configure(True, 1)\nconfigure(True, 2)\n")
+        candidates = self.scan("--paths", "app.py")["candidates"]
+        self.assertEqual(
+            candidates,
+            [
+                {
+                    "id": "C01",
+                    "path": "app.py",
+                    "symbol": "configure",
+                    "rule": "PY10c_cross_test_reachability",
+                    "change_tag": "path-audit",
+                    "span": [2, 6],
+                    "code": 'False; "policy"',
+                    "evidence": "Parameters 'zulu' (uniform value: True), "
+                    "'alpha' (uniform value: <DEFAULT>): 2 resolved prod call sites",
+                    "verify": "Does every immediate production binding, recursion included, "
+                    "fix each value, so the override is dead while the default's policy stays? "
+                    "Is it an export or extension contract (Counterweight)? See tests.md §4.",
+                }
+            ],
+        )
+
+    def test_cross_default_bundle_keeps_diff_lost_calls_and_external_base_clauses(self):
+        self.init_repo()
+        source = """\
+            from discord import ui
+            class Panel(ui.View):
+                def configure(
+                    self,
+                    zulu=False,
+                    varying=None,
+                    *,
+                    alpha="policy",
+                ):
+                    return zulu, varying, alpha
+            """
+        self.put("app.py", source)
+        calls = "Panel().configure(True, 1)\nPanel().configure(True, 2)\n"
+        self.put("caller.py", calls + "Panel().configure(False, 3, alpha='other')\n")
+        base = self.commit()
+        self.put("caller.py", calls)
+        for changed in (False, True):
+            with self.subTest(changed=changed):
+                if changed:
+                    self.put(
+                        "app.py",
+                        source.replace(
+                            "return zulu, varying, alpha", "return alpha, varying, zulu"
+                        ),
+                    )
+                candidates = self.scan("--base", base)["candidates"]
+                self.assertEqual(len(candidates), 1)
+                candidate = candidates[0]
+                self.assertEqual(candidate["rule"], "PY10c_cross_test_reachability")
+                self.assertEqual(candidate["symbol"], "Panel.configure")
+                self.assertEqual(candidate["path"], "app.py")
+                self.assertEqual(candidate["change_tag"], "changed")
+                self.assertEqual(candidate["span"], [5, 8])
+                self.assertEqual(candidate["code"], 'False; "policy"')
+                unchanged = (
+                    ""
+                    if changed
+                    else "; definition unchanged; triggered by deleted call"
+                )
+                self.assertEqual(
+                    candidate["evidence"],
+                    "Parameters 'zulu' (uniform value: True), "
+                    "'alpha' (uniform value: <DEFAULT>): 2 resolved prod call sites"
+                    "; lost call(s): base caller.py:3 (prod)"
+                    f"{unchanged}; enclosing class bases: ui.View (not defined in repo)",
+                )
+                self.assertIn("fix each value", candidate["verify"])
+
     def test_module_all_mutations_suppress_constant_default_candidates(self):
         self.init_repo()
         definitions = (
@@ -1605,9 +1730,9 @@ class ScanPythonTests(unittest.TestCase):
         self.assertIn(lost, idle["evidence"])
         self.assertNotIn("definition unchanged", idle["evidence"])
         defaults = [c for c in candidates if c["symbol"] == "configure"]
-        self.assertEqual(len(defaults), 2)
-        self.assertEqual({c["change_tag"] for c in defaults}, {"changed"})
-        self.assertEqual({c["code"] for c in defaults}, {"False", "None"})
+        self.assertEqual(len(defaults), 1)
+        self.assertEqual(defaults[0]["change_tag"], "changed")
+        self.assertEqual(defaults[0]["code"], "False; None")
         self.put("exports.py", 'from app import configure\n__all__ = ["configure"]\n')
         self.assertFalse(
             [
