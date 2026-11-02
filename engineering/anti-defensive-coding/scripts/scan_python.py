@@ -1166,7 +1166,9 @@ class CandidateProbes(CandidateRecords):
                             f"required-value guard at line {guard.lineno}",
                             f"Does the immediate producer require '{name}' to be present, "
                             "making this default hide rejection, or is omission an accepted "
-                            "boundary input (Counterweight)?" + note,
+                            "boundary input (Counterweight)?"
+                            + note
+                            + " See python.md §5.",
                             related=(guard.test, *guard.body),
                         )
                 if any(name in binding_names(child) for child in local_walk(guard)):
@@ -1188,7 +1190,7 @@ class CandidateProbes(CandidateRecords):
                 "Production callable identity is compared with a _DEFAULT_* hook",
                 "Does the immediate caller require a public replacement hook, or "
                 "does this only accommodate test patching; is a live extension "
-                "contract a Counterweight?",
+                "contract a Counterweight? See tests.md §5.",
             )
         self.generic_visit(node)
 
@@ -1277,7 +1279,7 @@ class CandidateProbes(CandidateRecords):
                 ),
                 "Does the immediate caller already own the transaction, making another "
                 "savepoint redundant; is independent rollback or required isolation "
-                "a Counterweight?",
+                "a Counterweight? See sql.md §5.",
                 related=(*checks[1:], *contexts),
             )
 
@@ -1316,7 +1318,7 @@ class CandidateProbes(CandidateRecords):
                         f"{resets[attr][0].lineno}",
                         f"Does the immediate consumer require transient 'self.{attr}', "
                         "or can it receive an explicit argument; is a documented "
-                        "lifecycle/reentrancy guarantee a Counterweight?",
+                        "lifecycle/reentrancy guarantee a Counterweight? See python.md §8.",
                         related=related,
                     )
             for assignment in write_targets(child):
@@ -1352,7 +1354,7 @@ class CandidateProbes(CandidateRecords):
             f"at line {key.lineno}",
             "Does the immediate dictionary consumer expect data only, so this dependency "
             "should be explicit; is a documented dependency registry or boundary adapter "
-            "a Counterweight?",
+            "a Counterweight? See python.md §8.",
             related=() if assignment is not None else (value,),
         )
 
@@ -1445,8 +1447,10 @@ class CandidateProbes(CandidateRecords):
             "PY05_dead_param_evasion",
             node,
             f"Parameter '{name}': {fact} at line {node.lineno}",
-            f"Does an immediate caller still need parameter '{name}', or can its signature "
-            "plumbing be removed; is a live public/framework protocol a Counterweight?",
+            "Does an immediate caller or an export, re-export or published/framework "
+            f"signature require parameter '{name}'? Does a default such as Depends(...) "
+            "run a required side-effect dependency (Counterweight), or can its plumbing "
+            "be removed? See python.md §7.",
             related=related,
         )
 
@@ -1523,7 +1527,7 @@ class CandidateProbes(CandidateRecords):
                 f"at line {node.lineno}",
                 "Does the immediate consumer need this representation round-trip, "
                 "or can the original value preserve Semantic Fidelity; is documented "
-                "wire normalization or isolation a Counterweight?",
+                "wire normalization or isolation a Counterweight? See python.md §10.",
             )
 
     def lock_candidate(self, node, fact):
@@ -1688,7 +1692,7 @@ class CandidateProbes(CandidateRecords):
                 ),
                 "Does the immediate consumer mutate or retain an independent snapshot "
                 "each iteration, or can copying be removed/hoisted; is isolation or "
-                "required wire serialization a Counterweight?",
+                "required wire serialization a Counterweight? See python.md §10.",
                 related=tuple(header for _, headers in contexts for header in headers),
             )
         if (
@@ -1785,6 +1789,7 @@ class CandidateProbes(CandidateRecords):
                 verify = (
                     "Does the immediate hook's rejection contract require preserving its "
                     "diagnostic, or is replacement documented boundary translation (Counterweight)?"
+                    " See python.md §4."
                     if washes_hook
                     else "Which failure outcome reaches the immediate caller: false success, "
                     "omitted work, or fail-open, versus an established recovery contract "
@@ -1966,14 +1971,14 @@ class TestProbes(CandidateRecords):
         for statement in lexical_nodes(tree.body):
             self.bind_raw_text(statement, self.module_bindings)
 
-    def smell(self, node, evidence, related=()):
+    def smell(self, node, evidence, related=(), *, section):
         self.add(
             "PY10b_test_smell",
             node,
             evidence,
             "Does the immediate production contract require this test mechanism, "
             "or can the test exercise observable behavior; is a documented aliasing "
-            "or compatibility contract a Counterweight?",
+            f"or compatibility contract a Counterweight? See tests.md §{section}.",
             related=related,
         )
 
@@ -2003,7 +2008,9 @@ class TestProbes(CandidateRecords):
     def visit_Attribute(self, node):
         if node.attr.startswith("_legacy"):
             self.smell(
-                node, f"Test accesses private compatibility attribute '{node.attr}'"
+                node,
+                f"Test accesses private compatibility attribute '{node.attr}'",
+                section=4,
             )
         self.generic_visit(node)
 
@@ -2062,6 +2069,7 @@ class TestProbes(CandidateRecords):
                     site,
                     f"Patch targets directly invoked SUT symbol '{symbol}'",
                     related,
+                    section=5,
                 )
         self.generic_visit(node)
         self.symbols.pop()
@@ -2075,6 +2083,7 @@ class TestProbes(CandidateRecords):
                 node,
                 "Assertion checks raw source/documentation text from a .py/.md path",
                 tuple(dict.fromkeys(origin[1])),
+                section=6,
             )
 
     def getter_mutations(self, nodes):
@@ -2120,6 +2129,7 @@ class TestProbes(CandidateRecords):
                     getter.binding,
                     f"Getter '{getter.method}' return '{name}' is mutated before re-call",
                     (*getter.mutations, node),
+                    section=2,
                 )
                 getter.mutations.clear()
 

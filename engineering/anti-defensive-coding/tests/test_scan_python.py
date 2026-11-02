@@ -433,6 +433,23 @@ class ScanPythonTests(unittest.TestCase):
                     self.assertEqual(candidates[0]["symbol"], "test_case")
                     self.assertIn("Counterweight", candidates[0]["verify"])
 
+    def test_test_smell_verify_points_to_its_subprobe_catalogue(self):
+        for body, pointer in [
+            ("obj._legacy_read()", "tests.md §4"),
+            ('assert "class" in Path("app.py").read_text()', "tests.md §6"),
+            ("r = obj.items()\nr.append(1)\nobj.items()", "tests.md §2"),
+            ('with patch("app.execute"):\n    execute()', "tests.md §5"),
+        ]:
+            with self.subTest(pointer=pointer):
+                self.put(
+                    "tests/test_case.py",
+                    "def test_case():\n" + textwrap.indent(body, "    ") + "\n",
+                )
+                candidates = self.scan("--paths", "tests/test_case.py")["candidates"]
+                self.assertEqual(len(candidates), 1)
+                self.assertEqual(candidates[0]["rule"], "PY10b_test_smell")
+                self.assertIn(pointer, candidates[0]["verify"])
+
     def test_getter_recall_is_checked_before_rebinding_its_result(self):
         for replacement, expected in [
             ("result = obj.items()", True),

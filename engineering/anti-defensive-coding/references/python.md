@@ -406,6 +406,30 @@ def prepare_execution(items: list[dict], archived_decisions=_COMPUTE_FRESH):
 
 **Counterweight (When to Keep):** When `None` is a documented, valid domain meaning equivalent to omitting the argument (for example, an optional filter where both omitted `tag` and `tag=None` mean "no filter"), a `None` default sentinel is clean and idiomatic.
 
+### Unchecked positional fallback after a failed anchor lookup
+
+**Pattern Name & Grade Condition:** Unchecked positional fallback — `[Hard]`, **Error Washing**, when the loader can truncate or reorder the sequence and the fallback yields an empty or wrong tail that the caller accepts as successful completion; `[Simplify]`, **Dead Plumbing**, when the producer guarantees the anchor is present, making the fallback unreachable.
+
+**Signal (Bad):** An identity-anchor lookup fails, so code slices from a stored count without checking whether that position still belongs to the loaded sequence. Python slicing silently clips an out-of-range count to an empty result.
+
+```python
+def remaining_entries(entries, anchor_id, processed_count):
+    index = next((i for i, entry in enumerate(entries) if entry.id == anchor_id), None)
+    return entries[index + 1:] if index is not None else entries[processed_count:]
+```
+
+**1-Hop Verify & Fix (Good):** Inspect the immediate sequence loader, the count's producer, and the caller's treatment of an empty tail. If loading can truncate or reorder entries, reject the missing anchor unless a documented positional checkpoint still identifies the same prefix. Bounds alone cannot prove that identity; when positional fallback is valid, check `0 <= processed_count <= len(entries)` before slicing.
+
+```python
+def remaining_entries(entries, anchor_id):
+    index = next((i for i, entry in enumerate(entries) if entry.id == anchor_id), None)
+    if index is None:
+        raise StaleCheckpointError("Anchor missing from loaded entries")
+    return entries[index + 1:]
+```
+
+**Counterweight (When to Keep):** Keep a documented legacy count fallback when its producer guarantees the same ordered sequence and the count is validated against its current length; a count equal to that length legitimately means no remaining entries.
+
 ## 6. Falsy Coalescing & Pre-Validation Equality Diffing
 
 ### Falsy `or` coalescing over valid zero, empty, or `False` values
@@ -480,7 +504,7 @@ def changed_numeric_fields(incoming: dict, current: dict) -> dict:
 
 ### Linter-evading dead parameters (`_ = param`, entry overwrite, dual-parameter fallback)
 
-**Pattern Name & Grade Condition:** Linter-evading dead parameter — `[Simplify]`, **Dead Plumbing**, when no caller relies on the discarded or overwritten parameter.
+**Pattern Name & Grade Condition:** Linter-evading dead parameter — `[Simplify]`, **Dead Plumbing**, when no immediate caller relies on the discarded or overwritten parameter and no **Public Contract** or dependency side effect requires its presence.
 
 **Signal (Bad):** A function silences unused-argument checks via `_ = param`, overwrites a parameter in its entry prefix before reading it (`metrics = prepared["metrics"]`), or keeps an old parent container alongside a new pre-extracted slice parameter with an unreachable fallback (`if item_slice is None: item_slice = parent_map.get(item.id)`).
 
@@ -493,18 +517,37 @@ def score_item(item, parent_timelines, prepared, item_timeline=None, audit_count
     return len(item_timeline)
 ```
 
-**1-Hop Verify & Fix (Good):** Check all 1-hop callers. When callers already supply `item_timeline` (or `prepared`) and never rely on the overwritten/discarded parameters, make the consumed input required and remove the dead parameters across the signature and call sites.
+**1-Hop Verify & Fix (Good):** Check all 1-hop callers, the defining module's `__all__`, explicit re-exports, and published signatures (including public methods of exported classes). Inspect framework dependency defaults at their dispatch source: `Depends(...)` may execute authorization even when its result is discarded. Only when these checks establish that the parameter is internal and unused, make the consumed input required and remove the dead parameters across the signature and call sites.
 
 ```python
 def score_item(item_timeline: list) -> int:
     return len(item_timeline)
 ```
 
-**Counterweight (When to Keep):** Framework callbacks, event handlers, `@abstractmethod` / `Protocol` implementations, or public APIs with positional signature obligations may have unused parameters dictated by an external interface; prefer naming them `_unused` when the interface cannot be narrowed.
+**Counterweight (When to Keep):** Preserve parameters required by framework callbacks, event handlers, `@abstractmethod` / `Protocol` implementations, or a **Public Contract** exposed through exports, re-exports, or a published signature; an empty internal caller inventory does not retire that contract. Keep side-effect dependency defaults such as authorization. Use `_unused` only when parameter names are not part of the external calling contract.
+
+```python
+# _plugins.py: context is retained by the published signature.
+def resolve_plugin(name, *, context=None):
+    _ = context
+    return registry[name]
+
+
+# Public facade: external callers may pass context by keyword.
+from ._plugins import resolve_plugin as resolve_plugin
+
+__all__ = ["resolve_plugin"]
+
+
+@router.get("/jobs")
+def list_jobs(token: str = Depends(require_admin)):
+    _ = token  # Dependency execution authorizes the request.
+    return repo.list_jobs()
+```
 
 ### Ubiquitous `context=None` fallback chains across internal callees
 
-**Pattern Name & Grade Condition:** Pseudo-optional context fallback chain — `[Simplify]`, **Dead Plumbing**, when every production entry point passes a context; the repository methods only the fallback reaches belong to the same finding.
+**Pattern Name & Grade Condition:** Pseudo-optional context fallback chain — `[Simplify]`, **Dead Plumbing**, when every production entry point passes a context and no **Public Contract** permits omission; the repository methods only the fallback reaches belong to the same finding.
 
 **Signal (Bad):** Every production entry point constructs a transaction/read context and passes it down, yet internal helpers declare `context=None` and repeat `context.items if context is not None else ItemRepository(conn).list_items()` across layers.
 
@@ -519,14 +562,14 @@ def resolve_references(conn, plan_id: str, context: ReadContext | None = None):
     return repo.match(tasks)
 ```
 
-**1-Hop Verify & Fix (Good):** Inspect all production callers of `resolve_references`. When every production entry point passes a non-null `ReadContext`, tighten the parameter to `context: ReadContext`, delete the `if context is not None else ...` fallback branches, and remove any repository methods whose production call count drops to zero.
+**1-Hop Verify & Fix (Good):** Inspect all production callers of `resolve_references` and any export or published-signature contract. When every production entry point passes a non-null `ReadContext` and omission is not public behavior, tighten the parameter to `context: ReadContext`, delete the `if context is not None else ...` fallback branches, and remove any repository methods whose production call count drops to zero.
 
 ```python
 def resolve_references(plan_id: str, context: ReadContext):
     return context.references.match(context.tasks_by_plan(plan_id))
 ```
 
-**Counterweight (When to Keep):** Keep an optional `context=None` parameter on a public entry point or CLI helper that is genuinely invoked both standalone and inside an existing batch context by live callers.
+**Counterweight (When to Keep):** Keep an optional `context=None` parameter when a **Public Contract** permits standalone use, even without an internal caller, or when a CLI helper is genuinely invoked both standalone and inside an existing batch context.
 
 ## 8. Hidden State Smuggling & Runtime Test-Hook Trampolines
 
@@ -667,6 +710,28 @@ class BaseQueryService:
 
 **Counterweight (When to Keep):** Trimming user-typed search queries or normalizing new identifiers at the write/import admission boundary (while rejecting inputs where stripping collides with an existing distinct key) is valid boundary parsing.
 
+### Centralization half-move leaving a legacy sibling parser
+
+**Pattern Name & Grade Condition:** Centralization half-move — `[Hard]`, **Split Paths & Compensation**, when reachable representations of the same error receive different statuses and change the caller's retry behavior; `[Simplify]`, **Half-Moves & Zombie Scaffolding**, when the legacy branch is unreachable or only duplicates the canonical rule.
+
+**Signal (Bad):** A canonical extractor accepts both serialized and parsed errors, but only the string branch uses it. A sibling dict branch retains a legacy status mapping.
+
+```python
+def error_status(payload):
+    if isinstance(payload, str):
+        return extract_error(payload).status
+    return payload["error"].get("status", 400)
+```
+
+**1-Hop Verify & Fix (Good):** Inspect the immediate producer's representations and the canonical extractor's accepted inputs and mapping. If the producer can emit `{"error": {"type": "rate_limit"}}` and the extractor maps that error to 429, the legacy default of 400 changes retry behavior. Route both representations through the owner and delete the legacy mapping; if the producer cannot reach the legacy branch, remove it as dead plumbing.
+
+```python
+def error_status(payload):
+    return extract_error(payload).status
+```
+
+**Counterweight (When to Keep):** Keep a separate parser when the representation is provably outside the canonical extractor's input contract and has documented distinct semantics. A second implementation of the same rule for an already-supported representation is not such a boundary.
+
 ## 10. Round-Trip Conversions, Copy Churn & Cache-Busting Copies
 
 ### Serialization, datetime, and `int(float(x))` round-trips; same-type scalar reparsing
@@ -736,8 +801,39 @@ def summarize_results(repo, results: list[OutcomeRecord]) -> list[dict]:
 - **Row factory.** For `dict(row)`, the row factory of the cursor that produced the row separates churn from the first materialization; `sql.md` §3 holds the cursor rule.
 - **Deep copy of an already-detached value.** After `source = copy.deepcopy(payload)`, `normalize(copy.deepcopy(source["request"]))` copies a subtree of the fresh `source`; when nothing reads the un-normalized subtree afterwards, normalize `source["request"]` directly.
 - **Deep copy fed straight to `json.dumps`.** `snapshot = {"tools": copy.deepcopy(tools)}` serialized by `json.dumps(snapshot)`, with no mutation or `await` in between and `snapshot` not kept afterwards, copies a value that `json.dumps` only reads; put `tools` in the snapshot directly.
+- **Intermediate `list(x)` re-iterated into a new container.** `values = list(x); encoded = [encode(value) for value in values]` becomes `encoded = [encode(value) for value in x]` when the sole consumer iterates read-only and neither it nor intervening work mutates `x`. Inspect the producer and consumer for required snapshot or eager-evaluation timing before removing the intermediate list.
 
-**Counterweight (When to Keep):** Keep an explicit copy when another owner retains the source and one side mutates: entries copied out of a lock-guarded registry and mutated after release, a merged value cached for later calls and handed out per call, source and target trees kept side by side. Also keep it at the first materialization of driver rows (`sql.md` §3), or when a documented public API contract promises a detached mutable copy.
+**Counterweight (When to Keep):** Keep an explicit copy when another owner retains the source and one side mutates: entries copied out of a lock-guarded registry and mutated after release, a merged value cached for later calls and handed out per call, source and target trees kept side by side. Also keep it at the first materialization of driver rows (`sql.md` §3), or when a documented public API contract promises a detached mutable copy. Keep an intermediate list when it supplies a required stable snapshot, repeated traversal, or eager consumption before the next operation's effects.
+
+### Re-wrapping normalized owned values and re-normalizing canonical fields
+
+**Pattern Name & Grade Condition:** Repeated owned-value normalization — `[Simplify]`, **Redundant Churn**, when construction only copies an already-normalized value for read-only serialization, or **Revalidation** when every owned writer already stores the field canonically.
+
+**Signal (Bad):** A setter stores a normalized `Timeout`, yet serialization constructs another `Timeout` solely to call `as_dict()`. A lookup lowercases a stored key even though every writer already lowercases that slot.
+
+```python
+def timeout_payload(self):
+    return Timeout(self.timeout).as_dict()
+
+
+def matching_values(self, name):
+    key = name.lower()
+    return [value for stored_key, value in self._items if stored_key.lower() == key]
+```
+
+**1-Hop Verify & Fix (Good):** Inspect the property's setter, same-type constructor, and serializer to establish that re-wrapping adds no conversion or mutation isolation. For a canonical field, check every same-class writer, including copy/update paths. Serialize the owned value directly and compare stored keys as stored; normalization of the incoming lookup name still belongs at admission.
+
+```python
+def timeout_payload(self):
+    return self.timeout.as_dict()
+
+
+def matching_values(self, name):
+    key = name.lower()
+    return [value for stored_key, value in self._items if stored_key == key]
+```
+
+**Counterweight (When to Keep):** Keep construction at a raw-input boundary or when it performs a distinct representation conversion; preserve a copy if serialization mutates state retained by another owner. Read-side normalization can remain when a documented external or legacy writer still supplies noncanonical fields and normalization preserves their identity.
 
 ### Hot-loop `copy(obj)` busting `id(obj)` caches and unique row IDs in shared cache keys
 
@@ -775,6 +871,28 @@ def evaluate_batch(items: list[Entry], cache: dict) -> list[int]:
 ```
 
 **Counterweight (When to Keep):** When the computation genuinely depends on per-item identity (such as a memoized per-item recursive traversal within a DAG where the same `entry_id` is visited multiple times across paths), `entry_id` belongs in the cache key.
+
+### Inline re-derivation of an existing in-file helper
+
+**Pattern Name & Grade Condition:** Duplicate local rule — `[Simplify]`, **Redundant Churn**, when a loop or comprehension reproduces an existing helper's rule over the same input scope with the same result and side effects.
+
+**Signal (Bad):** An in-file helper already owns a transformation, but a caller spells it out again.
+
+```python
+def enabled_codes(options):
+    return {option.code for option in options if option.enabled}
+
+
+active = {option.code for option in settings.options if option.enabled}
+```
+
+**1-Hop Verify & Fix (Good):** Compare the inline expression with the existing helper, including traversal scope, filtering, output type, and effects. Once they are equivalent, call the helper with the intended input rather than maintaining a second implementation.
+
+```python
+active = enabled_codes(settings.options)
+```
+
+**Counterweight (When to Keep):** Similar-looking code with deliberately different filtering, ordering, or conflict semantics is not equivalent; document that distinction at the call site and preserve it.
 
 ## 11. In-Process Lock Critical Section Discipline
 

@@ -300,6 +300,33 @@ class LedgerWriter:
 
 **Counterweight (When to Keep):** Preserve a nested `SAVEPOINT` when either the helper or its caller catches an exception around the inner scope to isolate partial failures (rolling back only the failed item or multi-statement helper via the context manager's `__exit__` while keeping the outer transaction alive), or when `in_transaction` only reflects implicit driver state (`autocommit=False`) and the `with self.tx.transaction():` block is the sole owner of `COMMIT` / `ROLLBACK`.
 
+### Durable job skipped without a status update
+
+**Pattern Name & Grade Condition:** Silent durable-job skip — `[Hard]`, **Error Washing**, when corrupt persisted values can reach the worker and a normal return leaves required work pending for immediate retry; `[Simplify]`, **Dead Plumbing**, when the storage and row-admission contract makes the skip unreachable.
+
+**Signal (Bad):** A worker rejects a missing identifier with a bare `return`, leaving the durable row `pending` without a diagnostic. A scheduler selecting overdue pending rows immediately selects it again.
+
+```python
+def run_job(job, store):
+    if not job["target_id"]:
+        return
+    perform_job(job)
+    store.mark_done(job["id"])
+```
+
+**1-Hop Verify & Fix (Good):** Inspect the row producer/schema, the scheduler's selection query, and the immediate caller's ownership of status transitions. `NOT NULL` alone does not reject an empty identifier. When corrupt values can reach this worker, persist terminal failure with a diagnostic in the job owner's transaction, or raise to a caller that demonstrably records that outcome; when admission already rejects them, remove the dead skip.
+
+```python
+def run_job(job, store):
+    if not job["target_id"]:
+        store.mark_failed(job["id"], reason="Missing target_id")
+        return
+    perform_job(job)
+    store.mark_done(job["id"])
+```
+
+**Counterweight (When to Keep):** Keep a skip when the immediate caller durably records cancellation or failure, or an established lease/backoff contract deliberately schedules a bounded retry. Confirm that the transaction commits that state instead of leaving an overdue `pending` row eligible again immediately.
+
 ## 6. Batching & Contract Limits
 
 ### Caller-side manual chunking that duplicates or bypasses callee batch limits

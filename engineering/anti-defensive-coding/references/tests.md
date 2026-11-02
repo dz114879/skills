@@ -195,6 +195,35 @@ def test_choices_loads_available_options(db_conn):
 
 **Counterweight (When to Keep):** General-purpose library primitives, re-entrant query builders, or documented multi-mode services whose public contract supports calling query methods both standalone and inside an active snapshot/transaction context require tests covering both modes.
 
+### Double invocation with a freshly minted key
+
+**Pattern Name & Grade Condition:** Synthetic duplicate invocation — `[Simplify]`, **Implementation-Coupled Tests**, when only a test repeats a key that the sole production caller allocates fresh for one invocation; **Dead Plumbing** for the dedupe pre-check that only this test reaches.
+
+**Signal (Bad):** The sole caller mints a fresh unique key (`lastrowid`, `uuid4()`), invokes the operation once, and has no replay path. A test calls it twice with the same key solely to exercise an otherwise unreachable `if key in self.seen: return` pre-check.
+
+```python
+def create_notification(sender):
+    key = uuid4()
+    sender.send(key, "ready")
+
+
+def test_send_deduplicates(sender, deliveries):
+    key = uuid4()
+    sender.send(key, "ready")
+    sender.send(key, "ready")
+    assert deliveries == ["ready"]
+```
+
+**1-Hop Verify & Fix (Good):** Inspect the immediate caller's key allocation and dispatch: prove uniqueness across the pre-check's lifetime and exactly one invocation per key, including retries or resume paths. A fresh key alone does not prove the absence of replay. When only the test reuses a key, remove the unreachable dedupe branch and test the production submission's observable delivery.
+
+```python
+def test_create_notification_delivers(sender, deliveries):
+    create_notification(sender)
+    assert deliveries == ["ready"]
+```
+
+**Counterweight (When to Keep):** Keep duplicate-invocation tests when a live producer retries with the same key, supports resume/replay or at-least-once delivery, or a **Public Contract** promises idempotency. Exercise that supported path rather than inventing replay behind a fresh-key-only caller.
+
 ## 4. Test-Only Entry Points, Orphaned Repositories & Private Legacy Wrappers
 
 ### Zero-production-caller `.apply()` entry points and test-resurrected orphaned repositories
