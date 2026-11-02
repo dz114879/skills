@@ -577,7 +577,7 @@ def resolve_references(plan_id: str, context: ReadContext):
 
 **Pattern Name & Grade Condition:** Hidden state or dependency smuggling — `[Simplify]`, **Hidden Flow**; `[Hard]` only when the smuggled state causes a listed consequence, such as transient `self` state shared across concurrent or reentrant calls.
 
-**Signal (Bad):** Code stashes private `_attr` fields onto a foreign service/snapshot object and probes them downstream with `getattr(..., None)`, sets `self.active_tokens = ...` or `repo.revisions = ...` inside a `try` block and resets it to `None` in `finally:`, attaches extra functions/maps as attributes on a function object (`fn.prepared = ...`), or mutates `facts["reader"] = reader` to smuggle a database reader into a pure calculation dict.
+**Signal (Bad):** Code stashes private `_attr` fields onto a foreign service/snapshot object and probes them downstream with `getattr(..., None)`, stashes a computed value onto `self._last_payload = payload` immediately before `return payload` so a sibling helper (`_dump_error_payload`) can read it instead of receiving `payload` from callers that already hold the return value, sets `self.active_tokens = ...` or `repo.revisions = ...` inside a `try` block and resets it to `None` in `finally:`, attaches extra functions/maps as attributes on a function object (`fn.prepared = ...`), or mutates `facts["reader"] = reader` to smuggle a database reader into a pure calculation dict.
 
 ```python
 class ProjectionRunner:
@@ -604,7 +604,7 @@ class ProjectionRunner:
         )
 ```
 
-**Counterweight (When to Keep):** Standard descriptor protocols (`__set_name__`), decorators setting metadata on the wrapper function they construct and return, and context managers managing their own internal lock/connection state (`self._depth`) are legitimate local ownership patterns.
+**Counterweight (When to Keep):** Cross-call memoization or caching where later callers reuse `self._cached_x` without recomputing it, standard descriptor protocols (`__set_name__`), decorators setting metadata on the wrapper function they construct and return, and context managers managing their own internal lock/connection state (`self._depth`) are legitimate local ownership patterns.
 
 ### Production monkeypatch trampolines, `_DEFAULT_*` hook checks, and dropped mode flags
 

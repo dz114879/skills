@@ -1791,9 +1791,9 @@ class CandidateProbes(CandidateRecords):
                     "diagnostic, or is replacement documented boundary translation (Counterweight)?"
                     " See python.md §4."
                     if washes_hook
-                    else "Which failure outcome reaches the immediate caller: false success, "
-                    "omitted work, or fail-open, versus an established recovery contract "
-                    "(Counterweight)? Is this handler Lint-Owned? See python.md §4."
+                    else "Which outcome applies at 1 hop: false success, omitted work, or "
+                    "fail-open; an unreachable failure (dead handler); an established "
+                    "recovery contract (Counterweight); or Lint-Owned? See python.md §4."
                 )
                 self.add(
                     "PY02_error_washing",
