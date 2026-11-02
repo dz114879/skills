@@ -842,6 +842,78 @@ class ScanPythonTests(unittest.TestCase):
                     [c["code"] for c in candidates], ["0"] if flagged else []
                 )
 
+    def test_cross_default_forwarded_recursive_parameters(self):
+        self.init_repo()
+        fixture = (
+            "def render(node, width, indent=2):\n"
+            "    step = 4\n"
+            "    for child in node.children:\n"
+            "        {}\n"
+            "    return width + step + indent\n"
+        )
+        for caller, body, flagged in [
+            ("render(tree, 8)", "render(child, width, indent)", True),
+            ("render(tree, 8)", "render(child, width, indent=indent)", True),
+            ("render(tree, 8)", "render(child, width, indent + 1)", False),
+            ("render(tree, 8)", "render(child, width, step)", False),
+            ("render(tree, 8)", "render(child, width, indent=width)", False),
+            (
+                "render(tree, 8)",
+                "indent = indent * 2\n        render(child, width, indent)",
+                False,
+            ),
+            (
+                "render(tree, 8)",
+                "indent += 2\n        render(child, width, indent)",
+                False,
+            ),
+            (
+                "render(tree, 8)",
+                "for indent in node.indents:\n            render(child, width, indent)",
+                False,
+            ),
+            (
+                "render(tree, 8)",
+                "with node.lock as indent:\n            render(child, width, indent)",
+                False,
+            ),
+            (
+                "render(tree, 8)",
+                "if (indent := step):\n            render(child, width, indent)",
+                False,
+            ),
+            (
+                "def other(tree):\n    indent = 4\n    return render(tree, 8, indent)",
+                "render(child, width, indent)",
+                False,
+            ),
+        ]:
+            with self.subTest(caller=caller, body=body):
+                self.put("app.py", fixture.format(body))
+                self.put("caller.py", caller + "\n")
+                candidates = self.scan("--paths", "app.py")["candidates"]
+                self.assertEqual(
+                    [c["code"] for c in candidates], ["2"] if flagged else []
+                )
+        self.put("caller.py", "Tree().render(tree)\n")
+        for header, call in [
+            (
+                "def render(self, node, indent=2, depth=0):",
+                "self.render(child, indent, depth + 1)",
+            ),
+            (
+                "@classmethod\n    def render(cls, node, indent=2, depth=0):",
+                "cls.render(child, indent=indent, depth=depth + 1)",
+            ),
+        ]:
+            with self.subTest(call=call):
+                self.put(
+                    "app.py",
+                    f"class Tree:\n    {header}\n        for child in node.children:\n            {call}\n        return indent + depth\n",
+                )
+                candidates = self.scan("--paths", "app.py")["candidates"]
+                self.assertEqual([c["code"] for c in candidates], ["2"])
+
     def test_rebound_import_aliases_are_escapes_instead_of_resolved_calls(self):
         self.init_repo()
         self.put("app.py", "def configure(flag=False):\n    return flag\n")

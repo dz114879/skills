@@ -2535,7 +2535,7 @@ class CrossReferences(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def effective_arguments(node, call):
+def effective_arguments(node, call, forwarded):
     positional = node.args.posonlyargs + node.args.args
     defaults = parameter_defaults(node)
     if any(isinstance(arg, ast.Starred) for arg in call.args) or any(
@@ -2581,6 +2581,12 @@ def effective_arguments(node, call):
         else None
         for name, default in defaults.items()
         if default is not None
+        and not (
+            name in forwarded
+            and name in bound
+            and isinstance(bound[name], ast.Name)
+            and bound[name].id == name
+        )
     }
 
 
@@ -2588,15 +2594,26 @@ def constant_defaults(definition, calls, change_tag, clauses):
     path, source, node, symbol, recursive_calls = definition
     if framework_hook(node):
         return []
-    bound = [effective_arguments(node, call) for call in (*calls, *recursive_calls)]
+    defaults = parameter_defaults(node)
+    rebound = {
+        name
+        for statement in node.body
+        for child in local_walk(statement)
+        for name in binding_names(child)
+    }
+    forwarded = defaults.keys() - rebound
+    bound = [
+        *(effective_arguments(node, call, ()) for call in calls),
+        *(effective_arguments(node, call, forwarded) for call in recursive_calls),
+    ]
     if any(arguments is None for arguments in bound):
         return []
     record = CandidateRecords(source)
     record.symbols = symbol.split(".")
-    for name, default in parameter_defaults(node).items():
+    for name, default in defaults.items():
         if default is None:
             continue
-        values = {arguments[name] for arguments in bound}
+        values = {arguments[name] for arguments in bound if name in arguments}
         if len(values) == 1 and None not in values:
             record.add(
                 "PY10c_cross_test_reachability",
