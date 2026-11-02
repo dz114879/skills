@@ -114,21 +114,42 @@ class ScanPythonTests(unittest.TestCase):
         self.assertEqual(
             {c["path"] for c in moved}, {f"{name}.py" for name in defenses}
         )
-        origin_lines = {"reflect.py": 2, "handler.py": 4, "coalesce.py": 2}
+        expected_moved = {
+            "reflect.py": (
+                "Receiver item; parameter item: <unannotated> at line 4; "
+                "receiver class unknown; same PY01_reflect_default signature "
+                "'value' lost from base reflect.py:2 (original) "
+                "(signature match only)",
+                "python.md §1",
+            ),
+            "handler.py": (
+                "Handler catches (TypeError, KeyError) at line 8; "
+                "broad/multi-exception handler has a non-raising exit; "
+                "same PY02_error_washing signature KeyError, TypeError "
+                "lost from base handler.py:4 (original) (signature match only)",
+                "python.md §4",
+            ),
+            "coalesce.py": (
+                "Lookup coalesces to 30 at line 6; "
+                "same PY04_lossy_falsy_coalesce signature 'value' "
+                "lost from base coalesce.py:2 (original) (signature match only)",
+                "python.md §6",
+            ),
+        }
         for candidate in moved:
+            expected_evidence, base_section = expected_moved[candidate["path"]]
             self.assertEqual(candidate["symbol"], "destination")
             self.assertEqual(candidate["change_tag"], "moved-defense")
-            self.assertIn(
-                f"lost from base {candidate['path']}:{origin_lines[candidate['path']]} "
-                "(original)",
-                candidate["evidence"],
+            self.assertEqual(candidate["evidence"], expected_evidence)
+            self.assertEqual(
+                candidate["verify"],
+                "Open the origin first: did it guard the same producer, "
+                "receiver or exception source? If so, did this callee become "
+                "the owner, or is it a relocated hedge (a genuine boundary is "
+                "a Counterweight)? If not, verify this defense on its own "
+                f"under {base_section}. See python.md §4.",
             )
-            self.assertIn("signature match only", candidate["evidence"])
-            self.assertIn("Counterweight", candidate["verify"])
-        self.assertEqual(
-            {c["rule"] for c in result["candidates"] if c["change_tag"] == "changed"},
-            {"PY01_reflect_default", "PY02_error_washing", "PY04_lossy_falsy_coalesce"},
-        )
+        self.assertEqual(result["candidates"], moved)
 
     def test_moved_defense_maps_git_rename_and_requires_signature_loss(self):
         self.init_repo()
@@ -146,15 +167,18 @@ class ScanPythonTests(unittest.TestCase):
             + 'class Owner:\n    def original(self, item):\n        return item.value\n\n    def destination(self, item):\n        return hasattr(item, "value")\n',
         )
         self.assertIn("R", self.git("diff", "-M", "--name-status", base))
-        moved = [
-            c
-            for c in self.scan("--base", base)["candidates"]
-            if c["rule"] == "PY10a_moved_defense"
-        ]
-        self.assertEqual(len(moved), 1)
-        self.assertEqual(moved[0]["symbol"], "Owner.destination")
-        self.assertEqual(moved[0]["path"], "new.py")
-        self.assertIn("base old.py:43 (Owner.original)", moved[0]["evidence"])
+        candidates = self.scan("--base", base)["candidates"]
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["rule"], "PY10a_moved_defense")
+        self.assertEqual(candidates[0]["symbol"], "Owner.destination")
+        self.assertEqual(candidates[0]["path"], "new.py")
+        self.assertIn(
+            "Receiver item; parameter item: <unannotated> at line 45; "
+            "receiver class unknown; same PY01_reflect_default signature "
+            "'value' lost from base old.py:43 (Owner.original) "
+            "(signature match only)",
+            candidates[0]["evidence"],
+        )
         self.put(
             "new.py",
             padding
@@ -193,12 +217,15 @@ class ScanPythonTests(unittest.TestCase):
                 f"new{index}.py",
                 "def destination(item):\n" + textwrap.indent(after, "    ") + "\n",
             )
-        moved = [
-            c
-            for c in self.scan("--base", base)["candidates"]
-            if c["rule"] == "PY10a_moved_defense"
-        ]
-        self.assertEqual({c["path"] for c in moved}, {"new0.py", "new1.py", "new2.py"})
+        candidates = self.scan("--base", base)["candidates"]
+        self.assertEqual(
+            [(c["path"], c["rule"]) for c in candidates],
+            [
+                ("new0.py", "PY10a_moved_defense"),
+                ("new1.py", "PY10a_moved_defense"),
+                ("new2.py", "PY10a_moved_defense"),
+            ],
+        )
         for index, (_, after) in enumerate(pairs):
             self.put(
                 f"new{index}.py",
@@ -267,10 +294,13 @@ class ScanPythonTests(unittest.TestCase):
                     for c in candidates
                     if c["rule"] == "PY10a_moved_defense"
                 }
+                self.assertEqual(len(candidates), len(gained))
                 self.assertEqual(set(moved), set(expected))
                 for symbol, names in expected.items():
+                    self.assertIn("Handler catches Exception at line", moved[symbol])
                     self.assertIn(
-                        "PY02_error_washing signature Exception", moved[symbol]
+                        "; same PY02_error_washing signature Exception lost from ",
+                        moved[symbol],
                     )
                     self.assertIn("signature match only", moved[symbol])
                     for name in names:
@@ -282,7 +312,7 @@ class ScanPythonTests(unittest.TestCase):
                         if c["rule"] == "PY02_error_washing"
                         and c["change_tag"] == "changed"
                     },
-                    set(gained),
+                    set(gained) - set(expected),
                 )
 
     def test_moved_defense_destination_must_intersect_added_lines(self):
@@ -293,26 +323,40 @@ class ScanPythonTests(unittest.TestCase):
             'def old_name(item):\n    return getattr(item, "value", None)\n',
         )
         base = self.commit()
-        for defense, expected in [
-            ('getattr(item, "value", None)', []),
-            ('getattr(item, "value", 0)', ["new_name"]),
+        for body, expected in [
+            ('    return getattr(item, "value", None)\n', []),
+            (
+                '    return getattr(item, "value", 0)\n',
+                [("PY10a_moved_defense", "moved-defense", [6, 6])],
+            ),
+            (
+                '    first = getattr(item, "value", 0)\n'
+                '    return getattr(other, "value", 1)\n',
+                [
+                    ("PY01_reflect_default", "changed", [6, 6]),
+                    ("PY10a_moved_defense", "moved-defense", [7, 7]),
+                ],
+            ),
         ]:
-            with self.subTest(defense=defense):
+            with self.subTest(body=body):
                 self.put(
                     "app.py",
                     "def original(item):\n    return item.value\n\n\n"
-                    f"def new_name(item):\n    return {defense}\n",
+                    "def new_name(item, other=None):\n" + body,
                 )
                 tip = self.commit()
-                moved = [
-                    c
-                    for c in self.scan("--base", base, "--tip", tip)["candidates"]
-                    if c["rule"] == "PY10a_moved_defense"
-                ]
-                self.assertEqual([c["symbol"] for c in moved], expected)
-                for candidate in moved:
-                    self.assertEqual(candidate["span"], [6, 6])
-                    self.assertIn("base app.py:2 (original)", candidate["evidence"])
+                candidates = self.scan("--base", base, "--tip", tip)["candidates"]
+                self.assertEqual(
+                    [(c["rule"], c["change_tag"], c["span"]) for c in candidates],
+                    expected,
+                )
+                for candidate in candidates:
+                    if candidate["rule"] == "PY10a_moved_defense":
+                        self.assertIn(
+                            "; same PY01_reflect_default signature 'value' "
+                            "lost from base app.py:2 (original)",
+                            candidate["evidence"],
+                        )
 
     def test_test_smells_legacy_raw_text_getter_mutation_and_self_patch(self):
         cases = [

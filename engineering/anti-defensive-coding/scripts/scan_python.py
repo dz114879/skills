@@ -2197,7 +2197,7 @@ def parse_source(raw, path, errors, *, base=False, pattern=None):
 
 
 def moved_defenses(before, after, changes):
-    """Compare signature presence per function, rather than defense multiplicity.
+    """Promote destination candidates in place by comparing signature presence per function.
 
     `before` and `after` map post-change paths to probes; `changes` maps them to
     their `FileChange`.
@@ -2230,26 +2230,31 @@ def moved_defenses(before, after, changes):
                 and touches([candidate["span"]], changes[path].added_lines)
             ):
                 destinations.setdefault(signature, {})[identity] = candidate
+    sections = {
+        "PY01_reflect_default": 1,
+        "PY02_error_washing": 4,
+        "PY04_lossy_falsy_coalesce": 6,
+    }
     for signature, found in destinations.items():
         # More new locations than functions that lost the signature is a coincidence.
         if len(found) > len(lost[signature]):
             continue
         rule, parts = signature
-        for (path, _, _), candidate in found.items():
-            yield {
-                **candidate,
-                "rule": "PY10a_moved_defense",
-                "path": path,
-                "change_tag": "moved-defense",
-                "evidence": f"Same {rule} signature {', '.join(parts)} lost from "
+        for candidate in found.values():
+            candidate["rule"] = "PY10a_moved_defense"
+            candidate["change_tag"] = "moved-defense"
+            candidate["evidence"] += (
+                f"; same {rule} signature {', '.join(parts)} lost from "
                 + ", ".join(lost[signature])
-                + " (signature match only)",
-                "verify": "Open the origin first: did it guard the same producer, "
-                "receiver or exception source? If not, dismiss as a signature "
-                "coincidence. If so, did this callee become the owner, or is it a "
-                "relocated hedge (a genuine boundary is a Counterweight)? "
-                "See python.md §4.",
-            }
+                + " (signature match only)"
+            )
+            candidate["verify"] = (
+                "Open the origin first: did it guard the same producer, "
+                "receiver or exception source? If so, did this callee become "
+                "the owner, or is it a relocated hedge (a genuine boundary is "
+                "a Counterweight)? If not, verify this defense on its own "
+                f"under python.md §{sections[rule]}. See python.md §4."
+            )
 
 
 def snapshot_sources(root, tip, excludes):
@@ -2900,16 +2905,10 @@ def scan(root, files, base, tip, args):
         for candidate in probes.candidates:
             if not touches(candidate["_scope"], change.added_lines):
                 continue
-            candidates.append(
-                {
-                    **candidate,
-                    "path": relative,
-                    "change_tag": "changed" if args.base else "path-audit",
-                }
-            )
-    candidates.extend(
-        moved_defenses(before, after, {change.path: change for change in files})
-    )
+            candidate["path"] = relative
+            candidate["change_tag"] = "changed" if args.base else "path-audit"
+            candidates.append(candidate)
+    moved_defenses(before, after, {change.path: change for change in files})
     cross, checked = cross_reachability(
         root,
         tip,

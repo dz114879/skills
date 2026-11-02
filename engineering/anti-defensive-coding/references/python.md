@@ -332,7 +332,7 @@ async def finish(stream):
         await close_async_iterator(stream)
 ```
 
-**1-Hop Verify & Fix (Good):** A `PY10a` candidate is a signature match only: the same rule with the same caught exception names or attribute/key literals, receiver dropped. First open each origin it names at the base and confirm it guarded the same producer, receiver, or exception source as the destination; otherwise dismiss the pair as a signature coincidence. Once the origin matches, ask whether the callee became the owner of the rule, then check the owner's callers for a copied guard and call the owner directly.
+**1-Hop Verify & Fix (Good):** A `PY10a` candidate is a signature match only: the same rule with the same caught exception names or attribute/key literals, receiver dropped. First open each origin it names at the base and confirm it guarded the same producer, receiver, or exception source as the destination; if not, drop the moved-defense pairing as a signature coincidence and verify the defense on its own under its base rule (§1, §4, or §6). Once the origin matches, ask whether the callee became the owner of the rule, then check the owner's callers for a copied guard and call the owner directly.
 
 ```python
 async def finish(stream):
