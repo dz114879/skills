@@ -1,10 +1,15 @@
 """Production candidate probes for PY01-PY09 and default hooks."""
 
 import ast
+from functools import cached_property
 
 from .ast_helpers import (
+    MODULE_SCOPE,
+    PREFIX_BOUNDARY_TYPES,
+    SCOPE_TYPES,
     CandidateRecords,
     absent_self_attribute,
+    allocation_batch,
     assignments,
     binding_names,
     bound_targets,
@@ -20,7 +25,6 @@ from .ast_helpers import (
     is_none,
     iteration_parts,
     last_noreturn_call,
-    lexical_nodes,
     literal_truth,
     load_names,
     local_walk,
@@ -28,6 +32,7 @@ from .ast_helpers import (
     lookup_signature,
     name_path,
     named_class,
+    node_parts,
     none_check,
     parameter_defaults,
     parameters,
@@ -36,12 +41,16 @@ from .ast_helpers import (
     row_factory_facts,
     same_class_stashes,
     saved_retry,
+    scope_index,
     self_state_writes,
     simple_assignment,
     stored_primary_cleanup,
     terminal_name,
     terminal_names,
+    tree_index,
     undeclared_attribute,
+    unparse,
+    walk,
     write_targets,
     zero_arg_constructor,
 )
@@ -57,35 +66,46 @@ from .registry import (
 
 
 class CandidateProbes(CandidateRecords):
+    @allocation_batch()
     def __init__(self, source, tree):
         super().__init__(source)
-        classes = [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
-        self.classes = {}
-        for cls in local_walk(tree):
-            if isinstance(cls, ast.ClassDef):
-                self.classes.setdefault(cls.name, []).append(cls)
-        self.attributes = class_declarations(classes)
-        self.parents = []
-        self.imported = import_bindings(ast.walk(tree))
-        self.stashes = same_class_stashes(tree)
-        self.iterations = {}
+        self.index = tree_index(tree)
+        index = self.index
+        self.class_nodes = index.by_type.get(ast.ClassDef, ())
+        self.tree = tree
+        self.imported = import_bindings(
+            [
+                *index.by_type.get(ast.Import, ()),
+                *index.by_type.get(ast.ImportFrom, ()),
+            ]
+        )
+        self.stashes = same_class_stashes(
+            self.class_nodes, index.following, index.local_nodes
+        )
         self.lock_contexts = {}
         self.transaction_contexts = set()
+        self.transaction_functions = set()
         returns = {}
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        for kind in (ast.FunctionDef, ast.AsyncFunctionDef):
+            for node in index.by_type.get(kind, ()):
                 returns.setdefault(node.name, []).append(terminal_name(node.returns))
-            if isinstance(node, (ast.With, ast.AsyncWith)):
-                self.transaction_contexts.update(
-                    item.context_expr
-                    for item in node.items
-                    if context_tokens(item.context_expr) & PY09_TX_TOKENS["entry"]
-                )
-            repeated, headers = iteration_parts(node)
-            for part in repeated:
-                for child in local_walk(part):
-                    if isinstance(child, ast.Call):
-                        self.iterations.setdefault(child, []).append((node, headers))
+        contexts = sorted(
+            [
+                *index.by_type.get(ast.With, ()),
+                *index.by_type.get(ast.AsyncWith, ()),
+            ],
+            key=lambda node: (node.lineno, node.col_offset),
+        )
+        for node in contexts:
+            self.transaction_contexts.update(
+                item.context_expr
+                for item in node.items
+                if context_tokens(item.context_expr) & PY09_TX_TOKENS["entry"]
+            )
+            if any(
+                item.context_expr in self.transaction_contexts for item in node.items
+            ):
+                self.transaction_functions.add(index.owners[node])
             for context, parts in lock_context_parts(node):
                 for part in parts:
                     for child in local_walk(part):
@@ -98,19 +118,29 @@ class CandidateProbes(CandidateRecords):
         }
         self.functions = set()
 
+    @cached_property
+    def classes(self):
+        classes = {}
+        for declarations in self.index.module_definitions.values():
+            for cls in declarations:
+                if isinstance(cls, ast.ClassDef):
+                    classes.setdefault(cls.name, []).append(cls)
+        return classes
+
+    @cached_property
+    def attributes(self):
+        return class_declarations(self.class_nodes)
+
     def generic_visit(self, node):
-        self.parents.append(node)
-        for _, value in ast.iter_fields(node):
-            if (
-                isinstance(value, list)
-                and value
-                and all(isinstance(item, ast.stmt) for item in value)
-            ):
-                self.default_shadows(value)
-        super().generic_visit(node)
-        self.parents.pop()
+        for body in node_parts(node)[1]:
+            self.default_shadows(body)
+        key = MODULE_SCOPE if isinstance(node, ast.Module) else node
+        for child in self.index.probe_children.get(key, ()):
+            self.visit(child)
 
     def default_shadows(self, body):
+        if len(body) < 2 or not any(isinstance(guard, ast.If) for guard in body[1:]):
+            return
         for index, statement in enumerate(body):
             assignment = simple_assignment(statement)
             if assignment is None:
@@ -197,7 +227,7 @@ class CandidateProbes(CandidateRecords):
                 node,
                 evidence_text(
                     "PY04_lossy_falsy_coalesce",
-                    fallback=ast.unparse(fallback),
+                    fallback=unparse(fallback),
                     line=node.lineno,
                 ),
                 verify,
@@ -205,7 +235,7 @@ class CandidateProbes(CandidateRecords):
             )
             self.candidates[-1]["_coalesce"] = (
                 node.col_offset,
-                ast.unparse(fallback),
+                unparse(fallback),
             )
         self.generic_visit(node)
 
@@ -228,7 +258,9 @@ class CandidateProbes(CandidateRecords):
     visit_AsyncFunctionDef = visit_FunctionDef
 
     def transaction_checks(self, node):
-        nodes = [child for statement in node.body for child in local_walk(statement)]
+        if node not in self.transaction_functions:
+            return
+        nodes = scope_index(node).nodes
         contexts = [child for child in nodes if child in self.transaction_contexts]
         if not contexts:
             return
@@ -260,7 +292,7 @@ class CandidateProbes(CandidateRecords):
                     contexts=", ".join(
                         evidence_text(
                             "PY09_tx_context",
-                            context=ast.unparse(context),
+                            context=unparse(context),
                             line=context.lineno,
                         )
                         for context in contexts
@@ -271,7 +303,7 @@ class CandidateProbes(CandidateRecords):
             )
 
     def state_smuggling(self, node):
-        nodes = [child for statement in node.body for child in local_walk(statement)]
+        nodes = self.index.local_nodes.get(node, ())
         for child in nodes:
             if child in self.stashes:
                 attr, returned, readers = self.stashes[child]
@@ -338,7 +370,7 @@ class CandidateProbes(CandidateRecords):
             evidence_text(
                 "PY07_dict_dependency",
                 key=key.value,
-                value=ast.unparse(value),
+                value=unparse(value),
                 line=key.lineno,
             ),
             verify_text("PY07_dict_dependency"),
@@ -351,33 +383,38 @@ class CandidateProbes(CandidateRecords):
             for param in [*parameters(node), node.args.vararg, node.args.kwarg]
             if param is not None and param.arg not in {"self", "cls"}
         }
-        reads = {name: [] for name in params}
+        if not params:
+            return
+        for child in self.index.discards.get(node, ()):
+            value = child.value
+            if value.id in params and scope_index(node).reads.get(value.id) == [value]:
+                self.dead_param_candidate(
+                    value.id,
+                    child,
+                    evidence_text("PY05_discard"),
+                )
+        relevant = False
         for statement in node.body:
-            for child in load_names(statement):
-                if child.id in reads:
-                    reads[child.id].append(child)
-        for statement in node.body:
-            for child in local_walk(statement):
-                assignment = simple_assignment(child)
-                if assignment is None:
-                    continue
-                name, value = assignment
-                if (
-                    name == "_"
-                    and isinstance(value, ast.Name)
-                    and value.id in params
-                    and reads[value.id] == [value]
-                ):
-                    self.dead_param_candidate(
-                        value.id,
-                        child,
-                        evidence_text("PY05_discard"),
-                    )
+            if isinstance(statement, PREFIX_BOUNDARY_TYPES):
+                relevant = (
+                    isinstance(statement, ast.If)
+                    and none_check(statement.test) in params
+                )
+                break
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)) and any(
+                isinstance(target, ast.Name) and target.id in params
+                for assignment in write_targets(statement)
+                for target in bound_targets(assignment)
+            ):
+                relevant = True
+                break
+        if not relevant:
+            return
         unseen = set(params)
-        defaults = parameter_defaults(node)
         for statement in node.body:
             # The first control-flow statement may itself be the fallback guard.
             if isinstance(statement, ast.If):
+                defaults = parameter_defaults(node)
                 new = none_check(statement.test)
                 if (
                     new in params
@@ -391,9 +428,8 @@ class CandidateProbes(CandidateRecords):
                             continue
                         rhs_reads = load_names(assignment[1])
                         for old in sorted(params - {new}):
-                            if reads[old] and all(
-                                read in rhs_reads for read in reads[old]
-                            ):
+                            reads = scope_index(node).reads.get(old, ())
+                            if reads and all(read in rhs_reads for read in reads):
                                 self.dead_param_candidate(
                                     old,
                                     statement.test,
@@ -408,7 +444,7 @@ class CandidateProbes(CandidateRecords):
             if prefix_boundary(statement):
                 break
             mentioned = {
-                child.id for child in ast.walk(statement) if isinstance(child, ast.Name)
+                child.id for child in walk(statement) if isinstance(child, ast.Name)
             }
             for child in local_walk(statement):
                 mentioned.update(binding_names(child))
@@ -424,7 +460,7 @@ class CandidateProbes(CandidateRecords):
                 }
                 rhs = {
                     child.id
-                    for child in ast.walk(statement.value)
+                    for child in walk(statement.value)
                     if isinstance(child, ast.Name)
                 }
                 for name in sorted((unseen & bound) - rhs):
@@ -462,7 +498,7 @@ class CandidateProbes(CandidateRecords):
                     function = next(
                         (
                             scope
-                            for scope in reversed(self.parents)
+                            for scope in self.index.ancestors(node)
                             if isinstance(
                                 scope, (ast.FunctionDef, ast.AsyncFunctionDef)
                             )
@@ -514,8 +550,8 @@ class CandidateProbes(CandidateRecords):
                 node,
                 evidence_text(
                     "PY08_roundtrip_copy",
-                    outer=ast.unparse(node.func),
-                    inner=ast.unparse(inner.func),
+                    outer=unparse(node.func),
+                    inner=unparse(inner.func),
                     line=node.lineno,
                 ),
                 verify_text("PY08_roundtrip_copy"),
@@ -541,7 +577,7 @@ class CandidateProbes(CandidateRecords):
                 contexts=", ".join(
                     evidence_text(
                         "PY09_lock_context",
-                        context=ast.unparse(context),
+                        context=unparse(context),
                         line=context.lineno,
                     )
                     for context in contexts
@@ -568,7 +604,7 @@ class CandidateProbes(CandidateRecords):
             root = root.value
         if not isinstance(root, ast.Name):
             return [], None
-        for scope in reversed(self.parents):
+        for scope in self.index.ancestors(receiver):
             if isinstance(
                 scope, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
             ) and any(
@@ -581,23 +617,11 @@ class CandidateProbes(CandidateRecords):
                 scope, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
             ):
                 continue
-            body = [] if isinstance(scope, ast.Lambda) else scope.body
-            nodes = lexical_nodes(body)
-            for statement in reversed(nodes):
-                targets = (
-                    [statement.target]
-                    if isinstance(statement, ast.AnnAssign)
-                    else write_targets(statement)
-                )
-                if (
-                    targets
-                    and (statement.end_lineno, statement.end_col_offset)
-                    <= (receiver.lineno, receiver.col_offset)
-                    and any(
-                        isinstance(name, ast.Name) and name.id == root.id
-                        for target in targets
-                        for name in bound_targets(target)
-                    )
+            index = scope_index(scope)
+            for statement in reversed(index.writes.get(root.id, ())):
+                if (statement.end_lineno, statement.end_col_offset) <= (
+                    receiver.lineno,
+                    receiver.col_offset,
                 ):
                     annotation = (
                         statement.annotation
@@ -607,36 +631,32 @@ class CandidateProbes(CandidateRecords):
                     return [
                         evidence_text(
                             "PY01_local_binding",
-                            binding=ast.unparse(statement),
+                            binding=unparse(statement),
                             line=statement.lineno,
                         )
                     ], annotation if receiver is root else None
             if not isinstance(scope, ast.Module):
-                for param in (*parameters(scope), scope.args.vararg, scope.args.kwarg):
-                    if param is not None and param.arg == root.id:
-                        annotation = (
-                            ast.unparse(param.annotation)
-                            if param.annotation is not None
-                            else evidence_text("PY01_unannotated")
+                param = index.parameters.get(root.id)
+                if param is not None:
+                    annotation = (
+                        unparse(param.annotation)
+                        if param.annotation is not None
+                        else evidence_text("PY01_unannotated")
+                    )
+                    return [
+                        evidence_text(
+                            "PY01_parameter",
+                            name=param.arg,
+                            annotation=annotation,
+                            line=param.lineno,
                         )
-                        return [
-                            evidence_text(
-                                "PY01_parameter",
-                                name=param.arg,
-                                annotation=annotation,
-                                line=param.lineno,
-                            )
-                        ], param.annotation if receiver is root else None
-            if any(
-                root.id in binding_names(child)
-                for statement in body
-                for child in local_walk(statement)
-            ):
+                    ], param.annotation if receiver is root else None
+            if root.id in index.bindings:
                 break
         return [], None
 
     def reflection_evidence(self, receiver, cls, attr):
-        facts = [evidence_text("PY01_receiver", receiver=ast.unparse(receiver))]
+        facts = [evidence_text("PY01_receiver", receiver=unparse(receiver))]
         if isinstance(receiver, ast.Name) and receiver.id == "self" and cls is not None:
             facts.append(
                 evidence_text("PY01_enclosing_class", name=cls.name, line=cls.lineno)
@@ -648,7 +668,7 @@ class CandidateProbes(CandidateRecords):
         if cls is None:
             facts.append(evidence_text("PY01_unknown_class"))
         else:
-            bases = ", ".join(ast.unparse(base) for base in cls.bases) or evidence_text(
+            bases = ", ".join(unparse(base) for base in cls.bases) or evidence_text(
                 "PY01_implicit_base"
             )
             facts.append(
@@ -662,10 +682,11 @@ class CandidateProbes(CandidateRecords):
             )
         return "; ".join(facts)
 
-    def memo_guard(self, cls, attr):
+    def memo_guard(self, node, cls, attr):
         if cls is None:
             return False
-        test, guard = self.parents[-1], self.parents[-2]
+        test = self.index.parent(node)
+        guard = self.index.parent(test)
         if not (
             isinstance(guard, ast.If)
             and absent_self_attribute(test) == attr
@@ -679,6 +700,18 @@ class CandidateProbes(CandidateRecords):
             for _, value in guarded_self_writes(guard)
         )
 
+    def iteration_contexts(self, node):
+        contexts = []
+        descendants = {node}
+        for parent in self.index.ancestors(node):
+            if isinstance(parent, SCOPE_TYPES):
+                break
+            repeated, headers = iteration_parts(parent)
+            if any(part in descendants for part in repeated):
+                contexts.append((parent, headers))
+            descendants.add(parent)
+        return list(reversed(contexts))
+
     def visit_Call(self, node):
         self.roundtrip(node)
         if (
@@ -688,17 +721,21 @@ class CandidateProbes(CandidateRecords):
         ):
             self.lock_candidate(
                 node,
-                evidence_text("PY09_lock_io_fact", callable=ast.unparse(node.func)),
+                evidence_text("PY09_lock_io_fact", callable=unparse(node.func)),
                 "PY09_lock_io",
             )
-        contexts = self.iterations.get(node, [])
-        if contexts and name_path(node.func) in PY08_COPY_CALLS:
+        contexts = (
+            self.iteration_contexts(node)
+            if name_path(node.func) in PY08_COPY_CALLS
+            else ()
+        )
+        if contexts:
             self.add(
                 "PY08_roundtrip_and_copy",
                 node,
                 evidence_text(
                     "PY08_iteration_copy",
-                    callable=ast.unparse(node.func),
+                    callable=unparse(node.func),
                     line=node.lineno,
                     iterations=", ".join(
                         evidence_text(
@@ -726,12 +763,12 @@ class CandidateProbes(CandidateRecords):
             cls = next(
                 (
                     parent
-                    for parent in reversed(self.parents)
+                    for parent in self.index.ancestors(node)
                     if isinstance(parent, ast.ClassDef)
                 ),
                 None,
             )
-            if self.memo_guard(cls, attr):
+            if self.memo_guard(node, cls, attr):
                 self.generic_visit(node)
                 return
             self.add(
@@ -752,21 +789,24 @@ class CandidateProbes(CandidateRecords):
             "ValueError",
             "LookupError",
         }
-        hooks = [
-            child
-            for statement in node.body
-            for child in local_walk(statement)
-            if isinstance(child, ast.Call)
-            and isinstance(child.func, ast.Attribute)
-            and child.func.attr == "loads"
-            and isinstance(child.func.value, ast.Name)
-            and child.func.value.id == "json"
-            and any(keyword.arg == "object_pairs_hook" for keyword in child.keywords)
-        ]
+        hooks = (
+            [
+                child
+                for statement in node.body
+                for child in local_walk(statement)
+                if child in self.index.json_hooks
+            ]
+            if self.index.json_hooks
+            else []
+        )
+        parent = self.index.parent(node)
+        parents = (self.index.parent(parent), parent)
         for handler in node.handlers:
             caught = handler.type
             names = terminal_names(caught)
             broad = caught is None or bool(names & {"Exception", "BaseException"})
+            if not broad and len(names & internal) < 2 and not hooks:
+                continue
             outcomes = exits(handler.body)
             facts = []
             if (
@@ -775,9 +815,9 @@ class CandidateProbes(CandidateRecords):
                 and not (
                     not exits(node.finalbody) & {"return", "break", "continue"}
                     and (
-                        saved_retry(node, handler, self.parents)
-                        or bounded_retry(node, handler, self.parents[-1])
-                        or stored_primary_cleanup(node, handler, self.parents)
+                        saved_retry(node, handler, parents)
+                        or bounded_retry(node, handler, parent)
+                        or stored_primary_cleanup(node, handler, parents)
                     )
                 )
             ):
@@ -802,7 +842,7 @@ class CandidateProbes(CandidateRecords):
                 )
             if facts:
                 label = (
-                    ast.unparse(caught)
+                    unparse(caught)
                     if caught is not None
                     else evidence_text("PY02_bare_except")
                 )

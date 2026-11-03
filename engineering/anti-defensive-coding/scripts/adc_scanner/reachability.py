@@ -10,14 +10,19 @@ import re
 
 from .ast_helpers import (
     CLASS_DEFINITION,
+    MODULE_SCOPE,
     CandidateRecords,
-    binding_names,
+    ReferenceCounts,
+    allocation_batch,
     context_tokens,
-    local_walk,
     parameter_defaults,
     parameters,
     parse_source,
+    scope_index,
     terminal_name,
+    tree_index,
+    unparse,
+    walk,
 )
 from .probes_prod import CandidateProbes
 from .registry import (
@@ -183,11 +188,11 @@ class CallSite:
 
 
 def call_sites(tree, lines, path, file_role):
-    for node in ast.walk(tree):
+    for node in walk(tree):
         if isinstance(node, ast.Call) and intersects(node, lines):
             name = terminal_name(node.func)
             if target_name(name):
-                yield CallSite(name, file_role, ast.unparse(node), path, node.lineno)
+                yield CallSite(name, file_role, unparse(node), path, node.lineno)
 
 
 def lost_calls(deleted, added):
@@ -217,10 +222,13 @@ def lost_call_clause(sites, changed):
 
 
 def framework_hook(node):
-    return any(
-        context_tokens(decorator) & PY10C_FRAMEWORK_DECORATORS
-        for decorator in node.decorator_list
-    )
+    cache = vars(node)
+    if "_adc_framework_hook" not in cache:
+        cache["_adc_framework_hook"] = any(
+            context_tokens(decorator) & PY10C_FRAMEWORK_DECORATORS
+            for decorator in node.decorator_list
+        )
+    return cache["_adc_framework_hook"]
 
 
 @dataclass
@@ -229,143 +237,78 @@ class ImportedAlias:
     ambiguous: bool
 
 
-@dataclass
-class ReferenceCounts:
-    calls: list[ast.Call] = field(default_factory=list)
-    non_calls: int = 0
-
-
-class CrossReferences(ast.NodeVisitor):
+class CrossReferences:
     def __init__(self, tree, targets):
+        index = tree_index(tree)
         self.targets = targets
-        self.symbols = []
-        self.enclosing_functions = []
-        self.methods = {}
-        self.aliases = {}
-        self.definitions = []
-        self.references = {name: ReferenceCounts() for name in targets}
-        self.recursive_calls = {}
-        self.delegations = set()
-        self.call_funcs = {
-            node.func: node for node in ast.walk(tree) if isinstance(node, ast.Call)
-        }
-        self.visit_scope(tree)
-
-    def visit_scope(self, node):
-        previous = self.aliases
-        self.aliases = previous.copy()
-        local = [child for statement in node.body for child in local_walk(statement)]
-        bindings = {}
-        for child in local:
-            for name in binding_names(child):
-                bindings.setdefault(name, set()).add(child)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for param in parameters(node):
-                bindings.setdefault(param.arg, set()).add(param)
-        for name in bindings:
-            self.aliases.pop(name, None)
-        imports = {}
-        for child in local:
-            if isinstance(child, ast.ImportFrom):
-                for alias in child.names:
-                    if alias.name in self.targets:
+        self.methods = index.methods
+        self.definitions = [
+            (node, symbol) for node, symbol in index.definitions if node.name in targets
+        ]
+        self.references = {}
+        self.recursive_calls = index.recursive_calls
+        self.delegations = index.delegations
+        self.call_funcs = index.call_funcs
+        self.include(index.attribute_references, targets)
+        has_aliases = any(
+            alias.name in targets
+            for imports in index.scope_imports.values()
+            for statement in imports
+            for alias in statement.names
+        )
+        if not has_aliases:
+            self.include(index.name_references, targets)
+            return
+        self.include(index.name_references, targets - index.name_uses.keys())
+        environments = {}
+        for scope in index.scopes:
+            aliases = (
+                {}
+                if scope is MODULE_SCOPE
+                else environments[index.scope_parents[scope]].copy()
+            )
+            bindings = index.scope_bindings[scope].copy()
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for param in parameters(scope):
+                    bindings[param.arg] = bindings.get(param.arg, 0) + 1
+            for name in bindings:
+                aliases.pop(name, None)
+            imports = {}
+            for statement in index.scope_imports.get(scope, ()):
+                for alias in statement.names:
+                    if alias.name in targets:
                         imports.setdefault(alias.asname or alias.name, set()).add(
                             alias.name
                         )
-        for name, targets in imports.items():
-            self.aliases[name] = ImportedAlias(targets, len(bindings[name]) > 1)
-        for statement in node.body:
-            self.visit(statement)
-        self.aliases = previous
+            for name, imported in imports.items():
+                aliases[name] = ImportedAlias(imported, bindings[name] > 1)
+            environments[scope] = aliases
+        for name, uses in index.name_uses.items():
+            for node, scope in uses:
+                alias = environments[scope].get(name)
+                if alias is None:
+                    self.reference(node, name, False)
+                else:
+                    for target in alias.targets:
+                        self.reference(node, target, alias.ambiguous)
 
-    def visit_FunctionDef(self, node):
-        for decorator in node.decorator_list:
-            self.visit(decorator)
-        self.visit(node.args)
-        if node.returns:
-            self.visit(node.returns)
-        self.symbols.append(node.name)
-        if node.name in self.targets:
-            self.definitions.append((node, ".".join(self.symbols)))
-        self.enclosing_functions.append(node)
-        self.visit_scope(node)
-        self.enclosing_functions.pop()
-        self.symbols.pop()
+    def include(self, facts, names):
+        for name in names & facts.keys():
+            if name not in self.references:
+                self.references[name] = ReferenceCounts()
+            refs = self.references[name]
+            refs.calls.extend(facts[name].calls)
+            refs.non_calls += facts[name].non_calls
 
-    visit_AsyncFunctionDef = visit_FunctionDef
-
-    def visit_ClassDef(self, node):
-        for expr in (*node.decorator_list, *node.bases, *node.keywords):
-            self.visit(expr)
-        self.methods.update(
-            (child, node)
-            for child in node.body
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
-        )
-        self.symbols.append(node.name)
-        self.visit_scope(node)
-        self.symbols.pop()
-
-    def enclosing(self, name):
-        return next(
-            (
-                function
-                for function in reversed(self.enclosing_functions)
-                if function.name == name
-            ),
-            None,
-        )
-
-    def record_recursion(self, node, owner):
-        # Self-recursion never counts as a reachability reference. A call that
-        # reaches `owner` itself (a bare name outside a class body, `self.`/`cls.`
-        # on a method) still binds its parameters for `constant_defaults`.
-        if node in self.call_funcs and isinstance(node, ast.Attribute) == (
-            owner in self.methods
-        ):
-            self.recursive_calls.setdefault(owner, []).append(self.call_funcs[node])
-
-    def reference(self, node, name, *, ambiguous=False):
+    def reference(self, node, name, ambiguous):
         if name in self.targets:
+            if name not in self.references:
+                self.references[name] = ReferenceCounts()
             refs = self.references[name]
             if node in self.call_funcs and not ambiguous:
                 refs.calls.append(self.call_funcs[node])
             else:
                 refs.non_calls += 1
-
-    def visit_Name(self, node):
-        if isinstance(node.ctx, ast.Load):
-            owner = self.enclosing(node.id)
-            if owner is not None:
-                self.record_recursion(node, owner)
-            elif node.id in self.aliases:
-                alias = self.aliases[node.id]
-                for name in alias.targets:
-                    self.reference(node, name, ambiguous=alias.ambiguous)
-            else:
-                self.reference(node, node.id)
-
-    def visit_Attribute(self, node):
-        owner = self.enclosing(node.attr)
-        receiver = node.value
-        if (
-            owner is not None
-            and isinstance(receiver, ast.Name)
-            and receiver.id in {"self", "cls"}
-        ):
-            self.record_recursion(node, owner)
-        else:
-            if (
-                owner is not None
-                and node in self.call_funcs
-                and isinstance(receiver, ast.Call)
-                and isinstance(receiver.func, ast.Name)
-                and receiver.func.id == "super"
-            ):
-                # A `super()` delegation reaches a base definition, never `owner`.
-                self.delegations.add(self.call_funcs[node])
-            self.reference(node, node.attr)
-        self.generic_visit(node)
 
 
 def effective_arguments(node, call, forwarded):
@@ -425,15 +368,12 @@ def effective_arguments(node, call, forwarded):
 
 def constant_defaults(definition, calls, change_tag, clauses):
     path, source, node, symbol, recursive_calls = definition
+    if not node.args.defaults and not any(node.args.kw_defaults):
+        return []
     if framework_hook(node):
         return []
     defaults = parameter_defaults(node)
-    rebound = {
-        name
-        for statement in node.body
-        for child in local_walk(statement)
-        for name in binding_names(child)
-    }
+    rebound = scope_index(node).bindings
     forwarded = defaults.keys() - rebound
     bound = [
         *(effective_arguments(node, call, ()) for call in calls),
@@ -494,28 +434,10 @@ class ModuleScope:
 
 
 def module_scope(tree):
-    scope = ModuleScope()
-    for statement in local_walk(tree):
-        if not isinstance(statement, ast.stmt):
-            continue
-        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            scope.definitions.setdefault(statement.name, []).append(statement)
-        elif isinstance(statement, ast.ImportFrom):
-            for alias in statement.names:
-                if alias.name != "*":
-                    scope.imports.setdefault(alias.asname or alias.name, []).append(
-                        (statement, alias.name)
-                    )
-        parts = list(local_walk(statement))
-        if any(
-            isinstance(child, ast.Name) and child.id == "__all__" for child in parts
-        ):
-            scope.exports.update(
-                child.value
-                for child in parts
-                if isinstance(child, ast.Constant) and isinstance(child.value, str)
-            )
-    return scope
+    index = tree_index(tree)
+    return ModuleScope(
+        index.module_exports, index.module_definitions, index.module_imports
+    )
 
 
 def import_origin(path, statement, paths):
@@ -571,13 +493,33 @@ def external_base_clause(enclosing_class, classes):
     if enclosing_class is None:
         return ""
     bases = [
-        ast.unparse(base)
+        unparse(base)
         for base in enclosing_class.bases
         if terminal_name(base) != "object" and terminal_name(base) not in classes
     ]
     return evidence_text("PY10c_external_base", bases=", ".join(bases)) if bases else ""
 
 
+WORDS = re.compile(r"\w+")
+
+
+class TargetWords:
+    def __init__(self, targets):
+        self.words = frozenset(name for name in targets if WORDS.fullmatch(name))
+        other = sorted(targets - self.words)
+        self.other = (
+            re.compile(r"\b(?:" + "|".join(map(re.escape, other)) + r")\b")
+            if other
+            else None
+        )
+
+    def search(self, source):
+        return any(match[0] in self.words for match in WORDS.finditer(source)) or (
+            self.other is not None and self.other.search(source) is not None
+        )
+
+
+@allocation_batch()
 def cross_reachability(root, tip, args, selected, lost, active_trees, errors):
     """`selected` maps changed (path, line) definitions to names; `lost` maps
     net-lost call names to their base sites."""
@@ -586,11 +528,7 @@ def cross_reachability(root, tip, args, selected, lost, active_trees, errors):
         return [], 0
     # Re-exporting modules (`from .core import Client; __all__ = [...]`) may not
     # mention a target name, so `__all__` admits them to the parsed set.
-    pattern = re.compile(
-        r"\b(?:"
-        + "|".join(re.escape(name) for name in ["__all__", *sorted(targets)])
-        + r")\b"
-    )
+    pattern = TargetWords({"__all__", *targets})
     definitions = {name: [] for name in targets}
     counts = {
         name: {"prod": ReferenceCounts(), "test": ReferenceCounts()} for name in targets
@@ -614,10 +552,10 @@ def cross_reachability(root, tip, args, selected, lost, active_trees, errors):
         source, tree = parsed
         file_role = role(Path(path), args.test_glob)
         refs = CrossReferences(tree, targets)
-        for name in targets:
+        for name, references in refs.references.items():
             total = counts[name][file_role]
-            total.calls.extend(refs.references[name].calls)
-            total.non_calls += refs.references[name].non_calls
+            total.calls.extend(references.calls)
+            total.non_calls += references.non_calls
         delegations.update(refs.delegations)
         if file_role == "prod":
             scopes[path] = module_scope(tree)

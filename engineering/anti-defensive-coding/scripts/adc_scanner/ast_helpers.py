@@ -2,15 +2,231 @@
 
 import ast
 import builtins
+from collections import deque
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from functools import cached_property, lru_cache
+import gc
 import io
 from itertools import pairwise
 import re
 import tokenize
+import weakref
 
 from .registry import PY09_IO_CALLS, PY09_LOCK_TOKENS, evidence_text
 
 
 CLASS_DEFINITION = re.compile(rb"^[ \t]*class[ \t]+(\w+)", re.MULTILINE)
+SCOPE_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+PREFIX_BOUNDARY_TYPES = (
+    ast.If,
+    ast.For,
+    ast.AsyncFor,
+    ast.While,
+    ast.Try,
+    ast.TryStar,
+    ast.With,
+    ast.AsyncWith,
+    ast.Match,
+    ast.Return,
+    ast.Raise,
+)
+LEAF_TYPES = frozenset(
+    {
+        ast.Name,
+        ast.Constant,
+        ast.alias,
+        ast.Global,
+        ast.Nonlocal,
+        ast.Pass,
+        ast.Break,
+        ast.Continue,
+    }
+)
+BINDING_TYPES = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.ExceptHandler,
+    ast.MatchAs,
+    ast.MatchStar,
+)
+MODULE_SCOPE = object()
+PROBE_TYPES = frozenset(
+    {
+        ast.Compare,
+        ast.BoolOp,
+        ast.ClassDef,
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.ListComp,
+        ast.Call,
+        ast.With,
+        ast.AsyncWith,
+        ast.Try,
+        ast.TryStar,
+    }
+)
+STATE_TYPES = frozenset({ast.Assign, ast.AnnAssign, ast.Dict, ast.Try, ast.TryStar})
+
+
+@contextmanager
+def allocation_batch():
+    """Retained ASTs are acyclic; collect young temporaries once per scan batch."""
+    enabled = gc.isenabled()
+    if enabled:
+        gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.collect(0)
+            gc.enable()
+
+
+def ast_field_parts():
+    ignored = {
+        "ctx",
+        "op",
+        "ops",
+        "id",
+        "attr",
+        "name",
+        "arg",
+        "asname",
+        "module",
+        "level",
+        "is_async",
+        "simple",
+        "conversion",
+        "kind",
+        "type_comment",
+        "rest",
+        "kwd_attrs",
+        "type_ignores",
+        "str",
+    }
+    lists = {
+        "body",
+        "orelse",
+        "finalbody",
+        "handlers",
+        "decorator_list",
+        "bases",
+        "keywords",
+        "targets",
+        "items",
+        "cases",
+        "values",
+        "elts",
+        "generators",
+        "comparators",
+        "args",
+        "posonlyargs",
+        "kwonlyargs",
+        "defaults",
+        "names",
+        "ifs",
+        "patterns",
+        "kwd_patterns",
+        "keys",
+        "kw_defaults",
+        "type_params",
+        "argtypes",
+    }
+    parts = {}
+    pending = [ast.AST]
+    while pending:
+        cls = pending.pop()
+        pending.extend(cls.__subclasses__())
+        fields = []
+        if cls not in LEAF_TYPES and cls is not ast.MatchSingleton:
+            for name in cls._fields:
+                if name in ignored and not (
+                    name == "name" and cls.__name__ == "TypeAlias"
+                ):
+                    continue
+                scalar = (name == "args" and cls in SCOPE_TYPES) or (
+                    name in {"body", "orelse"} and cls in {ast.IfExp, ast.Lambda}
+                )
+                mode = (
+                    "scalar"
+                    if scalar or name not in lists
+                    else "nullable"
+                    if (cls is ast.Dict and name == "keys")
+                    or (cls is ast.arguments and name == "kw_defaults")
+                    else "body"
+                    if name in {"body", "orelse", "finalbody"}
+                    else "list"
+                )
+                fields.append((name, mode))
+        parts[cls] = tuple(fields)
+    return parts
+
+
+TYPE_PARTS = ast_field_parts()
+
+
+def unparse(node):
+    """Cache formatting on immutable parsed nodes for the lifetime of their tree."""
+    cache = vars(node)
+    if "_adc_unparse" not in cache:
+        cache["_adc_unparse"] = ast.unparse(node)
+    return cache["_adc_unparse"]
+
+
+def node_parts(node):
+    """Use the AST schema without allocating permanent per-node child caches."""
+    children, bodies = [], []
+    fields = vars(node)
+    for name, mode in TYPE_PARTS[type(node)]:
+        value = fields.get(name)
+        if mode == "scalar":
+            if value is not None:
+                children.append(value)
+        elif mode == "nullable":
+            children.extend(child for child in value if child is not None)
+        else:
+            children.extend(value)
+            if mode == "body" and value:
+                bodies.append(value)
+    return children, bodies
+
+
+def walk(node):
+    pending = deque([node])
+    while pending:
+        current = pending.popleft()
+        yield current
+        pending.extend(node_parts(current)[0])
+
+
+class IndexedVisitor(ast.NodeVisitor):
+    def __init__(self):
+        self.visitors = {}
+
+    def visit(self, node):
+        kind = type(node)
+        if kind not in self.visitors:
+            self.visitors[kind] = getattr(
+                type(self), "visit_" + kind.__name__, type(self).generic_visit
+            )
+        return self.visitors[kind](self, node)
+
+    def generic_visit(self, node):
+        fields = vars(node)
+        for name, mode in TYPE_PARTS[type(node)]:
+            value = fields.get(name)
+            if mode == "scalar":
+                if value is not None:
+                    self.visit(value)
+            elif mode == "nullable":
+                for child in value:
+                    if child is not None:
+                        self.visit(child)
+            else:
+                for child in value:
+                    self.visit(child)
 
 
 def assignments(node):
@@ -51,27 +267,35 @@ def absent_self_attribute(test):
 
 def guarded_self_writes(node):
     if not isinstance(node, ast.If):
-        return
+        return ()
+    cache = vars(node)
+    if "_adc_guarded_writes" in cache:
+        return cache["_adc_guarded_writes"]
     attr = absent_self_attribute(node.test)
-    if attr is None:
-        return
-    for statement in node.body:
-        for write in local_walk(statement):
-            if (
-                not isinstance(write, (ast.Assign, ast.AnnAssign))
-                or write.value is None
-            ):
-                continue
-            for target in write_targets(write):
-                for attribute in bound_targets(target):
-                    if self_attribute(attribute) and attribute.attr == attr:
-                        yield attribute, write.value
+    writes = []
+    if attr is not None:
+        for statement in node.body:
+            for write in local_walk(statement):
+                if (
+                    not isinstance(write, (ast.Assign, ast.AnnAssign))
+                    or write.value is None
+                ):
+                    continue
+                for target in write_targets(write):
+                    writes.extend(
+                        (attribute, write.value)
+                        for attribute in bound_targets(target)
+                        if self_attribute(attribute) and attribute.attr == attr
+                    )
+    cache["_adc_guarded_writes"] = writes
+    return writes
 
 
 def class_declarations(classes):
     attributes = {}
     for cls in classes:
-        for statement in lexical_nodes(cls.body):
+        nodes = lexical_nodes(cls.body)
+        for statement in nodes:
             if isinstance(statement, (ast.Assign, ast.AnnAssign)):
                 targets = (
                     [statement.target]
@@ -86,14 +310,14 @@ def class_declarations(classes):
                             )
         methods = [
             method
-            for method in lexical_nodes(cls.body)
+            for method in nodes
             if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
         helpers = {
             node.func.attr
             for initializer in methods
             if initializer.name == "__init__"
-            for node in lexical_nodes(initializer.body)
+            for node in scope_index(initializer).nodes
             if isinstance(node, ast.Call) and self_attribute(node.func)
         }
         for method in methods:
@@ -102,11 +326,11 @@ def class_declarations(classes):
             # Lazy presence-guarded writes do not establish a construction invariant.
             lazy_targets = {
                 attribute
-                for node in lexical_nodes(method.body)
+                for node in scope_index(method).nodes
                 for attribute, _ in guarded_self_writes(node)
             }
-            for statement in method.body:
-                for target in assignments(statement):
+            for statement in scope_index(method).assignments:
+                for target in write_targets(statement):
                     for attribute in bound_targets(target):
                         if self_attribute(attribute) and attribute not in lazy_targets:
                             attributes.setdefault((cls, attribute.attr), set()).add(
@@ -159,25 +383,342 @@ def zero_arg_constructor(node, classes):
 
 
 def local_walk(node):
-    yield node
-    if not isinstance(
-        node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
-    ):
-        for child in ast.iter_child_nodes(node):
-            yield from local_walk(child)
+    pending = [node]
+    while pending:
+        current = pending.pop()
+        yield current
+        if not isinstance(current, SCOPE_TYPES):
+            pending.extend(reversed(node_parts(current)[0]))
 
 
 def lexical_nodes(body):
     """Located statement and expression nodes under body, in source order."""
+    nodes = (child for statement in body for child in local_walk(statement))
     return sorted(
-        (
-            child
-            for statement in body
-            for child in local_walk(statement)
-            if isinstance(child, (ast.stmt, ast.expr))
-        ),
+        (child for child in nodes if isinstance(child, (ast.stmt, ast.expr))),
         key=lambda child: (child.lineno, child.col_offset),
     )
+
+
+class ScopeIndex:
+    """Scope-local traversal, source-ordered writes, and binding ownership."""
+
+    def __init__(self, scope):
+        self.body = [] if isinstance(scope, ast.Lambda) else scope.body
+        self.args = (
+            scope.args
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+            else None
+        )
+        cache = vars(scope)
+        if "_adc_bindings" in cache:
+            self.bindings = cache["_adc_bindings"]
+
+    @cached_property
+    def nodes(self):
+        return [child for statement in self.body for child in local_walk(statement)]
+
+    @cached_property
+    def bindings(self):
+        bindings = {}
+        for child in self.nodes:
+            for name in binding_names(child):
+                bindings[name] = bindings.get(name, 0) + 1
+        return bindings
+
+    @cached_property
+    def assignments(self):
+        return [
+            child
+            for child in self.nodes
+            if isinstance(child, (ast.Assign, ast.AnnAssign))
+        ]
+
+    @cached_property
+    def parameters(self):
+        if self.args is None:
+            return {}
+        return {
+            param.arg: param
+            for param in (
+                *self.args.posonlyargs,
+                *self.args.args,
+                *self.args.kwonlyargs,
+                self.args.vararg,
+                self.args.kwarg,
+            )
+            if param is not None
+        }
+
+    @cached_property
+    def lexical(self):
+        return sorted(
+            (child for child in self.nodes if isinstance(child, (ast.stmt, ast.expr))),
+            key=lambda child: (child.lineno, child.col_offset),
+        )
+
+    @cached_property
+    def writes(self):
+        writes = {}
+        for statement in self.lexical:
+            targets = (
+                [statement.target]
+                if isinstance(statement, ast.AnnAssign)
+                else write_targets(statement)
+            )
+            names = {
+                name.id
+                for target in targets
+                for name in bound_targets(target)
+                if isinstance(name, ast.Name)
+            }
+            for name in names:
+                writes.setdefault(name, []).append(statement)
+        return writes
+
+    @cached_property
+    def locals(self):
+        return scope_bindings(self.parameters, self.nodes)
+
+    @cached_property
+    def reads(self):
+        reads = {}
+        for child in self.nodes:
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                reads.setdefault(child.id, []).append(child)
+            elif isinstance(child, SCOPE_TYPES):
+                for loaded in load_names(child):
+                    reads.setdefault(loaded.id, []).append(loaded)
+        return reads
+
+
+def scope_index(node):
+    cache = vars(node)
+    if "_adc_scope_index" not in cache:
+        cache["_adc_scope_index"] = ScopeIndex(node)
+    return cache["_adc_scope_index"]
+
+
+@dataclass
+class ReferenceCounts:
+    calls: list[ast.Call] = field(default_factory=list)
+    non_calls: int = 0
+
+
+class TreeIndex:
+    """One acyclic index shared by local probes and snapshot reachability."""
+
+    def __init__(self, tree):
+        self.root = weakref.ref(tree)
+        self.parents = {}
+        self.by_type = {}
+        self.probe_children = {}
+        self.following = {}
+        self.owners = {}
+        self.local_nodes = {}
+        self.discards = {}
+        self.json_hooks = set()
+        self.call_funcs = {}
+        self.scopes = [MODULE_SCOPE]
+        self.scope_parents = {}
+        self.scope_bindings = {MODULE_SCOPE: {}}
+        self.scope_imports = {}
+        self.methods = {}
+        self.definitions = []
+        self.function_parents = {}
+        self.recursive_calls = {}
+        self.delegations = set()
+        self.name_references = {}
+        self.attribute_references = {}
+        self.name_uses = {}
+        self.module_definitions = {}
+        self.module_imports = {}
+        self.module_exports = set()
+        export_groups = {}
+        alias_names = set()
+        context = (MODULE_SCOPE, None, ())
+        pending = [(tree, MODULE_SCOPE, None, MODULE_SCOPE, context, None)]
+        while pending:
+            node, parent, local, owner, context, top = pending.pop()
+            kind = type(node)
+            is_module = isinstance(node, ast.Module)
+            if not is_module:
+                self.parents[node] = parent
+                if kind not in LEAF_TYPES:
+                    self.by_type.setdefault(kind, []).append(node)
+            if kind in STATE_TYPES:
+                self.local_nodes.setdefault(local, []).append(node)
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(
+                node.value, ast.Name
+            ):
+                assignment = simple_assignment(node)
+                if assignment is not None and assignment[0] == "_":
+                    self.discards.setdefault(local, []).append(node)
+            if local is not None:
+                bindings = self.scope_bindings[local]
+                for name in binding_names(node):
+                    bindings[name] = bindings.get(name, 0) + 1
+                if isinstance(node, ast.ImportFrom):
+                    self.scope_imports.setdefault(local, []).append(node)
+                    alias_names.update(
+                        alias.asname or alias.name for alias in node.names
+                    )
+            if local is MODULE_SCOPE:
+                if isinstance(
+                    node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    self.module_definitions.setdefault(node.name, []).append(node)
+                elif isinstance(node, ast.ImportFrom):
+                    for alias in node.names:
+                        if alias.name != "*":
+                            self.module_imports.setdefault(
+                                alias.asname or alias.name, []
+                            ).append((node, alias.name))
+                if isinstance(node, ast.Name) and node.id == "__all__":
+                    export_groups.setdefault(top, [False, set()])[0] = True
+                elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    export_groups.setdefault(top, [False, set()])[1].add(node.value)
+            if isinstance(node, ast.Call):
+                self.call_funcs[node.func] = node
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "loads"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "json"
+                    and any(
+                        keyword.arg == "object_pairs_hook" for keyword in node.keywords
+                    )
+                ):
+                    self.json_hooks.add(node)
+            if context is not None and (
+                isinstance(node, ast.Attribute)
+                or (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load))
+            ):
+                self.record_reference(node, context)
+            children, bodies = node_parts(node)
+            for body in bodies:
+                self.following.update(pairwise(body))
+            if not is_module and (kind in PROBE_TYPES or bodies):
+                self.owners[node] = local
+                self.probe_children.setdefault(owner, []).append(node)
+                owner = node
+            if is_module:
+                pending.extend(
+                    (child, MODULE_SCOPE, MODULE_SCOPE, owner, context, child)
+                    for child in reversed(children)
+                )
+            elif isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                scope, enclosing, symbols = context
+                symbols = (*symbols, node.name)
+                self.scopes.append(node)
+                self.scope_parents[node] = scope
+                self.scope_bindings[node] = {}
+                if isinstance(node, ast.ClassDef):
+                    self.methods.update(
+                        (method, node)
+                        for method in node.body
+                        if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    )
+                else:
+                    self.definitions.append((node, ".".join(symbols)))
+                    self.function_parents[node] = enclosing
+                    enclosing = node
+                nested = (node, enclosing, symbols)
+                body = set(node.body)
+                # CrossReferences historically skips PEP 695 type-parameter fields.
+                type_params = set(vars(node).get("type_params", ()))
+                pending.extend(
+                    (
+                        child,
+                        node,
+                        node if child in body else None,
+                        owner,
+                        nested
+                        if child in body
+                        else None
+                        if child in type_params
+                        else context,
+                        None,
+                    )
+                    for child in reversed(children)
+                )
+            else:
+                if isinstance(node, ast.Lambda):
+                    local, top = None, None
+                pending.extend(
+                    (child, node, local, owner, context, top)
+                    for child in reversed(children)
+                )
+        self.name_uses = {
+            name: uses for name, uses in self.name_uses.items() if name in alias_names
+        }
+        for exported, strings in export_groups.values():
+            if exported:
+                self.module_exports.update(strings)
+        for scope, bindings in self.scope_bindings.items():
+            cache = vars(tree if scope is MODULE_SCOPE else scope)
+            cache["_adc_bindings"] = bindings
+
+    def parent(self, node):
+        if isinstance(node, ast.Module):
+            return None
+        parent = self.parents[node]
+        return self.root() if parent is MODULE_SCOPE else parent
+
+    def ancestors(self, node):
+        parent = self.parent(node)
+        while parent is not None:
+            yield parent
+            parent = self.parent(parent)
+
+    def record_reference(self, node, context):
+        is_name = isinstance(node, ast.Name)
+        name = node.id if is_name else node.attr
+        owner = context[1]
+        while owner is not None and owner.name != name:
+            owner = self.function_parents[owner]
+        call = self.call_funcs.get(node)
+        receiver = None if is_name else node.value
+        recursive = owner is not None and (
+            is_name
+            or (isinstance(receiver, ast.Name) and receiver.id in {"self", "cls"})
+        )
+        if recursive:
+            if call is not None and (not is_name) == (owner in self.methods):
+                self.recursive_calls.setdefault(owner, []).append(call)
+            return
+        if (
+            owner is not None
+            and call is not None
+            and isinstance(receiver, ast.Call)
+            and isinstance(receiver.func, ast.Name)
+            and receiver.func.id == "super"
+        ):
+            self.delegations.add(call)
+        references = self.name_references if is_name else self.attribute_references
+        if name not in references:
+            references[name] = ReferenceCounts()
+        refs = references[name]
+        if call is None:
+            refs.non_calls += 1
+        else:
+            refs.calls.append(call)
+        if is_name:
+            self.name_uses.setdefault(name, []).append((node, context[0]))
+
+
+def tree_index(tree):
+    cache = vars(tree)
+    if "_adc_tree_index" not in cache:
+        cache["_adc_tree_index"] = TreeIndex(tree)
+    return cache["_adc_tree_index"]
+
+
+@lru_cache(maxsize=16)
+def source_lines(source):
+    return [*source.encode().splitlines(keepends=True), b""]
 
 
 def terminal_name(node):
@@ -482,7 +1023,7 @@ def last_noreturn_call(body, helpers):
         and isinstance(call.func.value, ast.Name)
         and call.func.value.id in {"self", "cls"}
     ):
-        return ast.unparse(call.func)
+        return unparse(call.func)
     return None
 
 
@@ -501,7 +1042,7 @@ def parameters(node):
 def load_names(node):
     return [
         child
-        for child in ast.walk(node)
+        for child in walk(node)
         if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
     ]
 
@@ -518,46 +1059,21 @@ def parameter_defaults(node):
 
 
 def prefix_boundary(node):
-    return isinstance(
-        node,
-        (
-            ast.If,
-            ast.For,
-            ast.AsyncFor,
-            ast.While,
-            ast.Try,
-            ast.TryStar,
-            ast.With,
-            ast.AsyncWith,
-            ast.Match,
-            ast.Return,
-            ast.Raise,
-        ),
-    ) or any(
+    return isinstance(node, PREFIX_BOUNDARY_TYPES) or any(
         isinstance(child, (ast.Yield, ast.YieldFrom)) for child in local_walk(node)
     )
 
 
 def binding_names(node):
     if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-        return {node.id}
-    if isinstance(
-        node,
-        (
-            ast.FunctionDef,
-            ast.AsyncFunctionDef,
-            ast.ClassDef,
-            ast.ExceptHandler,
-            ast.MatchAs,
-            ast.MatchStar,
-        ),
-    ):
-        return {node.name} if node.name is not None else set()
+        return (node.id,)
+    if isinstance(node, BINDING_TYPES):
+        return (node.name,) if node.name is not None else ()
     if isinstance(node, ast.MatchMapping):
-        return {node.rest} if node.rest is not None else set()
+        return (node.rest,) if node.rest is not None else ()
     if isinstance(node, ast.alias):
-        return {node.asname or node.name.split(".")[0]}
-    return set()
+        return (node.asname or node.name.split(".")[0],)
+    return ()
 
 
 def import_bindings(nodes):
@@ -599,11 +1115,11 @@ def row_factory_facts(function):
     return [
         evidence_text(
             "PY08_row_factory",
-            target=ast.unparse(target),
-            value=ast.unparse(node.value),
+            target=unparse(target),
+            value=unparse(node.value),
             line=node.lineno,
         )
-        for node in lexical_nodes(function.body)
+        for node in scope_index(function).lexical
         if isinstance(node, (ast.Assign, ast.AnnAssign))
         for target in write_targets(node)
         if isinstance(target, ast.Attribute) and target.attr == "row_factory"
@@ -632,28 +1148,14 @@ def self_attribute(node):
     )
 
 
-def adjacent_statements(nodes):
-    """Adjacent statement pairs of every statement list owned by same-scope nodes."""
-    for node in nodes:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            continue
-        for _, body in ast.iter_fields(node):
-            if (
-                isinstance(body, list)
-                and body
-                and all(isinstance(item, ast.stmt) for item in body)
-            ):
-                yield from pairwise(body)
-
-
-def scope_bindings(function, nodes):
+def scope_bindings(params, nodes):
     """Names local to function: parameters and stores among its same-scope nodes."""
     # Comprehension targets bind in the comprehension's own scope.
     comprehension_names = {
         name
         for node in nodes
         if isinstance(node, ast.comprehension)
-        for name in ast.walk(node.target)
+        for name in walk(node.target)
     }
     external = {
         name
@@ -661,65 +1163,64 @@ def scope_bindings(function, nodes):
         if isinstance(node, (ast.Global, ast.Nonlocal))
         for name in node.names
     }
-    return {
-        param.arg
-        for param in [*parameters(function), function.args.vararg, function.args.kwarg]
-        if param is not None
-    }.union(
-        *(binding_names(node) for node in nodes if node not in comprehension_names)
-    ) - external
+    return (
+        set(params).union(
+            *(binding_names(node) for node in nodes if node not in comprehension_names)
+        )
+        - external
+    )
 
 
-def same_class_stashes(tree):
+def same_class_stashes(classes, following_statements, local_nodes):
     """Map `self._a = n` directly followed by `return n` to sibling-method readers."""
     stashes = {}
-    for cls in ast.walk(tree):
-        if not isinstance(cls, ast.ClassDef):
-            continue
+    for cls in classes:
         methods = [
             node
             for node in cls.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
-        scopes = {
-            method: [
-                child for statement in method.body for child in local_walk(statement)
-            ]
-            for method in methods
-        }
-        loads = {}
-        for method, nodes in scopes.items():
-            for node in nodes:
-                if self_attribute(node) and isinstance(node.ctx, ast.Load):
-                    loads.setdefault(node.attr, []).append((method, node))
-        for method, nodes in scopes.items():
-            local = scope_bindings(method, nodes)
-            for statement, following in [
-                *pairwise(method.body),
-                *adjacent_statements(nodes),
-            ]:
+        writers = []
+        for method in methods:
+            for statement in local_nodes.get(method, ()):
+                following = following_statements.get(statement)
                 if not (
                     isinstance(statement, (ast.Assign, ast.AnnAssign))
                     and isinstance(statement.value, ast.Name)
-                    and statement.value.id in local
                     and isinstance(following, ast.Return)
                     and isinstance(following.value, ast.Name)
                     and following.value.id == statement.value.id
+                    and statement.value.id in scope_index(method).locals
                 ):
                     continue
-                for target in write_targets(statement):
-                    if not (self_attribute(target) and target.attr.startswith("_")):
-                        continue
-                    readers = sorted(
-                        (
-                            (other.name, load)
-                            for other, load in loads.get(target.attr, [])
-                            if other is not method
-                        ),
-                        key=lambda reader: (reader[1].lineno, reader[1].col_offset),
-                    )
-                    if readers:
-                        stashes[statement] = (target.attr, following, readers)
+                writers.extend(
+                    (method, statement, following, target.attr)
+                    for target in write_targets(statement)
+                    if self_attribute(target) and target.attr.startswith("_")
+                )
+        if not writers:
+            continue
+        attributes = {attr for _, _, _, attr in writers}
+        loads = {}
+        for method in methods:
+            for node in scope_index(method).nodes:
+                if (
+                    self_attribute(node)
+                    and node.attr in attributes
+                    and isinstance(node.ctx, ast.Load)
+                ):
+                    loads.setdefault(node.attr, []).append((method, node))
+        for method, statement, following, attr in writers:
+            readers = sorted(
+                (
+                    (other.name, load)
+                    for other, load in loads.get(attr, ())
+                    if other is not method
+                ),
+                key=lambda reader: (reader[1].lineno, reader[1].col_offset),
+            )
+            if readers:
+                stashes[statement] = (attr, following, readers)
     return stashes
 
 
@@ -802,13 +1303,33 @@ def lookup_signature(values):
     return tuple(keys) or None
 
 
-class CandidateRecords(ast.NodeVisitor):
+class CandidateRecords(IndexedVisitor):
     def __init__(self, source):
+        super().__init__()
         self.source = source
+        self.source_lines = source_lines(source)
         self.symbols = []
         self.candidates = []
         self.function_depth = 0
         self.defenses = []
+
+    def visit_Module(self, node):
+        with allocation_batch():
+            self.generic_visit(node)
+
+    def source_segment(self, node):
+        start, end = node.lineno - 1, node.end_lineno - 1
+        if start == end:
+            return self.source_lines[start][
+                node.col_offset : node.end_col_offset
+            ].decode()
+        return b"".join(
+            [
+                self.source_lines[start][node.col_offset :],
+                *self.source_lines[start + 1 : end],
+                self.source_lines[end][: node.end_col_offset],
+            ]
+        ).decode()
 
     def add(self, rule, node, evidence, verify, related=(), signature=None, scope=()):
         """`scope` line ranges make the candidate diff-eligible outside its `span`;
@@ -816,7 +1337,7 @@ class CandidateRecords(ast.NodeVisitor):
         Code stays lossless for bundle evidence until final output truncation."""
         nodes = (node, *related)
         spans = [(item.lineno, item.end_lineno) for item in nodes]
-        code = "; ".join(ast.get_source_segment(self.source, item) for item in nodes)
+        code = "; ".join(self.source_segment(item) for item in nodes)
         self.candidates.append(
             {
                 "rule": rule,
@@ -836,6 +1357,8 @@ class CandidateRecords(ast.NodeVisitor):
 
 
 def has_conflict(source):
+    if "<<<<<<< " not in source:
+        return False
     state = 0
     for line in source.splitlines():
         if state == 0 and line.startswith("<<<<<<< "):
@@ -847,6 +1370,7 @@ def has_conflict(source):
     return False
 
 
+@allocation_batch()
 def parse_source(raw, path, errors, *, base=False, pattern=None):
     try:
         encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
