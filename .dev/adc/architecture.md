@@ -2,26 +2,27 @@
 
 Target skill: `engineering/anti-defensive-coding/`
 Extractor entrypoint: `engineering/anti-defensive-coding/scripts/scan_python.py` (Python 3.11+ standard library only)
+Internal package: `engineering/anti-defensive-coding/scripts/adc_scanner/` (`rules.json`, `registry.py`, `scope.py`, `ast_helpers.py`, `probes_prod.py`, `probes_test.py`, `reachability.py`, `bundling.py`)
 
 ---
 
 ## 1. Pipeline Architecture
 
-`scan_python.py` is a stateless, 4-stage AST pipeline (`main` → `scan` → `render`):
+`scan_python.py` delegates to the acyclic `scripts/adc_scanner/` package across a stateless, 4-stage AST pipeline (`main` → `scan` → `render`):
 
-1. **Stage 1 — Scope & Inventory Resolution (`diff_scope` / `paths_scope`)**:
+1. **Stage 1 — Scope & Inventory Resolution (`adc_scanner/scope.py`: `diff_scope` / `paths_scope`)**:
    - Resolves the repository or common path root and produces a sorted list of `FileChange` records.
    - **Diff mode (`--base` [`--tip`] [`--merge-base`])**: Runs `git diff --name-status -z` and per-file `git diff --unified=0 --inter-hunk-context=0 --ignore-space-at-eol` to populate `added_lines` and `deleted_lines`. When `--tip` is omitted (worktree mode), appends untracked non-ignored `.py` files (`added_lines = None`, meaning every line counts as added).
    - **Paths mode (`--paths`)**: Walks explicit files/directories (pruning `SKIP_SEGMENTS`, `--exclude` globs, and symlinks) and emits `FileChange(path, added_lines=None)`.
-2. **Stage 2 — Per-File AST Extraction (`CandidateProbes` / `TestProbes`)**:
+2. **Stage 2 — Single-Pass Indexing & Per-File AST Extraction (`adc_scanner/{ast_helpers,probes_prod,probes_test}.py`)**:
    - Classifies each file via `role(path, test_globs)` into `"prod"` or `"test"`.
    - In diff mode, parses the `base` blob (`git show <base>:<old_path>`) for modified/renamed/deleted files to collect deleted `CallSite`s and pre-change `CandidateProbes` (used by `PY10a`).
-   - Parses the active file (`git show <tip>:<path>` or disk bytes) via `parse_source` (honoring PEP 263 encoding cookies and recording syntax/codec/merge-conflict errors into `parse_errors` without aborting).
+   - Parses the active file (`git show <tip>:<path>` or disk bytes) via `parse_source` (honoring PEP 263 encoding cookies and recording syntax/codec/merge-conflict errors into `parse_errors` without aborting) and builds a cached single-pass `TreeIndex` (`tree_index(tree)`) and lazy per-scope `ScopeIndex` (`scope_index(node)`).
    - Runs `CandidateProbes` on `"prod"` files (`PY01`–`PY09`, plus `_DEFAULT_*` hook comparisons for `PY10b`) or `TestProbes` on `"test"` files (`PY10b`), filtering emitted candidates by `touches(candidate["_scope"], change.added_lines)`.
-3. **Stage 3 — Cross-Version & Cross-File Correlation (`moved_defenses` / `cross_reachability`)**:
+3. **Stage 3 — Cross-Version & Cross-File Correlation (`adc_scanner/reachability.py`: `moved_defenses` / `cross_reachability`)**:
    - **`moved_defenses` (`PY10a`)**: Compares `(path, symbol, signature)` defense presence between `before` and `after` production ASTs. When a surviving function loses a signature (`PY01`, `PY02`, or `PY04`) and added lines introduce the same signature in at most as many destinations as lost origins, promotes the destination candidate in place to `PY10a_moved_defense` (`change_tag = "moved-defense"`).
-   - **`cross_reachability` (`PY10c`)**: Streams the repository Python snapshot (`snapshot_sources`, using `git ls-tree` + `git cat-file --batch` when `tip` is pinned, or `git ls-files` / `os.walk` on worktree), pre-filters raw source with a compiled word-boundary regex (`__all__` plus target function names), and runs `CrossReferences` + `module_scope` + `public_contracts` to emit `constant_defaults`, `cross-test`, and `orphaned` candidates.
-4. **Stage 4 — Post-Processing, Lossless Bundling & Rendering (`bundle_coalesces` / `render`)**:
+   - **`cross_reachability` (`PY10c`)**: Streams the repository Python snapshot (`snapshot_sources`, using `git ls-tree` + `git cat-file --batch` when `tip` is pinned, or `git ls-files` / `os.walk` on worktree), pre-filters raw source with `TargetWords` (`__all__` plus target function names), and projects `TreeIndex` through `CrossReferences` + `module_scope` + `public_contracts` to emit `constant_defaults`, `cross-test`, and `orphaned` candidates.
+4. **Stage 4 — Post-Processing, Lossless Bundling & Rendering (`adc_scanner/bundling.py`: `bundle_coalesces` / `scan` / `render`)**:
    - `bundle_coalesces` groups non-module `PY04_lossy_falsy_coalesce` records by `(path, symbol, change_tag)` after `moved_defenses` promotion has completed.
    - Sorts all candidates by `(path, span[0], rule)`, strips internal transient keys (`_scope`, `_coalesce`), truncates `code` to 200 characters, assigns sequential IDs (`C01`..`Cnn`), and renders `"compact"` text or `"json"`.
 
@@ -30,7 +31,7 @@ Extractor entrypoint: `engineering/anti-defensive-coding/scripts/scan_python.py`
 ## 2. Architectural Invariants & Boundaries
 
 1. **Zero Target Mutation (Read-Only Guarantee)**:
-   - Every `git` invocation passes `GIT_OPTIONAL_LOCKS=0` and `LC_ALL=C`. The extractor writes exclusively to `stdout`/`stderr` and never creates caches, temporary files, or `.pyc` artifacts in scanned repositories.
+   - Every `git` invocation passes `GIT_OPTIONAL_LOCKS=0` and `LC_ALL=C`, and both `scripts/scan_python.py` and `tests/helpers.py` set `sys.dont_write_bytecode = True` before importing scanner modules. The extractor writes exclusively to `stdout`/`stderr` and never creates caches, temporary files, or `.pyc` artifacts in scanned repositories or `/home/roocode/skills`.
 2. **Symlink & Root Containment**:
    - Explicit `--paths` outside `--repo` raise `ScanError` (exit `2`). Symlinked files and directories are skipped during tree walks and worktree snapshot enumeration (`mode != b"120000"` in `git ls-tree`, `is_symlink()` on disk).
 3. **1-Hop Sweet-Spot Boundary (`ADR-0001`)**:
@@ -42,22 +43,20 @@ Extractor entrypoint: `engineering/anti-defensive-coding/scripts/scan_python.py`
 
 ---
 
-## 3. Code Map (By Symbol)
+## 3. Code Map (By Module & Symbol)
 
-Never hardcode line numbers when referencing `scan_python.py`; locate subsystems by symbol name:
+Never hardcode line numbers when referencing the scanner; locate subsystems by module and symbol name. Modules follow a strict bottom-up acyclic dependency DAG (`registry` → `scope` / `ast_helpers` → `probes_prod` / `probes_test` → `reachability` → `bundling` → `scan_python.py`):
 
-| Subsystem | Key Classes & Functions | Responsibility |
-| --- | --- | --- |
-| **CLI & Scope** | `main`, `diff_scope`, `paths_scope`, `git`, `worktree_root`, `resolve_ref`, `FileChange`, `ScanError`, `excluded`, `role` | Argument validation, Git diff hunk parsing (`--ignore-space-at-eol`), path filtering, `"prod"` vs `"test"` role assignment. |
-| **AST & Control-Flow Helpers** | `local_walk`, `lexical_nodes`, `exits`, `statement_exits`, `assignments`, `bound_targets`, `write_targets`, `binding_names`, `import_bindings`, `name_path`, `terminal_name` | Scope-bounded AST traversal (stopping at nested `def`/`class`/`lambda`), fallthrough vs raising exit analysis, local binding extraction. |
-| **Class & Receiver Helpers (`PY01`)** | `class_declarations`, `named_class`, `undeclared_attribute`, `absent_self_attribute`, `guarded_self_writes`, `zero_arg_constructor` | Same-file class attribute declaration indexing, `if not hasattr(self, attr):` lazy memoization guard detection. |
-| **Exception & Retry Helpers (`PY02`)** | `saved_retry`, `bounded_retry`, `stored_primary_cleanup`, `last_noreturn_call`, `saved_exception`, `final_attempt` | Proving deferred exception propagation across retry loops, cleanup blocks, and same-file `NoReturn`/`Never` helpers. |
-| **State & Lock Helpers (`PY07`–`PY09`)** | `same_class_stashes`, `self_state_writes`, `row_factory_facts`, `lock_context_parts`, `io_or_hash_call`, `iteration_parts`, `predicate_tests` | Sibling-method `self._x = v; return v` stash indexing, `try`/`finally` transient attribute writes, lock/transaction context token matching. |
-| **Production Visitor (`PY01`–`PY09`, `PY10b` hook)** | `CandidateRecords`, `CandidateProbes` (`default_shadows`, `visit_Compare`, `visit_BoolOp`, `transaction_checks`, `state_smuggling`, `dict_dependency`, `dead_parameters`, `visit_ListComp`, `roundtrip`, `visit_With`, `receiver_binding`, `reflection_evidence`, `memo_guard`, `visit_Call`, `visit_Try`) | Single-file AST extraction on production files, recording both `candidates` and `defenses` (`(rule, signature)` pairs for `PY10a`). |
-| **Test Visitor (`PY10b`)** | `TestProbes`, `patch_windows`, `PatchWindow`, `patch_symbol`, `is_patch_constructor`, `raw_text_origin`, `GetterReturn` | Lexical patch-window tracking (`@patch`, `with patch`, `.start()`/`.stop()`, `monkeypatch.setattr`), mutated getter return recall, raw `.py`/`.md` text assertions, `_legacy*` attribute access. |
-| **Moved Defense (`PY10a`)** | `moved_defenses`, `lookup_signature` | Diff-only signature pairing between `before` and `after` `CandidateProbes`, in-place promotion of `PY01`/`PY02`/`PY04` destinations to `PY10a_moved_defense`. |
-| **Cross-Reachability (`PY10c`)** | `cross_reachability`, `snapshot_sources`, `CrossReferences`, `effective_arguments`, `constant_defaults`, `module_scope`, `ModuleScope`, `import_origin`, `public_contracts`, `lost_calls`, `call_sites`, `framework_hook`, `external_base_clause` | Whole-repo reference counting, `__all__` static export graph closure, uniform constant parameter bundling, `cross-test` and `orphaned` detection. |
-| **Bundling & Output** | `bundle_coalesces`, `scan`, `render`, `parse_source`, `has_conflict`, `touches`, `intersects` | Per-function `PY04` bundling, candidate sorting, 200-char code truncation, `C01` ID assignment, JSON/compact rendering. |
+| Module | Subsystem | Key Classes, Functions & Constants | Responsibility |
+| --- | --- | --- | --- |
+| `scripts/scan_python.py` | **CLI Entrypoint** | `main`, `SCRIPT_DIR` | Sets `sys.dont_write_bytecode = True`, injects `SCRIPT_DIR` into `sys.path`, validates CLI flags, dispatches `diff_scope`/`paths_scope` → `scan` → `render`. |
+| `scripts/adc_scanner/rules.json` + `registry.py` | **Declarative Rule Registry** | `RULES`, `VERIFY_TEMPLATES`, `EVIDENCE_TEMPLATES`, `SKIP_SEGMENTS`, `TEST_GLOBS`, `DIFF_FLAGS`, `PY07_DEPENDENCY_SUFFIXES`, `PY08_ROUNDTRIP_PAIRS`, `PY08_COPY_CALLS`, `PY09_LOCK_TOKENS`, `PY09_TX_TOKENS`, `PY09_IO_CALLS`, `PY10A_BASE_SECTIONS`, `PY10B_PATCH_METHODS`, `PY10C_FRAMEWORK_DECORATORS`, `verify_text`, `evidence_text` | Loads `rules.json` once at import time, exposes immutable vocabulary constants and `Verify`/`Evidence` string formatters. |
+| `scripts/adc_scanner/scope.py` | **Git & Path Scope** | `ScanError`, `FileChange`, `git`, `worktree_root`, `resolve_ref`, `diff_scope`, `paths_scope`, `matches`, `excluded`, `role`, `raise_walk_error`, `touches`, `intersects` | Git diff hunk parsing (`--ignore-space-at-eol`), worktree/path inventory, exclusion filtering, `"prod"` vs `"test"` role assignment, span intersection checks. |
+| `scripts/adc_scanner/ast_helpers.py` | **Single-Pass AST Indexing & Helpers** | `TreeIndex`, `tree_index`, `ScopeIndex`, `scope_index`, `IndexedVisitor`, `ReferenceCounts`, `CandidateRecords`, `allocation_batch`, `unparse`, `walk`, `local_walk`, `lexical_nodes`, `exits`, `statement_exits`, `assignments`, `bound_targets`, `write_targets`, `binding_names`, `import_bindings`, `name_path`, `terminal_name`, `lookup_signature`, `parse_source`, `has_conflict`, `class_declarations`, `named_class`, `undeclared_attribute`, `absent_self_attribute`, `guarded_self_writes`, `zero_arg_constructor`, `saved_retry`, `bounded_retry`, `stored_primary_cleanup`, `last_noreturn_call`, `saved_exception`, `final_attempt`, `same_class_stashes`, `self_state_writes`, `row_factory_facts`, `lock_context_parts`, `io_or_hash_call`, `iteration_parts`, `predicate_tests` | Single-pass `TreeIndex` and lazy `ScopeIndex` construction, per-node `unparse` caching, control-flow exit analysis, receiver/class attribute indexing (`PY01`), deferred propagation proofs (`PY02`), and state/lock helpers (`PY07`–`PY09`). |
+| `scripts/adc_scanner/probes_prod.py` | **Production Visitor (`PY01`–`PY09`, `PY10b` hook)** | `CandidateProbes` (`default_shadows`, `visit_Compare`, `visit_BoolOp`, `transaction_checks`, `state_smuggling`, `dict_dependency`, `dead_parameters`, `visit_ListComp`, `roundtrip`, `visit_With`, `receiver_binding`, `reflection_evidence`, `memo_guard`, `visit_Call`, `visit_Try`) | Single-file AST extraction on production files consuming `tree_index(tree)`, recording both `candidates` and `defenses` (`(rule, signature)` pairs for `PY10a`). |
+| `scripts/adc_scanner/probes_test.py` | **Test Visitor (`PY10b`)** | `TestProbes`, `patch_windows`, `PatchWindow`, `patch_symbol`, `is_patch_constructor`, `raw_text_origin`, `GetterReturn` | Lexical patch-window tracking (`@patch`, `with patch`, `.start()`/`.stop()`, `monkeypatch.setattr`), mutated getter return recall, raw `.py`/`.md` text assertions, `_legacy*` attribute access. |
+| `scripts/adc_scanner/reachability.py` | **Moved Defense (`PY10a`) & Cross-Reachability (`PY10c`)** | `moved_defenses`, `cross_reachability`, `snapshot_sources`, `TargetWords`, `CrossReferences`, `ImportedAlias`, `effective_arguments`, `constant_defaults`, `module_scope`, `ModuleScope`, `import_origin`, `public_contracts`, `lost_calls`, `lost_call_clause`, `call_sites`, `CallSite`, `framework_hook`, `external_base_clause`, `target_name` | Diff-only signature pairing (`PY10a`), whole-repo reference counting over `TreeIndex`, `__all__` static export graph closure, uniform constant parameter bundling (`D4b`), `cross-test` and `orphaned` detection. |
+| `scripts/adc_scanner/bundling.py` | **Bundling & Output** | `bundle_coalesces`, `scan`, `render` | Per-function `PY04` bundling (`K4-B`), candidate sorting, 200-char code truncation, `C01` ID assignment, JSON/compact rendering. |
 
 ---
 

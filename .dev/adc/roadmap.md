@@ -17,7 +17,7 @@ Progression principle: **Stabilize modular foundation at zero behavioral delta (
 
 | Priority | Phase | Core Scope | Acceptance / Exit Gate |
 | --- | --- | --- | --- |
-| **P0** | Modular Python Architecture, Declarative Rule Metadata & Test Split | Split `scan_python.py` (3,050 lines) into an internal Python package behind the unchanged `scripts/scan_python.py` CLI entrypoint; extract rule metadata, `Verify`/`Evidence` templates, and probe vocabularies into JSON; split `test_scan_python.py` (4,349 lines) by subsystem and eliminate redundant AST walks. | `audit_helper.py compare v0.3 <p0-tag>` and `v0.3-diff-head5 <p0-diff-tag>` produce **`-0 / +0 / ~0` (100% multiset equivalence) across all 5 frozen external targets**, and the 6th self-scan target (`anti-defensive-coding`, flagged `[INPUT_CHANGED]` when splitting `scan_python.py`) retains only its `diff_scope` lookup candidate in `paths` mode and `0` in `diff` mode; full 6-target `paths` scan drops from ~24.5s to <5s. |
+| **P0** | Modular Python Architecture, Declarative Rule Metadata & Test Split (`v0.4`) | Split `scan_python.py` (3,050 lines) into `scripts/adc_scanner/` behind the unchanged `scripts/scan_python.py` CLI entrypoint; extract rule metadata, `Verify`/`Evidence` templates, and probe vocabularies into `scripts/adc_scanner/rules.json`; replace repeated AST subtree walks with single-pass `TreeIndex`/`ScopeIndex` and `unparse` caching; split `test_scan_python.py` (4,349 lines, `103` methods) into `tests/{helpers,test_scope,test_py01_py04,test_py02,test_py05_py09,test_py10_diff_reach}.py`. | `audit_helper.py compare v0.3 <p0-tag>` and `v0.3-diff-head5 <p0-diff-tag>` produce **`-0 / +0 / ~0` (100% multiset equivalence) across all 5 frozen external targets**, and the 6th self-scan target (`anti-defensive-coding`, flagged `[INPUT_CHANGED]` when splitting `scan_python.py`) retains only its `scripts/adc_scanner/scope.py:diff_scope` lookup candidate (`1` in `paths` mode and `1` relocated in `diff` `HEAD~5..HEAD`); full 6-target `paths` runtime drops from `24.5s` to `~7.1–7.9s` and unit test suite runtime drops from `~56.7s` to `~8.9s` (`0.8s–3.3s` per test module). |
 | **P1** | `v0.3` Bundling Reviewer Validation + `PY01` / `PY02` High-Volume Ergonomics | Run Goldfish Reviewer validation on `v0.3`'s bundled `PY04` (`K4-B`) and `PY10c` (`D4b`) records; introduce lossless per-function/per-receiver bundling for `PY01` (767 rows); enrich `PY02` (1,384 rows) `evidence` with handler exit strata (`silent-pass`, `returns-fallback`, `logged-exc-info`, `logged-no-traceback`). | Zero missed TP sites in bundled `PY04`/`PY10c` reviewer test; `PY01` lossless site equality (`old == new`) with ~50%+ record compaction; `PY02` stratum tags verified against `/home/roocode/adc_scanning_test/reports/audits/v0.2-PY02-paired-validation.md`. |
 | **P2** | Benchmark Corpus Expansion, Multi-Window Diff Audits & Deferred Probe Triage | Add 3–5 new Python targets covering underrepresented archetypes (Pydantic/SQLAlchemy CRUD, CLI/data pipeline, mock-heavy test suites) and multiple PR diff windows; measure low-count rules (`PY03`, `PY05`, `PY07`–`PY09`, `PY10b`) and the 11 deferred probes in `/home/roocode/adc_scanning_test/reports/audits/proposal-ledger-v0.md` §7. | Every active probe has measured precision on >=10 hits or synthetic+corpus proof; each §7 deferred probe is either promoted with `0` extractor noise (AST matches mechanically distinguishable as safe without losing TPs) or permanently rejected into `.dev/adc/dead-ends.md`. |
 | **P3** | Cross-Language Expansion (Corpus-First) | Build a 100+ issue real-world over-defense corpus in the next target language (e.g., TypeScript or Rust) using `SKILL.md`'s Four Gates & Eight Families; author `references/<lang>.md` and map linter overlap (`tsc`/`biome`/`clippy`) before building a language extractor. | `references/<lang>.md` backed by real project audits and Counterweight proofs before any `scan_<lang>` script or `ast-grep` / `tree-sitter` extractor is written. |
@@ -33,18 +33,25 @@ Progression principle: **Stabilize modular foundation at zero behavioral delta (
 - **Zero distribution friction**: Keeping the extractor in Python 3.11+ standard library preserves zero-build execution (`python3 <skill-dir>/scripts/scan_python.py`) across any environment where the skill is installed.
 - **Fast iteration**: P1 and P2 still adjust probe evidence, bundling, and deferred AST guards; Python keeps the edit-to-snapshot cycle under 5 seconds.
 
-#### 2. Package & Test Layout
-Keep `scripts/scan_python.py` as the stable CLI entrypoint (`SKILL.md` and `~/adc_scanning_test/scripts/audit_helper.py` require zero CLI changes), delegating to an internal package:
-- `scripts/scan_python.py` — CLI argument parsing, entrypoint, and top-level error handling.
-- `scripts/adc_scanner/` (or `scripts/scanner/`):
-  - `scope.py` — Git plumbing (`diff_scope`, `paths_scope`, `snapshot_sources`).
-  - `ast_helpers.py` — Single-pass scope/parent indexing, control-flow `exits`, receiver/binding resolution.
-  - `rules.json` + `registry.py` — Declarative rule metadata, `Verify`/`Evidence` templates, and pattern vocabularies.
-  - `probes_prod.py` — Production AST probes (`PY01`–`PY09`).
-  - `probes_test.py` — Test AST probes (`PY10b` patch windows, getter mutation, raw source assertions).
-  - `reachability.py` — Diff moved-defense pairing (`PY10a`) and whole-repo cross-reachability (`PY10c`).
-  - `bundling.py` — Lossless post-extraction record bundling (`PY04`, `PY10c`, and future `PY01`) and output rendering.
-- Split `tests/test_scan_python.py` into focused test modules (`test_scope.py`, `test_py01_py04.py`, `test_py02.py`, `test_py05_py09.py`, `test_py10_diff_reach.py`) with shared read-only Git fixtures where history mutation is not under test.
+#### 2. Package & Test Layout (`v0.4`)
+Keep `scripts/scan_python.py` as the stable CLI entrypoint (`sys.dont_write_bytecode = True`; `SKILL.md` requires zero CLI changes), delegating to the acyclic internal package `scripts/adc_scanner/`:
+- `scripts/scan_python.py` — CLI argument parsing, `sys.dont_write_bytecode = True`, `sys.path` setup, entrypoint (`main`), and top-level error handling.
+- `scripts/adc_scanner/`:
+  - `__init__.py` — Minimal package docstring marker (zero barrel re-exports).
+  - `rules.json` + `registry.py` — Declarative rule metadata, `Verify`/`Evidence` variant templates, and immutable probe vocabularies (`verify_text`, `evidence_text`).
+  - `scope.py` — Git and explicit-path scope resolution (`ScanError`, `FileChange`, `git`, `worktree_root`, `resolve_ref`, `diff_scope`, `paths_scope`, `excluded`, `role`, `touches`, `intersects`).
+  - `ast_helpers.py` — Single-pass `TreeIndex` (`tree_index`), lazy `ScopeIndex` (`scope_index`), cached `unparse`, `CandidateRecords`, control-flow `exits`, receiver/class declaration helpers (`PY01`), retry/cleanup proofs (`PY02`), and state/lock helpers (`PY07`–`PY09`).
+  - `probes_prod.py` — Production AST probes (`CandidateProbes`: `PY01`–`PY09` plus `_DEFAULT_*` production hook comparisons for `PY10b`).
+  - `probes_test.py` — Test AST probes (`TestProbes`, `PatchWindow`, `patch_windows`, `patch_symbol`, `is_patch_constructor`, `raw_text_origin`, `GetterReturn` for `PY10b`).
+  - `reachability.py` — Diff moved-defense pairing (`moved_defenses` for `PY10a`) and whole-repo cross-reachability (`cross_reachability`, `snapshot_sources`, `CrossReferences`, `effective_arguments`, `constant_defaults`, `module_scope`, `public_contracts` for `PY10c`).
+  - `bundling.py` — Lossless post-extraction record bundling (`bundle_coalesces`), orchestration (`scan`), and output rendering (`render`).
+- `tests/`:
+  - `helpers.py` — Sets `sys.dont_write_bytecode = True`, defines `SCRIPT`, `SKILLS_ROOT`, and `ExtractorTestCase` (`put`, in-process `cli`, `cli_subprocess`, `scan`, `git`, `init_repo`, `commit`, and class-level read-only Git fixture helpers `git_fixture` / `use_git_fixture`).
+  - `test_scope.py` (`ScopeTests`, `16` methods) — CLI arguments, exit codes, `cli_subprocess` (`subprocess.run`) and `runpy.run_path` entrypoints, PEP 263 codecs, merge conflicts, `--ignore-space-at-eol`, symlink skipping, and working-tree/git-status immutability.
+  - `test_py01_py04.py` (`Py01Py04Tests`, `15` methods) — `PY01` reflection/memo-guard/receiver-evidence and `PY04` lossy coalesce + per-function bundling (`K4-B`).
+  - `test_py02.py` (`Py02Tests`, `10` methods) — `PY02` error washing, deferred propagation, and `Z-T1` `try`-body diff scope.
+  - `test_py05_py09.py` (`Py05Py09Tests`, `21` methods) — `PY03` default shadows guard, `PY05` dead parameter evasion, `PY07` state smuggling, `PY08` copy/roundtrip churn, and `PY09` lock/transaction bleed.
+  - `test_py10_diff_reach.py` (`Py10DiffReachTests`, `41` methods) — `PY10a` moved defenses (`D2`), `PY10b` test smells and lexical patch windows (`D3`, `D10`), and `PY10c` cross-reachability and parameter bundling (`D4b`).
 
 #### 3. Hybrid JSON Rule Extraction (Avoiding the Inner-Platform Trap)
 - **Move to JSON (`rules.json`)**:
