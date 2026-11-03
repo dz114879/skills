@@ -1,0 +1,332 @@
+{
+  "rules": {
+    "PY01_reflect_default": {
+      "family": "PY01",
+      "catalogue_sections": [
+        "python.md §1"
+      ],
+      "bundling_policy": "singleton",
+      "diff_scope_mode": "candidate_scope"
+    },
+    "PY02_error_washing": {
+      "family": "PY02",
+      "catalogue_sections": [
+        "python.md §4"
+      ],
+      "bundling_policy": "singleton",
+      "diff_scope_mode": "handler_and_try_body"
+    },
+    "PY03_default_shadows_check": {
+      "family": "PY03",
+      "catalogue_sections": [
+        "python.md §5"
+      ],
+      "bundling_policy": "singleton",
+      "diff_scope_mode": "assignment_and_guard"
+    },
+    "PY04_lossy_falsy_coalesce": {
+      "family": "PY04",
+      "catalogue_sections": [
+        "python.md §6"
+      ],
+      "bundling_policy": "per_function_after_moved_defense",
+      "diff_scope_mode": "candidate_scope"
+    },
+    "PY05_dead_param_evasion": {
+      "family": "PY05",
+      "catalogue_sections": [
+        "python.md §7"
+      ],
+      "bundling_policy": "singleton",
+      "diff_scope_mode": "candidate_scope"
+    },
+    "PY06_revalidated_typed_param": {
+      "family": "PY06",
+      "catalogue_sections": [
+        "python.md §1",
+        "python.md §10"
+      ],
+      "bundling_policy": "retired",
+      "diff_scope_mode": "retired"
+    },
+    "PY07_state_smuggling": {
+      "family": "PY07",
+      "catalogue_sections": [
+        "python.md §8"
+      ],
+      "bundling_policy": "singleton",
+      "diff_scope_mode": "writes_and_readers"
+    },
+    "PY08_roundtrip_and_copy": {
+      "family": "PY08",
+      "catalogue_sections": [
+        "python.md §10",
+        "sql.md §3"
+      ],
+      "bundling_policy": "singleton",
+      "diff_scope_mode": "candidate_and_iteration_headers"
+    },
+    "PY09_io_or_tx_in_lock": {
+      "family": "PY09",
+      "catalogue_sections": [
+        "python.md §11",
+        "sql.md §5",
+        "sql.md §7"
+      ],
+      "bundling_policy": "singleton",
+      "diff_scope_mode": "candidate_and_contexts"
+    },
+    "PY10a_moved_defense": {
+      "family": "PY10a",
+      "catalogue_sections": [
+        "python.md §1",
+        "python.md §4",
+        "python.md §6"
+      ],
+      "bundling_policy": "promote_destination_in_place",
+      "diff_scope_mode": "added_destination_and_lost_origin"
+    },
+    "PY10b_test_smell": {
+      "family": "PY10b",
+      "catalogue_sections": [
+        "tests.md §2",
+        "tests.md §4",
+        "tests.md §5",
+        "tests.md §6"
+      ],
+      "bundling_policy": "singleton",
+      "diff_scope_mode": "candidate_and_related"
+    },
+    "PY10c_cross_test_reachability": {
+      "family": "PY10c",
+      "catalogue_sections": [
+        "tests.md §4"
+      ],
+      "bundling_policy": "per_function_uniform_defaults",
+      "diff_scope_mode": "changed_definitions_or_lost_calls"
+    }
+  },
+  "verify_templates": {
+    "PY01_reflect_default": "Does the immediate producer or governing type (including third-party classes) guarantee the attribute, even if nullable, or is it an optional capability? For owned state, do construction/lifecycle writes or constructor-bypassing callers/tests explain absence? See python.md §1.",
+    "PY02_error_washing": "Which outcome applies at 1 hop: false success, omitted work, or fail-open; an unreachable failure (dead handler); an established recovery contract (Counterweight); or Lint-Owned? See python.md §4.",
+    "PY02_hook_diagnostic": "Does the immediate hook's rejection contract require preserving its diagnostic, or is replacement documented boundary translation (Counterweight)? See python.md §4.",
+    "PY03_get_default_note": " The .get() default shadows missing keys unless None is explicitly stored.",
+    "PY05_dead_param_evasion": "Does an immediate caller or an export, re-export or published/framework signature require parameter '{name}'? Does a default such as Depends(...) run a required side-effect dependency (Counterweight), or can its plumbing be removed? See python.md §7.",
+    "PY07_return_stash": "Could each reader receive this value as an explicit argument from a caller that already holds the return, or does self.{attribute} memoize it across calls (Counterweight)? See python.md §8.",
+    "PY07_state_smuggling": "Does the immediate consumer require transient 'self.{attribute}', or can it receive an explicit argument; is a documented lifecycle/reentrancy guarantee a Counterweight? See python.md §8.",
+    "PY07_dict_dependency": "Does the immediate dictionary consumer expect data only, so this dependency should be explicit; is a documented dependency registry or boundary adapter a Counterweight? See python.md §8.",
+    "PY08_comprehension": "Is each '{name}' already a fresh mapping? For a DB row, its cursor's factory decides (set on the cursor, or last set on its connection before cursor creation): a dict factory makes this copy churn; sqlite3.Row/aiosqlite.Row makes it the first materialization (Counterweight at the owning boundary). See sql.md §3.",
+    "PY08_roundtrip_copy": "Does the immediate consumer need this representation round-trip, or can the original value preserve Semantic Fidelity; is documented wire normalization or isolation a Counterweight? See python.md §10.",
+    "PY08_iteration_copy": "Does the immediate consumer mutate or retain an independent snapshot each iteration, or can copying be removed/hoisted; is isolation or required wire serialization a Counterweight? See python.md §10.",
+    "PY09_tx_check": "Does the immediate caller already own the transaction, making another savepoint redundant; is independent rollback or required isolation a Counterweight? See sql.md §5.",
+    "PY10b_default_hook": "Does the immediate caller require a public replacement hook, or does this only accommodate test patching; is a live extension contract a Counterweight? See tests.md §5.",
+    "PY04_mixed": "Can the immediate producer or governing type deliver a falsy value at each site? If not, the fallback is dead; if it delivers a legitimate 0/\"\"/False or a distinct falsy value (None vs 0, 0 vs \"\"), the fallback rewrites it. Counterweight only if the boundary contract equates missing with empty or the producer already rejects empty. See python.md §6.",
+    "PY03_default_shadows_check": "Does the immediate producer require '{name}' to be present, making this default hide rejection, or is omission an accepted boundary input (Counterweight)?{note} See python.md §5.",
+    "PY04_truthy": "Can the immediate producer or governing type deliver a falsy value here? If not, the fallback is dead; if it delivers a legitimate 0/\"\"/False, the fallback overwrites it. Counterweight only if the boundary contract equates missing with empty or the producer already rejects empty. See python.md §6.",
+    "PY04_falsy": "Can the immediate producer or governing type deliver a falsy value here? If not, the fallback is dead; if it delivers a distinct legitimate one (None vs 0, 0 vs \"\"), the fallback rewrites it. Counterweight only if the boundary contract equates missing with empty or the producer already rejects empty. See python.md §6.",
+    "PY09_lock_io": "Does the immediate lock/transaction owner require this work in the protected region, or can it move outside; is atomicity, isolation, or data-loss prevention a Counterweight? See {catalogue}.",
+    "PY09_nested_tx": "Does the immediate lock/transaction owner require this work in the protected region, or can it move outside; is atomicity, isolation, or data-loss prevention a Counterweight? See {catalogue}.",
+    "PY10a_moved_defense": "Open the origin first: did it guard the same producer, receiver or exception source? If so, did this callee become the owner, or is it a relocated hedge (a genuine boundary is a Counterweight)? If not, verify this defense on its own under {base_section}. See python.md §4.",
+    "PY10b_legacy": "Does the immediate production contract require this test mechanism, or can the test exercise observable behavior; is a documented aliasing or compatibility contract a Counterweight? See tests.md §4.",
+    "PY10b_raw_text": "Does the immediate production contract require this test mechanism, or can the test exercise observable behavior; is a documented aliasing or compatibility contract a Counterweight? See tests.md §6.",
+    "PY10b_getter_mutation": "Does the immediate production contract require this test mechanism, or can the test exercise observable behavior; is a documented aliasing or compatibility contract a Counterweight? See tests.md §2.",
+    "PY10b_self_patch": "Does the immediate production contract require this test mechanism, or can the test exercise observable behavior; is a documented aliasing or compatibility contract a Counterweight? See tests.md §5.",
+    "PY10c_constant_default_single": "Does every immediate production binding, recursion included, fix this value, so the override is dead while the default's policy stays? Is it an export or extension contract (Counterweight)? See tests.md §4.",
+    "PY10c_constant_default_bundle": "Does every immediate production binding, recursion included, fix each value, so the override is dead while the default's policy stays? Is it an export or extension contract (Counterweight)? See tests.md §4.",
+    "PY10c_cross_test": "Does a registration API, by-name loader, inherited external-base hook or export reach this definition, with dispatch checked both ways? See tests.md §4.",
+    "PY10c_orphaned": "Does a registration API, by-name loader, inherited external-base hook or export reach this definition, with dispatch checked both ways? See tests.md §4."
+  },
+  "evidence_templates": {
+    "PY09_nested_tx_fact": "Nested transaction/savepoint",
+    "PY09_lock_io_fact": "I/O or hashing call {callable}",
+    "PY08_row_factory": "{target} = {value} at line {line}",
+    "PY03_default_shadows_check": "Default for '{name}' at line {default_line} precedes required-value guard at line {guard_line}",
+    "PY10b_default_hook": "Production callable identity is compared with a _DEFAULT_* hook",
+    "PY04_lossy_falsy_coalesce": "Lookup coalesces to {fallback} at line {line}",
+    "PY09_check_site": "line {line}",
+    "PY09_tx_context": "with {context} at line {line}",
+    "PY07_stash_reader": "{method} at line {line}",
+    "PY07_state_smuggling": "self.{attribute} set at line {write_line} in try at line {try_line}, reset to None in finally at line {reset_line}",
+    "PY07_dict_dependency": "Dependency-shaped key {key!r} stores {value} at line {line}",
+    "PY05_discard": "explicit discard with no other Load references",
+    "PY05_dual_parameter": "dual-parameter fallback to '{name}' (default None at line {default_line}); sole reads in overwrite at line {overwrite_line}",
+    "PY05_entry_overwrite": "entry overwrite before any RHS read",
+    "PY05_dead_param_evasion": "Parameter '{name}': {fact} at line {line}",
+    "PY08_comprehension": "Comprehension at line {comprehension_line} rewraps its target '{name}' in dict at line {call_line}",
+    "PY08_roundtrip_copy": "{outer} wraps {inner} at line {line}",
+    "PY09_lock_context": "with {context} at line {line}",
+    "PY01_local_binding": "local binding {binding} at line {line} (control-flow unresolved)",
+    "PY01_unannotated": "<unannotated>",
+    "PY01_parameter": "parameter {name}: {annotation} at line {line}",
+    "PY01_receiver": "Receiver {receiver}",
+    "PY01_enclosing_class": "enclosing class {name} at line {line}",
+    "PY01_unknown_class": "receiver class unknown",
+    "PY01_implicit_base": "object (implicit)",
+    "PY01_receiver_class": "receiver class {name}; bases: {bases}",
+    "PY01_declared_attribute": "Same-file class {name} declares attribute '{attribute}' at line {line}",
+    "PY08_iteration": "{kind} at line {line}",
+    "PY02_non_raising": "broad/multi-exception handler has a non-raising exit",
+    "PY02_noreturn": "re-raises via `{helper}` (NoReturn)",
+    "PY02_hook_site": "line {line}",
+    "PY02_bare_except": "bare except",
+    "PY10b_legacy": "Test accesses private compatibility attribute '{attribute}'",
+    "PY10b_self_patch": "Patch targets directly invoked SUT symbol '{symbol}'",
+    "PY10b_raw_text": "Assertion checks raw source/documentation text from a .py/.md path",
+    "PY10b_getter_mutation": "Getter '{method}' return '{name}' is mutated before re-call",
+    "PY10a_origin": "base {path}:{line} ({symbol})",
+    "PY10c_lost_call_site": "base {path}:{line} ({role})",
+    "PY10c_definition_unchanged": "; definition unchanged; triggered by deleted call",
+    "PY10c_constant_default_single": "Parameter '{name}': {calls} resolved prod call sites; uniform value: {value}{clauses}",
+    "PY10c_constant_parameter": "'{name}' (uniform value: {value})",
+    "PY10c_constant_default_bundle": "Parameters {parameters}: {calls} resolved prod call sites{clauses}",
+    "PY10c_external_base": "; enclosing class bases: {bases} (not defined in repo)",
+    "PY10c_references": "Terminal-name aggregates across {definitions} prod {definition_label}; test references are not attributed to this definition. Observed prod calls: {prod_calls}, prod non-call refs: {prod_refs}; test calls: {test_calls}, test non-call refs: {test_refs}",
+    "PY10c_ambiguous_definitions": "; ambiguous_defs: {definitions}",
+    "PY04_bundle_site": "line {line}: {code} -> {fallback}",
+    "PY09_tx_check": "in_transaction checked at {checks}; same function enters {contexts}",
+    "PY07_return_stash": "self.{attribute} = {name} at line {line} precedes return {name}; read in {readers}",
+    "PY09_lock": "{fact} at line {line} inside {contexts}",
+    "PY08_iteration_copy": "{callable} at line {line} runs per iteration of {iterations}",
+    "PY02_hook_diagnostic": "json.loads(object_pairs_hook=...) at {hooks} is not bare re-raised on every path",
+    "PY02_error_washing": "Handler catches {caught} at line {line}; {facts}",
+    "PY10a_moved_defense": "; same {rule} signature {signature} lost from {origins} (signature match only)",
+    "PY10c_lost_calls": "; lost call(s): {sites}",
+    "PY04_bundle": "{count} coalescing lookups in {symbol}: {sites}"
+  },
+  "vocabularies": {
+    "skip_segments": [
+      ".git",
+      ".hg",
+      ".mypy_cache",
+      ".pytest_cache",
+      ".ruff_cache",
+      ".scratch",
+      ".svn",
+      ".tox",
+      ".venv",
+      "__pycache__",
+      "build",
+      "dist",
+      "node_modules",
+      "venv"
+    ],
+    "test_globs": [
+      "test_*.py",
+      "*_test.py",
+      "conftest.py",
+      "*_test_support.py"
+    ],
+    "diff_flags": [
+      "--no-ext-diff",
+      "--no-textconv",
+      "-M",
+      "--no-color",
+      "--no-relative",
+      "--src-prefix=a/",
+      "--dst-prefix=b/"
+    ],
+    "py07_dependency_suffixes": [
+      "conn",
+      "connection",
+      "reader",
+      "repo",
+      "repository",
+      "service",
+      "session",
+      "writer"
+    ],
+    "py08_roundtrip_pairs": [
+      [
+        "int",
+        "float"
+      ],
+      [
+        "json.loads",
+        "json.dumps"
+      ]
+    ],
+    "py08_copy_calls": [
+      "asdict",
+      "copy.deepcopy",
+      "dataclasses.asdict",
+      "deepcopy"
+    ],
+    "py09_lock_tokens": [
+      "immediate",
+      "lock",
+      "locks",
+      "savepoint",
+      "transaction"
+    ],
+    "py10c_framework_decorators": [
+      "abstractmethod",
+      "contextmanager",
+      "delete",
+      "fixture",
+      "get",
+      "hook",
+      "overload",
+      "patch",
+      "post",
+      "property",
+      "put",
+      "register",
+      "route"
+    ],
+    "py09_tx_tokens": {
+      "entry": [
+        "savepoint",
+        "transaction"
+      ],
+      "protected": [
+        "immediate",
+        "savepoint",
+        "transaction"
+      ]
+    },
+    "py09_io_calls": {
+      "terminal_names": [
+        "open",
+        "read_bytes",
+        "read_text",
+        "write_bytes",
+        "write_text"
+      ],
+      "prefixes": [
+        "shutil.",
+        "hashlib."
+      ],
+      "paths": [
+        "os.remove",
+        "os.replace",
+        "os.unlink",
+        "sha256"
+      ],
+      "suffixes": [
+        ".followup.send"
+      ]
+    },
+    "py10a_base_sections": {
+      "PY01_reflect_default": "python.md §1",
+      "PY02_error_washing": "python.md §4",
+      "PY04_lossy_falsy_coalesce": "python.md §6"
+    },
+    "py10b_patch_methods": {
+      "target": [
+        "mock.patch",
+        "patch",
+        "unittest.mock.patch"
+      ],
+      "object": [
+        "mock.patch.object",
+        "patch.object",
+        "unittest.mock.patch.object"
+      ],
+      "stop_all": [
+        "mock.patch.stopall",
+        "patch.stopall",
+        "unittest.mock.patch.stopall"
+      ]
+    }
+  }
+}
