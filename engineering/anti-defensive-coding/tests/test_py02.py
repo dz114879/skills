@@ -1,5 +1,4 @@
 import textwrap
-import unittest
 
 from helpers import ExtractorTestCase
 
@@ -17,10 +16,10 @@ class Py02Tests(ExtractorTestCase):
             """,
         )
         candidates = self.scan("--paths", "groups.py")["candidates"]
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["rule"], "PY02_error_washing")
-        self.assertEqual(candidates[0]["span"], [4, 5])
-        self.assertIn("Exception", candidates[0]["evidence"])
+        assert len(candidates) == 1
+        assert candidates[0]["rule"] == "PY02_error_washing"
+        assert candidates[0]["span"] == [4, 5]
+        assert "Exception" in candidates[0]["evidence"]
 
     def test_error_washing_broad_handlers_follow_control_flow(self):
         cases = [
@@ -79,25 +78,24 @@ class Py02Tests(ExtractorTestCase):
             ("Exception", "match error:\n    case _ if ready:\n        raise", True),
         ]
         for caught, body, expected in cases:
-            with self.subTest(caught=caught, body=body):
-                header = f"except {caught}:" if caught else "except:"
-                self.put(
-                    "errors.py",
-                    "def load():\n    try:\n        work()\n    "
-                    + header
-                    + "\n"
-                    + textwrap.indent(body, "        ")
-                    + "\n",
-                )
-                candidates = self.scan("--paths", "errors.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    candidate = candidates[0]
-                    self.assertEqual(candidate["rule"], "PY02_error_washing")
-                    self.assertEqual(candidate["symbol"], "load")
-                    self.assertEqual(candidate["span"], [4, 4 + len(body.splitlines())])
-                    self.assertIn(caught or "bare except", candidate["evidence"])
-                    self.assertIn("line 4", candidate["evidence"])
+            header = f"except {caught}:" if caught else "except:"
+            self.put(
+                "errors.py",
+                "def load():\n    try:\n        work()\n    "
+                + header
+                + "\n"
+                + textwrap.indent(body, "        ")
+                + "\n",
+            )
+            candidates = self.scan("--paths", "errors.py")["candidates"]
+            assert len(candidates) == int(expected)
+            if expected:
+                candidate = candidates[0]
+                assert candidate["rule"] == "PY02_error_washing"
+                assert candidate["symbol"] == "load"
+                assert candidate["span"] == [4, 4 + len(body.splitlines())]
+                assert (caught or "bare except") in candidate["evidence"]
+                assert "line 4" in candidate["evidence"]
 
     def test_error_washing_saved_retry_requires_post_loop_propagation(self):
         for following, escape, finalizer, expected in [
@@ -110,40 +108,38 @@ class Py02Tests(ExtractorTestCase):
             ("raise last", "", "finally:\n    return None\n", True),
             ("else:\n    pass\nraise last", "", "", True),
         ]:
-            with self.subTest(following=following, escape=escape, finalizer=finalizer):
-                self.put(
-                    "retry.py",
-                    "def send():\n    last = None\n    for attempt in range(3):\n"
-                    "        try:\n            return deliver()\n"
-                    "        except Exception as error:\n"
-                    "            log(error)\n            last = error\n"
-                    + textwrap.indent(finalizer, "        ")
-                    + textwrap.indent(escape, "        ")
-                    + "\n        sleep(attempt)\n"
-                    + textwrap.indent(following, "    ")
-                    + "\n",
-                )
-                candidates = self.scan("--paths", "retry.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    self.assertEqual(candidates[0]["rule"], "PY02_error_washing")
-                    self.assertEqual(candidates[0]["symbol"], "send")
-                    self.assertIn("non-raising exit", candidates[0]["evidence"])
+            self.put(
+                "retry.py",
+                "def send():\n    last = None\n    for attempt in range(3):\n"
+                "        try:\n            return deliver()\n"
+                "        except Exception as error:\n"
+                "            log(error)\n            last = error\n"
+                + textwrap.indent(finalizer, "        ")
+                + textwrap.indent(escape, "        ")
+                + "\n        sleep(attempt)\n"
+                + textwrap.indent(following, "    ")
+                + "\n",
+            )
+            candidates = self.scan("--paths", "retry.py")["candidates"]
+            assert len(candidates) == int(expected)
+            if expected:
+                assert candidates[0]["rule"] == "PY02_error_washing"
+                assert candidates[0]["symbol"] == "send"
+                assert "non-raising exit" in candidates[0]["evidence"]
         for condition, expected in [("True", True), ("1", True), ("pending", False)]:
-            with self.subTest(condition=condition):
-                self.put(
-                    "retry.py",
-                    f"def send():\n    last = None\n    while {condition}:\n"
-                    "        try:\n            return deliver()\n"
-                    "        except Exception as error:\n            last = error\n"
-                    "    raise last\n",
-                )
-                candidates = self.scan("--paths", "retry.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    self.assertEqual(candidates[0]["rule"], "PY02_error_washing")
-                    self.assertEqual(candidates[0]["symbol"], "send")
-                    self.assertIn("non-raising exit", candidates[0]["evidence"])
+            self.put(
+                "retry.py",
+                f"def send():\n    last = None\n    while {condition}:\n"
+                "        try:\n            return deliver()\n"
+                "        except Exception as error:\n            last = error\n"
+                "    raise last\n",
+            )
+            candidates = self.scan("--paths", "retry.py")["candidates"]
+            assert len(candidates) == int(expected)
+            if expected:
+                assert candidates[0]["rule"] == "PY02_error_washing"
+                assert candidates[0]["symbol"] == "send"
+                assert "non-raising exit" in candidates[0]["evidence"]
 
     def test_error_washing_bounded_retry_requires_final_attempt_reraise(self):
         for condition, prefix, finalizer, expected in [
@@ -156,21 +152,20 @@ class Py02Tests(ExtractorTestCase):
             ("attempt == 2", "if stop:\n    break", "", True),
             ("attempt == 2", "log()", "finally:\n    return None\n", True),
         ]:
-            with self.subTest(condition=condition, prefix=prefix, finalizer=finalizer):
-                self.put(
-                    "retry.py",
-                    "def send():\n    for attempt in range(3):\n"
-                    "        try:\n            return deliver()\n"
-                    "        except Exception:\n"
-                    + textwrap.indent(prefix, "            ")
-                    + f"\n            if {condition}:\n                raise\n"
-                    + textwrap.indent(finalizer, "        "),
-                )
-                candidates = self.scan("--paths", "retry.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    self.assertEqual(candidates[0]["rule"], "PY02_error_washing")
-                    self.assertIn("non-raising exit", candidates[0]["evidence"])
+            self.put(
+                "retry.py",
+                "def send():\n    for attempt in range(3):\n"
+                "        try:\n            return deliver()\n"
+                "        except Exception:\n"
+                + textwrap.indent(prefix, "            ")
+                + f"\n            if {condition}:\n                raise\n"
+                + textwrap.indent(finalizer, "        "),
+            )
+            candidates = self.scan("--paths", "retry.py")["candidates"]
+            assert len(candidates) == int(expected)
+            if expected:
+                assert candidates[0]["rule"] == "PY02_error_washing"
+                assert "non-raising exit" in candidates[0]["evidence"]
 
     def test_error_washing_cleanup_preserves_primary_or_cleanup_failure(self):
         for mutation, finalizer, expected_cleanup in [
@@ -180,27 +175,24 @@ class Py02Tests(ExtractorTestCase):
             ("if stop:\n    return None", "", True),
             ("", "finally:\n    return None\n", True),
         ]:
-            with self.subTest(mutation=mutation, finalizer=finalizer):
-                self.put(
-                    "cleanup.py",
-                    "def update():\n    saved = None\n    try:\n        change()\n"
-                    "    except Exception as error:\n        saved = error\n"
-                    "    finally:\n        try:\n            restore()\n"
-                    "        except Exception as cleanup_error:\n"
-                    "            log(cleanup_error)\n"
-                    + textwrap.indent(mutation, "            ")
-                    + "\n            if saved is None:\n                raise\n"
-                    + textwrap.indent(finalizer, "        ")
-                    + "    if saved is not None:\n        raise saved\n",
-                )
-                candidates = self.scan("--paths", "cleanup.py")["candidates"]
-                self.assertEqual(len(candidates), 1 + int(expected_cleanup))
-                self.assertTrue(
-                    all(c["rule"] == "PY02_error_washing" for c in candidates)
-                )
-                self.assertIn("except Exception as error", candidates[0]["code"])
-                if expected_cleanup:
-                    self.assertIn("cleanup_error", candidates[1]["code"])
+            self.put(
+                "cleanup.py",
+                "def update():\n    saved = None\n    try:\n        change()\n"
+                "    except Exception as error:\n        saved = error\n"
+                "    finally:\n        try:\n            restore()\n"
+                "        except Exception as cleanup_error:\n"
+                "            log(cleanup_error)\n"
+                + textwrap.indent(mutation, "            ")
+                + "\n            if saved is None:\n                raise\n"
+                + textwrap.indent(finalizer, "        ")
+                + "    if saved is not None:\n        raise saved\n",
+            )
+            candidates = self.scan("--paths", "cleanup.py")["candidates"]
+            assert len(candidates) == 1 + int(expected_cleanup)
+            assert all(c["rule"] == "PY02_error_washing" for c in candidates)
+            assert "except Exception as error" in candidates[0]["code"]
+            if expected_cleanup:
+                assert "cleanup_error" in candidates[1]["code"]
 
     def test_error_washing_noreturn_helper_stays_with_truthful_evidence(self):
         for annotation, call, prefix, duplicate, helper, nonraising in [
@@ -244,53 +236,43 @@ class Py02Tests(ExtractorTestCase):
             ("NoReturn", "self._reject()", "return None", "", None, True),
             ("NoReturn", "return self._reject()", "", "", None, True),
         ]:
-            with self.subTest(
-                annotation=annotation, call=call, prefix=prefix, duplicate=duplicate
-            ):
-                self.put(
-                    "helpers.py",
-                    duplicate
-                    + f"class Client:\n    @staticmethod\n    def _reject() -> {annotation}:\n"
-                    "        raise Rejected()\n"
-                    "    async def check(self):\n        try:\n            request()\n"
-                    "        except Exception:\n"
-                    + textwrap.indent(prefix, "            ")
-                    + "\n            "
-                    + call
-                    + "\n",
-                )
-                candidates = self.scan("--paths", "helpers.py")["candidates"]
-                self.assertEqual(len(candidates), 1)
-                candidate = candidates[0]
-                self.assertEqual(candidate["rule"], "PY02_error_washing")
-                self.assertEqual(candidate["symbol"], "Client.check")
-                self.assertEqual(
-                    "non-raising exit" in candidate["evidence"], nonraising
-                )
-                if helper:
-                    self.assertIn(
-                        f"re-raises via `{helper}` (NoReturn)", candidate["evidence"]
-                    )
-                else:
-                    self.assertNotIn("re-raises via", candidate["evidence"])
+            self.put(
+                "helpers.py",
+                duplicate
+                + f"class Client:\n    @staticmethod\n    def _reject() -> {annotation}:\n"
+                "        raise Rejected()\n"
+                "    async def check(self):\n        try:\n            request()\n"
+                "        except Exception:\n"
+                + textwrap.indent(prefix, "            ")
+                + "\n            "
+                + call
+                + "\n",
+            )
+            candidates = self.scan("--paths", "helpers.py")["candidates"]
+            assert len(candidates) == 1
+            candidate = candidates[0]
+            assert candidate["rule"] == "PY02_error_washing"
+            assert candidate["symbol"] == "Client.check"
+            assert ("non-raising exit" in candidate["evidence"]) == nonraising
+            if helper:
+                assert f"re-raises via `{helper}` (NoReturn)" in candidate["evidence"]
+            else:
+                assert "re-raises via" not in candidate["evidence"]
 
     def test_error_washing_noreturn_helper_keeps_earlier_loop_exits(self):
         for escape in ("break", "continue"):
-            with self.subTest(escape=escape):
-                self.put(
-                    "helpers.py",
-                    "def reject() -> Never:\n    raise Rejected()\n"
-                    "def run():\n    for item in items:\n"
-                    "        try:\n            work(item)\n"
-                    "        except Exception:\n            if stop:\n"
-                    f"                {escape}\n            reject()\n",
-                )
-                candidates = self.scan("--paths", "helpers.py")["candidates"]
-                self.assertEqual(len(candidates), 1)
-                self.assertIn("non-raising exit", candidates[0]["evidence"])
-                self.assertIn(
-                    "re-raises via `reject` (NoReturn)", candidates[0]["evidence"]
-                )
+            self.put(
+                "helpers.py",
+                "def reject() -> Never:\n    raise Rejected()\n"
+                "def run():\n    for item in items:\n"
+                "        try:\n            work(item)\n"
+                "        except Exception:\n            if stop:\n"
+                f"                {escape}\n            reject()\n",
+            )
+            candidates = self.scan("--paths", "helpers.py")["candidates"]
+            assert len(candidates) == 1
+            assert "non-raising exit" in candidates[0]["evidence"]
+            assert "re-raises via `reject` (NoReturn)" in candidates[0]["evidence"]
 
     def test_error_washing_deferred_propagation_keeps_hook_fact(self):
         self.put(
@@ -331,21 +313,18 @@ class Py02Tests(ExtractorTestCase):
             """,
         )
         candidates = self.scan("--paths", "hooks.py")["candidates"]
-        self.assertEqual(len(candidates), 3)
+        assert len(candidates) == 3
         for candidate, symbol, line in zip(
             candidates,
             ("saved_retry", "bounded_retry", "cleanup"),
             (5, 14, 27),
             strict=True,
         ):
-            self.assertEqual(candidate["rule"], "PY02_error_washing")
-            self.assertEqual(candidate["symbol"], symbol)
-            self.assertEqual(
-                candidate["evidence"].split("; ")[1:],
-                [
-                    f"json.loads(object_pairs_hook=...) at line {line} is not bare re-raised on every path"
-                ],
-            )
+            assert candidate["rule"] == "PY02_error_washing"
+            assert candidate["symbol"] == symbol
+            assert candidate["evidence"].split("; ")[1:] == [
+                f"json.loads(object_pairs_hook=...) at line {line} is not bare re-raised on every path"
+            ]
 
     def test_error_washing_json_hook_preserves_only_all_path_bare_reraises(self):
         cases = [
@@ -361,39 +340,37 @@ class Py02Tests(ExtractorTestCase):
             ("TypeError", "return {}", False),
         ]
         for caught, body, expected in cases:
-            with self.subTest(caught=caught, body=body):
-                header = f"except {caught} as error:" if caught else "except:"
-                self.put(
-                    "hook.py",
-                    "def load(raw):\n    try:\n"
-                    "        return json.loads(raw, object_pairs_hook=unique)\n    "
-                    + header
-                    + "\n"
-                    + textwrap.indent(body, "        ")
-                    + "\n",
-                )
-                candidates = self.scan("--paths", "hook.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    candidate = candidates[0]
-                    self.assertEqual(candidate["rule"], "PY02_error_washing")
-                    self.assertIn("object_pairs_hook", candidate["evidence"])
-                    self.assertIn("line 3", candidate["evidence"])
-                    if caught == "Exception":
-                        self.assertIn("non-raising", candidate["evidence"])
+            header = f"except {caught} as error:" if caught else "except:"
+            self.put(
+                "hook.py",
+                "def load(raw):\n    try:\n"
+                "        return json.loads(raw, object_pairs_hook=unique)\n    "
+                + header
+                + "\n"
+                + textwrap.indent(body, "        ")
+                + "\n",
+            )
+            candidates = self.scan("--paths", "hook.py")["candidates"]
+            assert len(candidates) == int(expected)
+            if expected:
+                candidate = candidates[0]
+                assert candidate["rule"] == "PY02_error_washing"
+                assert "object_pairs_hook" in candidate["evidence"]
+                assert "line 3" in candidate["evidence"]
+                if caught == "Exception":
+                    assert "non-raising" in candidate["evidence"]
         for body in [
             "return json.loads(raw)",
             "def nested():\n    return json.loads(raw, object_pairs_hook=unique)",
             "reader = lambda: json.loads(raw, object_pairs_hook=unique)",
         ]:
-            with self.subTest(try_body=body):
-                self.put(
-                    "hook.py",
-                    "def load(raw):\n    try:\n"
-                    + textwrap.indent(body, "        ")
-                    + "\n    except ValueError:\n        raise DomainError()\n",
-                )
-                self.assertEqual(self.scan("--paths", "hook.py")["candidates"], [])
+            self.put(
+                "hook.py",
+                "def load(raw):\n    try:\n"
+                + textwrap.indent(body, "        ")
+                + "\n    except ValueError:\n        raise DomainError()\n",
+            )
+            assert self.scan("--paths", "hook.py")["candidates"] == []
 
     def test_error_washing_diff_scope_covers_handler_and_guarded_try_body(self):
         self.init_repo()
@@ -423,21 +400,11 @@ class Py02Tests(ExtractorTestCase):
             ("done()", "rewritten_done()", []),
             ("close()", "rewritten_close()", []),
         ]:
-            with self.subTest(edited=old):
-                path.write_text(source.replace(old, new))
-                tip = self.commit()
-                candidates = self.scan("--base", base, "--tip", tip)["candidates"]
-                self.assertEqual(
-                    [
-                        (c["rule"], c["span"], c["code"], c["change_tag"])
-                        for c in candidates
-                    ],
-                    [
-                        ("PY02_error_washing", span, code, "changed")
-                        for span, code in expected
-                    ],
-                )
-
-
-if __name__ == "__main__":
-    unittest.main()
+            path.write_text(source.replace(old, new))
+            tip = self.commit()
+            candidates = self.scan("--base", base, "--tip", tip)["candidates"]
+            assert [
+                (c["rule"], c["span"], c["code"], c["change_tag"]) for c in candidates
+            ] == [
+                ("PY02_error_washing", span, code, "changed") for span, code in expected
+            ]

@@ -1,7 +1,7 @@
 # ADC Testing & Benchmark Verification Map
 
 Verification for `engineering/anti-defensive-coding` operates in two tiers:
-1. **Tier 1 (In-Repo)**: Deterministic unit tests (`unittest`, `103` test methods across 5 modules) and linter/formatter gates in `/home/roocode/skills`.
+1. **Tier 1 (In-Repo)**: Deterministic unit tests (native `pytest` since `v0.4.3`, `103` tests across 5 modules) and linter/formatter gates (`ruff`, including `PT` `flake8-pytest-style`) in `/home/roocode/skills`.
 2. **Tier 2 (Cross-Repo Benchmark, `~8s`)**: Snapshot capture, multiset version diffing, and lossless site verification in `/home/roocode/adc_scanning_test`.
 
 ---
@@ -12,16 +12,18 @@ Verification for `engineering/anti-defensive-coding` operates in two tiers:
 
 | Task | Command (run from `/home/roocode/skills`) |
 | --- | --- |
-| **Run a single test method (fastest, ~0.1s)** | `uv run python -B -m unittest discover -s engineering/anti-defensive-coding/tests -p <test_module>.py -k <test_method_name>` |
-| **Run a single test module (~0.8s–3.3s)** | `uv run python -B -m unittest discover -s engineering/anti-defensive-coding/tests -p <test_module>.py` |
-| **Run the full unit test suite** | `uv run python -B -m unittest discover -s engineering/anti-defensive-coding/tests` |
+| **Run a single test (fastest, ~0.1s)** | `uv run python -B -m pytest engineering/anti-defensive-coding/tests/<test_module>.py -k <test_name_or_pattern>` |
+| **Run a single test module (~1.3s–4.9s)** | `uv run python -B -m pytest engineering/anti-defensive-coding/tests/<test_module>.py` |
+| **Run the full unit test suite (~12.5s)** | `uv run python -B -m pytest` |
 | **Run linter on scanner & tests** | `uv run ruff check engineering/anti-defensive-coding/scripts engineering/anti-defensive-coding/tests` |
 | **Run formatter check on scanner & tests** | `uv run ruff format --check engineering/anti-defensive-coding/scripts engineering/anti-defensive-coding/tests` |
 | **Run self-scan hygiene gate** | `uv run python engineering/anti-defensive-coding/scripts/scan_python.py --paths engineering/anti-defensive-coding --format json` |
 
+Always invoke `pytest` through `python -B`: `helpers.py` sets `sys.dont_write_bytecode = True` too late to stop `pytest` assertion rewriting from writing `tests/__pycache__`, and `pyproject.toml` disables `.pytest_cache` via `addopts = ["-p", "no:cacheprovider"]`. Both are required by `test_all_modes_leave_full_tree_and_git_status_unchanged`, which asserts `git status --porcelain --ignored` on `/home/roocode/skills` is unchanged. Timings above were measured with CPU turbo boost off; the `v0.4.2` `~8.83s` `unittest` figure was measured with turbo boost on. With turbo off, the `v0.4.2` `unittest` suite takes `11.7s–11.9s` versus `12.45s` under `pytest` (`~5%` runner overhead).
+
 ### 1.2 Unit Test Map (`engineering/anti-defensive-coding/tests/`)
 
-Shared test infrastructure lives in `tests/helpers.py` (`ExtractorTestCase`, which sets `sys.dont_write_bytecode = True`, runs `scan_python.main(argv)` in-process via `cli` / `scan`, provides `cli_subprocess` for real subprocess CLI checks, and manages class-level read-only Git fixtures via `git_template` / `git_fixture` / `use_git_fixture`). Locate test coverage by test module and method-name prefix (never by line number):
+Shared test infrastructure lives in `tests/helpers.py` (plain `ExtractorTestCase` base class collected via `python_classes = ["*Tests", "Test*"]`; sets `sys.dont_write_bytecode = True`; a class-scoped `autouse` `@classmethod` fixture builds the read-only Git template under `tmp_path_factory` and a function-scoped `autouse` fixture binds `self.root` to `tmp_path`; runs `scan_python.main(argv)` in-process via `cli` / `scan`, provides `cli_subprocess` for real subprocess CLI checks, and manages class-level read-only Git fixtures via `git_template` / `git_fixture` / `use_git_fixture`). Tests use plain `assert`, `pytest.raises`, and `@pytest.mark.skipif`; multi-case tests are in-method `for` loops (former `subTest` blocks) so collection stays at `103` items, with `@pytest.mark.parametrize` reserved for new independent P1 tests. Locate test coverage by test module and method-name prefix (never by line number):
 
 | Test Module & Class | Subsystem / Rule | Test Method Prefix / Pattern | What Is Tested |
 | --- | --- | --- | --- |

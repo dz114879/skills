@@ -1,5 +1,4 @@
 import textwrap
-import unittest
 
 from helpers import ExtractorTestCase
 
@@ -11,19 +10,16 @@ class Py05Py09Tests(ExtractorTestCase):
             ("def value():\n    pass", False),
             ("def helper():\n    value = None", True),
         ]:
-            with self.subTest(intervening=intervening):
-                self.put(
-                    "defaults.py",
-                    "def load(raw):\n    value = raw or 1\n"
-                    + textwrap.indent(intervening, "    ")
-                    + "\n    if value is None:\n        return None\n",
-                )
-                candidates = self.scan("--paths", "defaults.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    self.assertEqual(
-                        candidates[0]["rule"], "PY03_default_shadows_check"
-                    )
+            self.put(
+                "defaults.py",
+                "def load(raw):\n    value = raw or 1\n"
+                + textwrap.indent(intervening, "    ")
+                + "\n    if value is None:\n        return None\n",
+            )
+            candidates = self.scan("--paths", "defaults.py")["candidates"]
+            assert len(candidates) == int(expected)
+            if expected:
+                assert candidates[0]["rule"] == "PY03_default_shadows_check"
 
     def test_default_shadows_required_guard_within_five_siblings(self):
         cases = [
@@ -47,30 +43,26 @@ class Py05Py09Tests(ExtractorTestCase):
             ),
         ]
         for default, guard, intervening, expected in cases:
-            with self.subTest(default=default, guard=guard, intervening=intervening):
-                self.put(
-                    "defaults.py",
-                    "def load(raw):\n    value = "
-                    + default
-                    + "\n"
-                    + textwrap.indent(intervening, "    ")
-                    + f"    if {guard}:\n        raise ValueError('required')\n"
-                    + "    return value\n",
+            self.put(
+                "defaults.py",
+                "def load(raw):\n    value = "
+                + default
+                + "\n"
+                + textwrap.indent(intervening, "    ")
+                + f"    if {guard}:\n        raise ValueError('required')\n"
+                + "    return value\n",
+            )
+            candidates = self.scan("--paths", "defaults.py")["candidates"]
+            assert len(candidates) == int(expected)
+            if expected:
+                candidate = candidates[0]
+                assert candidate["rule"] == "PY03_default_shadows_check"
+                assert candidate["span"] == [2, 4 + len(intervening.splitlines())]
+                assert "line 2" in candidate["evidence"]
+                assert (
+                    f"line {3 + len(intervening.splitlines())}" in candidate["evidence"]
                 )
-                candidates = self.scan("--paths", "defaults.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    candidate = candidates[0]
-                    self.assertEqual(candidate["rule"], "PY03_default_shadows_check")
-                    self.assertEqual(
-                        candidate["span"], [2, 4 + len(intervening.splitlines())]
-                    )
-                    self.assertIn("line 2", candidate["evidence"])
-                    self.assertIn(
-                        f"line {3 + len(intervening.splitlines())}",
-                        candidate["evidence"],
-                    )
-                    self.assertIn("Counterweight", candidate["verify"])
+                assert "Counterweight" in candidate["verify"]
         self.put(
             "defaults.py",
             """
@@ -84,7 +76,7 @@ class Py05Py09Tests(ExtractorTestCase):
                     return None
             """,
         )
-        self.assertEqual(self.scan("--paths", "defaults.py")["candidates"], [])
+        assert self.scan("--paths", "defaults.py")["candidates"] == []
 
     def test_get_default_shadows_only_none_guard(self):
         for expression, guard, expected in [
@@ -96,21 +88,18 @@ class Py05Py09Tests(ExtractorTestCase):
             ("data.get('key', None)", "value is None", False),
             ("data.get('key', default)", "value is None", False),
         ]:
-            with self.subTest(expression=expression, guard=guard):
-                self.put(
-                    "defaults.py",
-                    f"def load(data):\n    value: int = {expression}\n"
-                    f"    if {guard}:\n        return None\n    return value\n",
-                )
-                candidates = self.scan("--paths", "defaults.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    self.assertEqual(
-                        candidates[0]["rule"], "PY03_default_shadows_check"
-                    )
-                    self.assertIn("missing keys", candidates[0]["verify"])
-                    self.assertIn("None", candidates[0]["verify"])
-                    self.assertIn("explicitly stored", candidates[0]["verify"])
+            self.put(
+                "defaults.py",
+                f"def load(data):\n    value: int = {expression}\n"
+                f"    if {guard}:\n        return None\n    return value\n",
+            )
+            candidates = self.scan("--paths", "defaults.py")["candidates"]
+            assert len(candidates) == int(expected)
+            if expected:
+                assert candidates[0]["rule"] == "PY03_default_shadows_check"
+                assert "missing keys" in candidates[0]["verify"]
+                assert "None" in candidates[0]["verify"]
+                assert "explicitly stored" in candidates[0]["verify"]
 
     def test_shadow_diff_ignores_unrelated_intervening_sibling(self):
         self.init_repo()
@@ -135,7 +124,7 @@ class Py05Py09Tests(ExtractorTestCase):
                     return None
             """,
         )
-        self.assertEqual(self.scan("--base", base)["candidates"], [])
+        assert self.scan("--base", base)["candidates"] == []
         self.put(
             "defaults.py",
             """
@@ -147,23 +136,20 @@ class Py05Py09Tests(ExtractorTestCase):
             """,
         )
         candidates = self.scan("--base", base)["candidates"]
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["span"], [2, 5])
-        self.assertEqual(candidates[0]["change_tag"], "changed")
-        self.assertEqual(
-            set(candidates[0]),
-            {
-                "id",
-                "rule",
-                "path",
-                "span",
-                "symbol",
-                "change_tag",
-                "code",
-                "evidence",
-                "verify",
-            },
-        )
+        assert len(candidates) == 1
+        assert candidates[0]["span"] == [2, 5]
+        assert candidates[0]["change_tag"] == "changed"
+        assert set(candidates[0]) == {
+            "id",
+            "rule",
+            "path",
+            "span",
+            "symbol",
+            "change_tag",
+            "code",
+            "evidence",
+            "verify",
+        }
 
     def test_dead_parameter_discard_requires_no_other_loads_anywhere(self):
         for body, expected in [
@@ -176,23 +162,22 @@ class Py05Py09Tests(ExtractorTestCase):
             ("_ = old\n_ = old\nreturn 1", False),
             ("return 1", False),
         ]:
-            with self.subTest(body=body):
-                self.put(
-                    "params.py",
-                    'def load(old):\n    """Load."""\n'
-                    + textwrap.indent(body, "    ")
-                    + "\n",
-                )
-                candidates = self.scan("--paths", "params.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    self.assertEqual(candidates[0]["rule"], "PY05_dead_param_evasion")
-                    self.assertEqual(candidates[0]["span"], [3, 3])
-                    self.assertIn("discard", candidates[0]["evidence"])
-                    self.assertIn("'old'", candidates[0]["evidence"])
-                    self.assertIn("line 3", candidates[0]["evidence"])
-                    self.assertIn("caller", candidates[0]["verify"])
-                    self.assertIn("Counterweight", candidates[0]["verify"])
+            self.put(
+                "params.py",
+                'def load(old):\n    """Load."""\n'
+                + textwrap.indent(body, "    ")
+                + "\n",
+            )
+            candidates = self.scan("--paths", "params.py")["candidates"]
+            assert len(candidates) == int(expected)
+            if expected:
+                assert candidates[0]["rule"] == "PY05_dead_param_evasion"
+                assert candidates[0]["span"] == [3, 3]
+                assert "discard" in candidates[0]["evidence"]
+                assert "'old'" in candidates[0]["evidence"]
+                assert "line 3" in candidates[0]["evidence"]
+                assert "caller" in candidates[0]["verify"]
+                assert "Counterweight" in candidates[0]["verify"]
         self.put(
             "params.py",
             """
@@ -203,7 +188,7 @@ class Py05Py09Tests(ExtractorTestCase):
                     return 1
             """,
         )
-        self.assertEqual(self.scan("--paths", "params.py")["candidates"], [])
+        assert self.scan("--paths", "params.py")["candidates"] == []
 
     def test_dead_parameter_entry_overwrite_stops_at_reads_and_control_flow(self):
         for body, expected in [
@@ -230,20 +215,19 @@ class Py05Py09Tests(ExtractorTestCase):
             ('"""Protocol."""\npass\n...\nraise NotImplementedError', False),
             ("raise NotImplementedError('abstract')", False),
         ]:
-            with self.subTest(body=body):
-                self.put(
-                    "params.py",
-                    "def load(old):\n" + textwrap.indent(body, "    ") + "\n",
+            self.put(
+                "params.py",
+                "def load(old):\n" + textwrap.indent(body, "    ") + "\n",
+            )
+            candidates = self.scan("--paths", "params.py")["candidates"]
+            assert len(candidates) == int(expected)
+            if expected:
+                assert candidates[0]["rule"] == "PY05_dead_param_evasion"
+                assert "entry overwrite" in candidates[0]["evidence"]
+                assert "'old'" in candidates[0]["evidence"]
+                assert candidates[0]["span"][0] == (
+                    3 if body.startswith("log()") else 2
                 )
-                candidates = self.scan("--paths", "params.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    self.assertEqual(candidates[0]["rule"], "PY05_dead_param_evasion")
-                    self.assertIn("entry overwrite", candidates[0]["evidence"])
-                    self.assertIn("'old'", candidates[0]["evidence"])
-                    self.assertEqual(
-                        candidates[0]["span"][0], 3 if body.startswith("log()") else 2
-                    )
         self.put(
             "params.py",
             """
@@ -257,9 +241,7 @@ class Py05Py09Tests(ExtractorTestCase):
             """,
         )
         candidates = self.scan("--paths", "params.py")["candidates"]
-        self.assertEqual(
-            [c["symbol"] for c in candidates], ["Model.load", "Model.load"]
-        )
+        assert [c["symbol"] for c in candidates] == ["Model.load", "Model.load"]
 
     def test_dead_parameter_dual_fallback_in_entry_prefix(self):
         for signature, before, rhs, after, expected in [
@@ -273,28 +255,27 @@ class Py05Py09Tests(ExtractorTestCase):
             ("old, new=None", "if ready:\n    log()\n", "old", "", False),
             ("old, new=None", "return 1\n", "old", "", False),
         ]:
-            with self.subTest(signature=signature, before=before, after=after):
-                self.put(
-                    "params.py",
-                    f"def load({signature}):\n"
-                    + textwrap.indent(before, "    ")
-                    + f"    if new is None:\n        new = {rhs}\n"
-                    + textwrap.indent(after, "    ")
-                    + "    return new\n",
-                )
-                candidates = self.scan("--paths", "params.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    candidate = candidates[0]
-                    self.assertEqual(candidate["rule"], "PY05_dead_param_evasion")
-                    self.assertIn("dual-parameter", candidate["evidence"])
-                    self.assertIn("'old'", candidate["evidence"])
-                    self.assertIn("'new'", candidate["evidence"])
-                    self.assertIn("default None at line 1", candidate["evidence"])
-                    self.assertEqual(
-                        candidate["span"],
-                        [2 + len(before.splitlines()), 3 + len(before.splitlines())],
-                    )
+            self.put(
+                "params.py",
+                f"def load({signature}):\n"
+                + textwrap.indent(before, "    ")
+                + f"    if new is None:\n        new = {rhs}\n"
+                + textwrap.indent(after, "    ")
+                + "    return new\n",
+            )
+            candidates = self.scan("--paths", "params.py")["candidates"]
+            assert len(candidates) == int(expected)
+            if expected:
+                candidate = candidates[0]
+                assert candidate["rule"] == "PY05_dead_param_evasion"
+                assert "dual-parameter" in candidate["evidence"]
+                assert "'old'" in candidate["evidence"]
+                assert "'new'" in candidate["evidence"]
+                assert "default None at line 1" in candidate["evidence"]
+                assert candidate["span"] == [
+                    2 + len(before.splitlines()),
+                    3 + len(before.splitlines()),
+                ]
 
     def test_diff_eligibility_excludes_noncontributing_else_branches(self):
         original = textwrap.dedent("""
@@ -316,7 +297,7 @@ class Py05Py09Tests(ExtractorTestCase):
             {"branches.py": original},
             working_files={"branches.py": original.replace("'before'", "'after'")},
         )
-        self.assertEqual(self.scan("--base", base)["candidates"], [])
+        assert self.scan("--base", base)["candidates"] == []
 
     def test_transient_self_state_requires_matching_try_and_finally_writes(self):
         for body, cleanup, handler, expected in [
@@ -346,26 +327,25 @@ class Py05Py09Tests(ExtractorTestCase):
                 False,
             ),
         ]:
-            with self.subTest(body=body, cleanup=cleanup, handler=handler):
-                self.put(
-                    "state.py",
-                    "class Runner:\n    def run(self):\n        try:\n"
-                    + textwrap.indent(body, "            ")
-                    + "\n"
-                    + textwrap.indent(handler, "        ")
-                    + "        finally:\n"
-                    + textwrap.indent(cleanup, "            ")
-                    + "\n",
-                )
-                candidates = self.scan("--paths", "state.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    candidate = candidates[0]
-                    self.assertEqual(candidate["rule"], "PY07_state_smuggling")
-                    self.assertEqual(candidate["symbol"], "Runner.run")
-                    self.assertIn("self.context", candidate["evidence"])
-                    self.assertIn("finally", candidate["evidence"])
-                    self.assertIn("Counterweight", candidate["verify"])
+            self.put(
+                "state.py",
+                "class Runner:\n    def run(self):\n        try:\n"
+                + textwrap.indent(body, "            ")
+                + "\n"
+                + textwrap.indent(handler, "        ")
+                + "        finally:\n"
+                + textwrap.indent(cleanup, "            ")
+                + "\n",
+            )
+            candidates = self.scan("--paths", "state.py")["candidates"]
+            assert len(candidates) == int(expected)
+            if expected:
+                candidate = candidates[0]
+                assert candidate["rule"] == "PY07_state_smuggling"
+                assert candidate["symbol"] == "Runner.run"
+                assert "self.context" in candidate["evidence"]
+                assert "finally" in candidate["evidence"]
+                assert "Counterweight" in candidate["verify"]
 
     def test_same_class_stash_needs_an_immediate_return_and_a_sibling_reader(self):
         made = "payload = compose()\n"
@@ -403,24 +383,23 @@ class Py05Py09Tests(ExtractorTestCase):
                 None,
             ),
         ]:
-            with self.subTest(writer=writer, reader=reader):
-                self.put(
-                    "state.py",
-                    "class Provider:\n    def build(self):\n"
-                    + textwrap.indent(writer, "        ")
-                    + "\n    def dump(self):\n"
-                    + textwrap.indent(reader, "        ")
-                    + "\n",
-                )
-                candidates = self.scan("--paths", "state.py")["candidates"]
-                self.assertEqual(len(candidates), int(span is not None))
-                if span is not None:
-                    candidate = candidates[0]
-                    self.assertEqual(candidate["rule"], "PY07_state_smuggling")
-                    self.assertEqual(candidate["symbol"], "Provider.build")
-                    self.assertEqual(candidate["span"], span)
-                    self.assertIn("self._last", candidate["evidence"])
-                    self.assertIn(f"dump at line {span[1]}", candidate["evidence"])
+            self.put(
+                "state.py",
+                "class Provider:\n    def build(self):\n"
+                + textwrap.indent(writer, "        ")
+                + "\n    def dump(self):\n"
+                + textwrap.indent(reader, "        ")
+                + "\n",
+            )
+            candidates = self.scan("--paths", "state.py")["candidates"]
+            assert len(candidates) == int(span is not None)
+            if span is not None:
+                candidate = candidates[0]
+                assert candidate["rule"] == "PY07_state_smuggling"
+                assert candidate["symbol"] == "Provider.build"
+                assert candidate["span"] == span
+                assert "self._last" in candidate["evidence"]
+                assert f"dump at line {span[1]}" in candidate["evidence"]
 
     def test_dict_dependency_smuggling_requires_final_key_token_and_object_value(self):
         for key, expected in [
@@ -444,18 +423,15 @@ class Py05Py09Tests(ExtractorTestCase):
                 f"data[{key!r}] = dep",
                 f"return {{{key!r}: owner.dep}}",
             ]:
-                with self.subTest(key=key, expression=expression):
-                    self.put(
-                        "state.py", "def pack(data, dep, owner):\n    " + expression
-                    )
-                    candidates = self.scan("--paths", "state.py")["candidates"]
-                    self.assertEqual(len(candidates), int(expected))
-                    if expected:
-                        candidate = candidates[0]
-                        self.assertEqual(candidate["rule"], "PY07_state_smuggling")
-                        self.assertIn(key, candidate["evidence"])
-                        self.assertIn("line 2", candidate["evidence"])
-                        self.assertIn("Counterweight", candidate["verify"])
+                self.put("state.py", "def pack(data, dep, owner):\n    " + expression)
+                candidates = self.scan("--paths", "state.py")["candidates"]
+                assert len(candidates) == int(expected)
+                if expected:
+                    candidate = candidates[0]
+                    assert candidate["rule"] == "PY07_state_smuggling"
+                    assert key in candidate["evidence"]
+                    assert "line 2" in candidate["evidence"]
+                    assert "Counterweight" in candidate["verify"]
         for expression in [
             'data["session"] = None',
             'data["service"] = make_service()',
@@ -464,11 +440,10 @@ class Py05Py09Tests(ExtractorTestCase):
             'return {"conn": lambda: dep}',
             "return {key: dep}",
         ]:
-            with self.subTest(expression=expression):
-                self.put("state.py", "def pack(data, dep):\n    " + expression)
-                self.assertEqual(self.scan("--paths", "state.py")["candidates"], [])
+            self.put("state.py", "def pack(data, dep):\n    " + expression)
+            assert self.scan("--paths", "state.py")["candidates"] == []
         self.put("state.py", 'data = {"session": dep}\n')
-        self.assertEqual(self.scan("--paths", "state.py")["candidates"], [])
+        assert self.scan("--paths", "state.py")["candidates"] == []
 
     def test_roundtrip_conversions_require_the_complete_nested_chain(self):
         for expression, expected in [
@@ -489,15 +464,14 @@ class Py05Py09Tests(ExtractorTestCase):
             ("set(list(values))", False),
             ("list(set(values))", False),
         ]:
-            with self.subTest(expression=expression):
-                self.put("churn.py", "result = " + expression + "\n")
-                candidates = self.scan("--paths", "churn.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    self.assertEqual(candidates[0]["rule"], "PY08_roundtrip_and_copy")
-                    self.assertEqual(candidates[0]["code"], expression)
-                    self.assertIn("line 1", candidates[0]["evidence"])
-                    self.assertIn("Counterweight", candidates[0]["verify"])
+            self.put("churn.py", "result = " + expression + "\n")
+            candidates = self.scan("--paths", "churn.py")["candidates"]
+            assert len(candidates) == int(expected)
+            if expected:
+                assert candidates[0]["rule"] == "PY08_roundtrip_and_copy"
+                assert candidates[0]["code"] == expression
+                assert "line 1" in candidates[0]["evidence"]
+                assert "Counterweight" in candidates[0]["verify"]
 
     def test_dict_comprehension_rewrap_requires_exact_target_argument(self):
         for expression, expected in [
@@ -511,14 +485,13 @@ class Py05Py09Tests(ExtractorTestCase):
             ("[dict(row) for obj.row in rows]", False),
             ("(dict(row) for row in rows)", False),
         ]:
-            with self.subTest(expression=expression):
-                self.put("churn.py", "result = " + expression + "\n")
-                candidates = self.scan("--paths", "churn.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    self.assertEqual(candidates[0]["rule"], "PY08_roundtrip_and_copy")
-                    self.assertIn("row", candidates[0]["evidence"])
-                    self.assertIn("line 1", candidates[0]["evidence"])
+            self.put("churn.py", "result = " + expression + "\n")
+            candidates = self.scan("--paths", "churn.py")["candidates"]
+            assert len(candidates) == int(expected)
+            if expected:
+                assert candidates[0]["rule"] == "PY08_roundtrip_and_copy"
+                assert "row" in candidates[0]["evidence"]
+                assert "line 1" in candidates[0]["evidence"]
 
     def test_dict_rewrap_evidence_names_the_enclosing_function_row_factory(self):
         self.put(
@@ -557,18 +530,13 @@ class Py05Py09Tests(ExtractorTestCase):
             for candidate in self.scan("--paths", "rows.py")["candidates"]
             if candidate["rule"] == "PY08_roundtrip_and_copy"
         }
-        self.assertEqual(
-            set(evidence), {"Store.tagged", "Store.untagged", "Store.nested"}
+        assert set(evidence) == {"Store.tagged", "Store.untagged", "Store.nested"}
+        assert (
+            "conn.row_factory = self.db.dict_row at line 12" in evidence["Store.tagged"]
         )
-        self.assertIn(
-            "conn.row_factory = self.db.dict_row at line 12", evidence["Store.tagged"]
-        )
-        self.assertIn(
-            "self.conn.row_factory = None at line 14", evidence["Store.tagged"]
-        )
+        assert "self.conn.row_factory = None at line 14" in evidence["Store.tagged"]
         for symbol in ["Store.untagged", "Store.nested"]:
-            with self.subTest(symbol=symbol):
-                self.assertNotIn("row_factory", evidence[symbol])
+            assert "row_factory" not in evidence[symbol]
 
     def test_copy_churn_requires_per_iteration_execution_without_nested_scopes(self):
         for body, expected in [
@@ -606,18 +574,15 @@ class Py05Py09Tests(ExtractorTestCase):
                 1,
             ),
         ]:
-            with self.subTest(body=body):
-                self.put(
-                    "churn.py", "async def run():\n" + textwrap.indent(body, "    ")
-                )
-                candidates = self.scan("--paths", "churn.py")["candidates"]
-                self.assertEqual(len(candidates), expected)
-                if expected:
-                    candidate = candidates[0]
-                    self.assertEqual(candidate["rule"], "PY08_roundtrip_and_copy")
-                    self.assertIn("iteration", candidate["evidence"])
-                    self.assertIn("line", candidate["evidence"])
-                    self.assertIn("Counterweight", candidate["verify"])
+            self.put("churn.py", "async def run():\n" + textwrap.indent(body, "    "))
+            candidates = self.scan("--paths", "churn.py")["candidates"]
+            assert len(candidates) == expected
+            if expected:
+                candidate = candidates[0]
+                assert candidate["rule"] == "PY08_roundtrip_and_copy"
+                assert "iteration" in candidate["evidence"]
+                assert "line" in candidate["evidence"]
+                assert "Counterweight" in candidate["verify"]
 
     def test_lock_io_and_hashing_use_context_tokens_and_stop_at_nested_scopes(self):
         prompts = {True: set(), False: set()}
@@ -642,25 +607,24 @@ class Py05Py09Tests(ExtractorTestCase):
             ("sessions[lock_id]", False),
         ]:
             for keyword in ["with", "async with"]:
-                with self.subTest(context=context, keyword=keyword):
-                    self.put(
-                        "locking.py",
-                        f"async def run():\n    {keyword} {context}:\n"
-                        "        path.read_text()\n",
+                self.put(
+                    "locking.py",
+                    f"async def run():\n    {keyword} {context}:\n"
+                    "        path.read_text()\n",
+                )
+                candidates = self.scan("--paths", "locking.py")["candidates"]
+                assert len(candidates) == int(expected)
+                if expected:
+                    candidate = candidates[0]
+                    assert candidate["rule"] == "PY09_io_or_tx_in_lock"
+                    assert candidate["span"] == [2, 3]
+                    assert "line 2" in candidate["evidence"]
+                    assert context in candidate["evidence"]
+                    assert "Counterweight" in candidate["verify"]
+                    prompts[context.startswith(("conn.", "db."))].add(
+                        candidate["verify"]
                     )
-                    candidates = self.scan("--paths", "locking.py")["candidates"]
-                    self.assertEqual(len(candidates), int(expected))
-                    if expected:
-                        candidate = candidates[0]
-                        self.assertEqual(candidate["rule"], "PY09_io_or_tx_in_lock")
-                        self.assertEqual(candidate["span"], [2, 3])
-                        self.assertIn("line 2", candidate["evidence"])
-                        self.assertIn(context, candidate["evidence"])
-                        self.assertIn("Counterweight", candidate["verify"])
-                        prompts[context.startswith(("conn.", "db."))].add(
-                            candidate["verify"]
-                        )
-        self.assertTrue(prompts[True].isdisjoint(prompts[False]))
+        assert prompts[True].isdisjoint(prompts[False])
         for expression, expected in [
             ("open(path)", True),
             ("path.open()", True),
@@ -687,28 +651,26 @@ class Py05Py09Tests(ExtractorTestCase):
             ("followup.send(message)", False),
             ("interaction.response.send_message(message)", False),
         ]:
-            with self.subTest(expression=expression):
-                self.put(
-                    "locking.py",
-                    "with outer_lock:\n    with inner_lock:\n        " + expression,
-                )
-                candidates = self.scan("--paths", "locking.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    self.assertEqual(candidates[0]["rule"], "PY09_io_or_tx_in_lock")
-                    self.assertIn("outer_lock", candidates[0]["evidence"])
-                    self.assertIn("inner_lock", candidates[0]["evidence"])
+            self.put(
+                "locking.py",
+                "with outer_lock:\n    with inner_lock:\n        " + expression,
+            )
+            candidates = self.scan("--paths", "locking.py")["candidates"]
+            assert len(candidates) == int(expected)
+            if expected:
+                assert candidates[0]["rule"] == "PY09_io_or_tx_in_lock"
+                assert "outer_lock" in candidates[0]["evidence"]
+                assert "inner_lock" in candidates[0]["evidence"]
         for body in [
             "def callback():\n    open(path)",
             "async def callback():\n    path.write_text(text)",
             "class Callback:\n    data = path.read_bytes()",
             "callback = lambda: sha256(data)",
         ]:
-            with self.subTest(body=body):
-                self.put("locking.py", "with lock:\n" + textwrap.indent(body, "    "))
-                self.assertEqual(self.scan("--paths", "locking.py")["candidates"], [])
+            self.put("locking.py", "with lock:\n" + textwrap.indent(body, "    "))
+            assert self.scan("--paths", "locking.py")["candidates"] == []
         self.put("locking.py", "open(path)\nhashlib.sha256(data)\n")
-        self.assertEqual(self.scan("--paths", "locking.py")["candidates"], [])
+        assert self.scan("--paths", "locking.py")["candidates"] == []
         self.put(
             "locking.py",
             "async def run(user_locks, user_id, interaction):\n"
@@ -716,11 +678,11 @@ class Py05Py09Tests(ExtractorTestCase):
             "        await interaction.followup.send('inside')\n",
         )
         candidates = self.scan("--paths", "locking.py")["candidates"]
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["rule"], "PY09_io_or_tx_in_lock")
-        self.assertEqual(candidates[0]["span"], [2, 3])
-        self.assertIn("interaction.followup.send", candidates[0]["evidence"])
-        self.assertIn("user_locks[user_id]", candidates[0]["evidence"])
+        assert len(candidates) == 1
+        assert candidates[0]["rule"] == "PY09_io_or_tx_in_lock"
+        assert candidates[0]["span"] == [2, 3]
+        assert "interaction.followup.send" in candidates[0]["evidence"]
+        assert "user_locks[user_id]" in candidates[0]["evidence"]
         self.put(
             "locking.py",
             "async def run(user_locks, user_id, interaction):\n"
@@ -728,7 +690,7 @@ class Py05Py09Tests(ExtractorTestCase):
             "        reply = 'outside'\n"
             "    await interaction.followup.send(reply)\n",
         )
-        self.assertEqual(self.scan("--paths", "locking.py")["candidates"], [])
+        assert self.scan("--paths", "locking.py")["candidates"] == []
 
     def test_nested_transaction_contexts_are_reported_once_in_acquisition_order(self):
         for body, expected in [
@@ -757,16 +719,13 @@ class Py05Py09Tests(ExtractorTestCase):
             ),
             ("with conn.savepoint():\n    work()", 0),
         ]:
-            with self.subTest(body=body):
-                self.put(
-                    "locking.py", "async def run():\n" + textwrap.indent(body, "    ")
-                )
-                candidates = self.scan("--paths", "locking.py")["candidates"]
-                self.assertEqual(len(candidates), expected)
-                if expected:
-                    self.assertEqual(candidates[0]["rule"], "PY09_io_or_tx_in_lock")
-                    self.assertIn("with", candidates[0]["evidence"])
-                    self.assertIn("Counterweight", candidates[0]["verify"])
+            self.put("locking.py", "async def run():\n" + textwrap.indent(body, "    "))
+            candidates = self.scan("--paths", "locking.py")["candidates"]
+            assert len(candidates) == expected
+            if expected:
+                assert candidates[0]["rule"] == "PY09_io_or_tx_in_lock"
+                assert "with" in candidates[0]["evidence"]
+                assert "Counterweight" in candidates[0]["verify"]
 
     def test_transaction_entry_requires_a_check_in_the_same_function_scope(self):
         for check, context, expected in [
@@ -799,23 +758,22 @@ class Py05Py09Tests(ExtractorTestCase):
                 False,
             ),
         ]:
-            with self.subTest(check=check, context=context):
-                self.put(
-                    "locking.py",
-                    "async def run():\n"
-                    + textwrap.indent(check, "    ")
-                    + f"\n    async with {context}:\n        work()\n",
-                )
-                candidates = self.scan("--paths", "locking.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    candidate = candidates[0]
-                    self.assertEqual(candidate["rule"], "PY09_io_or_tx_in_lock")
-                    self.assertEqual(candidate["symbol"], "run")
-                    self.assertIn("in_transaction", candidate["evidence"])
-                    self.assertIn("line 2", candidate["evidence"])
-                    self.assertIn(context, candidate["evidence"])
-                    self.assertIn("Counterweight", candidate["verify"])
+            self.put(
+                "locking.py",
+                "async def run():\n"
+                + textwrap.indent(check, "    ")
+                + f"\n    async with {context}:\n        work()\n",
+            )
+            candidates = self.scan("--paths", "locking.py")["candidates"]
+            assert len(candidates) == int(expected)
+            if expected:
+                candidate = candidates[0]
+                assert candidate["rule"] == "PY09_io_or_tx_in_lock"
+                assert candidate["symbol"] == "run"
+                assert "in_transaction" in candidate["evidence"]
+                assert "line 2" in candidate["evidence"]
+                assert context in candidate["evidence"]
+                assert "Counterweight" in candidate["verify"]
         self.put(
             "locking.py",
             """
@@ -829,7 +787,7 @@ class Py05Py09Tests(ExtractorTestCase):
                     work()
             """,
         )
-        self.assertEqual(self.scan("--paths", "locking.py")["candidates"], [])
+        assert self.scan("--paths", "locking.py")["candidates"] == []
 
     def test_transaction_checks_include_boolean_expressions_and_filter_guards(self):
         for check, line in [
@@ -840,17 +798,16 @@ class Py05Py09Tests(ExtractorTestCase):
             ("selected = [row for row in rows if conn.in_transaction]", 2),
             ("match value:\n    case _ if conn.in_transaction:\n        work()", 3),
         ]:
-            with self.subTest(check=check):
-                self.put(
-                    "locking.py",
-                    "def run():\n"
-                    + textwrap.indent(check, "    ")
-                    + "\n    with conn.transaction():\n        work()\n",
-                )
-                candidates = self.scan("--paths", "locking.py")["candidates"]
-                self.assertEqual(len(candidates), 1)
-                self.assertEqual(candidates[0]["rule"], "PY09_io_or_tx_in_lock")
-                self.assertIn(f"line {line}", candidates[0]["evidence"])
+            self.put(
+                "locking.py",
+                "def run():\n"
+                + textwrap.indent(check, "    ")
+                + "\n    with conn.transaction():\n        work()\n",
+            )
+            candidates = self.scan("--paths", "locking.py")["candidates"]
+            assert len(candidates) == 1
+            assert candidates[0]["rule"] == "PY09_io_or_tx_in_lock"
+            assert f"line {line}" in candidates[0]["evidence"]
 
     def test_lock_header_added_around_unchanged_io_is_diff_eligible(self):
         base = self.use_git_fixture(
@@ -861,11 +818,11 @@ class Py05Py09Tests(ExtractorTestCase):
             },
         )
         candidates = self.scan("--base", base)["candidates"]
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["rule"], "PY09_io_or_tx_in_lock")
-        self.assertEqual(candidates[0]["change_tag"], "changed")
-        self.assertEqual(candidates[0]["span"], [2, 3])
-        self.assertIn("with lock at line 2", candidates[0]["evidence"])
+        assert len(candidates) == 1
+        assert candidates[0]["rule"] == "PY09_io_or_tx_in_lock"
+        assert candidates[0]["change_tag"] == "changed"
+        assert candidates[0]["span"] == [2, 3]
+        assert "with lock at line 2" in candidates[0]["evidence"]
 
     def test_state_and_lock_diff_eligibility_uses_only_contributing_children(self):
         self.init_repo()
@@ -917,14 +874,9 @@ class Py05Py09Tests(ExtractorTestCase):
             ("conn.transaction()", "conn.savepoint()", "PY09_io_or_tx_in_lock"),
             ("unrelated_transaction()", "new_transaction_work()", None),
         ]:
-            with self.subTest(before=before):
-                self.put("scope.py", original.replace(before, after))
-                candidates = self.scan("--base", base)["candidates"]
-                self.assertEqual(len(candidates), int(expected is not None))
-                if expected:
-                    self.assertEqual(candidates[0]["rule"], expected)
-                    self.assertEqual(candidates[0]["change_tag"], "changed")
-
-
-if __name__ == "__main__":
-    unittest.main()
+            self.put("scope.py", original.replace(before, after))
+            candidates = self.scan("--base", base)["candidates"]
+            assert len(candidates) == int(expected is not None)
+            if expected:
+                assert candidates[0]["rule"] == expected
+                assert candidates[0]["change_tag"] == "changed"

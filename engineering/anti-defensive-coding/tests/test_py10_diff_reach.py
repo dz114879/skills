@@ -6,10 +6,10 @@ import json
 import runpy
 import sys
 import textwrap
-import unittest
 from unittest.mock import patch
 
 from helpers import SCRIPT, ExtractorTestCase
+import pytest
 
 
 class Py10DiffReachTests(ExtractorTestCase):
@@ -47,9 +47,7 @@ class Py10DiffReachTests(ExtractorTestCase):
         self.git("mv", "move.py", "relocated.py")
         result = self.scan("--base", base)
         moved = [c for c in result["candidates"] if c["rule"] == "PY10a_moved_defense"]
-        self.assertEqual(
-            {c["path"] for c in moved}, {f"{name}.py" for name in defenses}
-        )
+        assert {c["path"] for c in moved} == {f"{name}.py" for name in defenses}
         expected_moved = {
             "reflect.py": (
                 "Receiver item; parameter item: <unannotated> at line 4; "
@@ -74,18 +72,18 @@ class Py10DiffReachTests(ExtractorTestCase):
         }
         for candidate in moved:
             expected_evidence, base_section = expected_moved[candidate["path"]]
-            self.assertEqual(candidate["symbol"], "destination")
-            self.assertEqual(candidate["change_tag"], "moved-defense")
-            self.assertEqual(candidate["evidence"], expected_evidence)
-            self.assertEqual(
-                candidate["verify"],
-                "Open the origin first: did it guard the same producer, "
+            assert candidate["symbol"] == "destination"
+            assert candidate["change_tag"] == "moved-defense"
+            assert candidate["evidence"] == expected_evidence
+            assert (
+                candidate["verify"]
+                == "Open the origin first: did it guard the same producer, "
                 "receiver or exception source? If so, did this callee become "
                 "the owner, or is it a relocated hedge (a genuine boundary is "
                 "a Counterweight)? If not, verify this defense on its own "
-                f"under {base_section}. See python.md §4.",
+                f"under {base_section}. See python.md §4."
             )
-        self.assertEqual(result["candidates"], moved)
+        assert result["candidates"] == moved
 
     def test_moved_defense_maps_git_rename_and_requires_signature_loss(self):
         self.init_repo()
@@ -102,31 +100,28 @@ class Py10DiffReachTests(ExtractorTestCase):
             padding
             + 'class Owner:\n    def original(self, item):\n        return item.value\n\n    def destination(self, item):\n        return hasattr(item, "value")\n',
         )
-        self.assertIn("R", self.git("diff", "-M", "--name-status", base))
+        assert "R" in self.git("diff", "-M", "--name-status", base)
         candidates = self.scan("--base", base)["candidates"]
-        self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["rule"], "PY10a_moved_defense")
-        self.assertEqual(candidates[0]["symbol"], "Owner.destination")
-        self.assertEqual(candidates[0]["path"], "new.py")
-        self.assertIn(
+        assert len(candidates) == 1
+        assert candidates[0]["rule"] == "PY10a_moved_defense"
+        assert candidates[0]["symbol"] == "Owner.destination"
+        assert candidates[0]["path"] == "new.py"
+        assert (
             "Receiver item; parameter item: <unannotated> at line 45; "
             "receiver class unknown; same PY01_reflect_default signature "
             "'value' lost from base old.py:43 (Owner.original) "
-            "(signature match only)",
-            candidates[0]["evidence"],
+            "(signature match only)" in candidates[0]["evidence"]
         )
         self.put(
             "new.py",
             padding
             + 'class Owner:\n    def original(self, item):\n        return getattr(item, "value", None)\n\n    def destination(self, item):\n        return hasattr(item, "value")\n',
         )
-        self.assertFalse(
-            [
-                c
-                for c in self.scan("--base", base)["candidates"]
-                if c["rule"] == "PY10a_moved_defense"
-            ]
-        )
+        assert not [
+            c
+            for c in self.scan("--base", base)["candidates"]
+            if c["rule"] == "PY10a_moved_defense"
+        ]
 
     def test_moved_defense_normalizes_signatures_across_files(self):
         self.init_repo()
@@ -154,14 +149,11 @@ class Py10DiffReachTests(ExtractorTestCase):
                 "def destination(item):\n" + textwrap.indent(after, "    ") + "\n",
             )
         candidates = self.scan("--base", base)["candidates"]
-        self.assertEqual(
-            [(c["path"], c["rule"]) for c in candidates],
-            [
-                ("new0.py", "PY10a_moved_defense"),
-                ("new1.py", "PY10a_moved_defense"),
-                ("new2.py", "PY10a_moved_defense"),
-            ],
-        )
+        assert [(c["path"], c["rule"]) for c in candidates] == [
+            ("new0.py", "PY10a_moved_defense"),
+            ("new1.py", "PY10a_moved_defense"),
+            ("new2.py", "PY10a_moved_defense"),
+        ]
         for index, (_, after) in enumerate(pairs):
             self.put(
                 f"new{index}.py",
@@ -172,13 +164,11 @@ class Py10DiffReachTests(ExtractorTestCase):
                 )
                 + "\n",
             )
-        self.assertFalse(
-            [
-                c
-                for c in self.scan("--base", base)["candidates"]
-                if c["rule"] == "PY10a_moved_defense"
-            ]
-        )
+        assert not [
+            c
+            for c in self.scan("--base", base)["candidates"]
+            if c["rule"] == "PY10a_moved_defense"
+        ]
 
     def test_moved_defense_skips_signatures_with_more_destinations_than_origins(self):
         self.init_repo()
@@ -222,34 +212,29 @@ class Py10DiffReachTests(ExtractorTestCase):
                 {"alpha": ["first", "second"], "beta": ["first", "second"]},
             ),
         ]:
-            with self.subTest(lost=lost, gained=gained):
-                tip = history(lost, gained)
-                candidates = self.scan("--base", base, "--tip", tip)["candidates"]
-                moved = {
-                    c["symbol"]: c["evidence"]
-                    for c in candidates
-                    if c["rule"] == "PY10a_moved_defense"
-                }
-                self.assertEqual(len(candidates), len(gained))
-                self.assertEqual(set(moved), set(expected))
-                for symbol, names in expected.items():
-                    self.assertIn("Handler catches Exception at line", moved[symbol])
-                    self.assertIn(
-                        "; same PY02_error_washing signature Exception lost from ",
-                        moved[symbol],
-                    )
-                    self.assertIn("signature match only", moved[symbol])
-                    for name in names:
-                        self.assertIn(origins[name], moved[symbol])
-                self.assertEqual(
-                    {
-                        c["symbol"]
-                        for c in candidates
-                        if c["rule"] == "PY02_error_washing"
-                        and c["change_tag"] == "changed"
-                    },
-                    set(gained) - set(expected),
+            tip = history(lost, gained)
+            candidates = self.scan("--base", base, "--tip", tip)["candidates"]
+            moved = {
+                c["symbol"]: c["evidence"]
+                for c in candidates
+                if c["rule"] == "PY10a_moved_defense"
+            }
+            assert len(candidates) == len(gained)
+            assert set(moved) == set(expected)
+            for symbol, names in expected.items():
+                assert "Handler catches Exception at line" in moved[symbol]
+                assert (
+                    "; same PY02_error_washing signature Exception lost from "
+                    in moved[symbol]
                 )
+                assert "signature match only" in moved[symbol]
+                for name in names:
+                    assert origins[name] in moved[symbol]
+            assert {
+                c["symbol"]
+                for c in candidates
+                if c["rule"] == "PY02_error_washing" and c["change_tag"] == "changed"
+            } == set(gained) - set(expected)
 
     def test_moved_defense_destination_must_intersect_added_lines(self):
         self.init_repo()
@@ -274,25 +259,22 @@ class Py10DiffReachTests(ExtractorTestCase):
                 ],
             ),
         ]:
-            with self.subTest(body=body):
-                self.put(
-                    "app.py",
-                    "def original(item):\n    return item.value\n\n\n"
-                    "def new_name(item, other=None):\n" + body,
-                )
-                tip = self.commit()
-                candidates = self.scan("--base", base, "--tip", tip)["candidates"]
-                self.assertEqual(
-                    [(c["rule"], c["change_tag"], c["span"]) for c in candidates],
-                    expected,
-                )
-                for candidate in candidates:
-                    if candidate["rule"] == "PY10a_moved_defense":
-                        self.assertIn(
-                            "; same PY01_reflect_default signature 'value' "
-                            "lost from base app.py:2 (original)",
-                            candidate["evidence"],
-                        )
+            self.put(
+                "app.py",
+                "def original(item):\n    return item.value\n\n\n"
+                "def new_name(item, other=None):\n" + body,
+            )
+            tip = self.commit()
+            candidates = self.scan("--base", base, "--tip", tip)["candidates"]
+            assert [
+                (c["rule"], c["change_tag"], c["span"]) for c in candidates
+            ] == expected
+            for candidate in candidates:
+                if candidate["rule"] == "PY10a_moved_defense":
+                    assert (
+                        "; same PY01_reflect_default signature 'value' "
+                        "lost from base app.py:2 (original)" in candidate["evidence"]
+                    )
 
     def test_moved_defense_handles_non_named_exception_types_without_crashing(self):
         base = self.use_git_fixture(
@@ -317,8 +299,8 @@ class Py10DiffReachTests(ExtractorTestCase):
             for c in self.scan("--base", base)["candidates"]
             if c["rule"] == "PY10a_moved_defense"
         ]
-        self.assertEqual(len(moved), 1)
-        self.assertEqual(moved[0]["symbol"], "destination")
+        assert len(moved) == 1
+        assert moved[0]["symbol"] == "destination"
 
     def test_test_smells_legacy_raw_text_getter_mutation_and_self_patch(self):
         cases = [
@@ -425,19 +407,18 @@ class Py10DiffReachTests(ExtractorTestCase):
             ),
         ]
         for label, body, expected in cases:
-            with self.subTest(label=label):
-                self.put(
-                    "tests/test_case.py",
-                    "def test_case(self, obj, other, monkeypatch):\n"
-                    + textwrap.indent(body, "    ")
-                    + "\n",
-                )
-                candidates = self.scan("--paths", "tests/test_case.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected), candidates)
-                if expected:
-                    self.assertEqual(candidates[0]["rule"], "PY10b_test_smell")
-                    self.assertEqual(candidates[0]["symbol"], "test_case")
-                    self.assertIn("Counterweight", candidates[0]["verify"])
+            self.put(
+                "tests/test_case.py",
+                "def test_case(self, obj, other, monkeypatch):\n"
+                + textwrap.indent(body, "    ")
+                + "\n",
+            )
+            candidates = self.scan("--paths", "tests/test_case.py")["candidates"]
+            assert len(candidates) == int(expected), (label, candidates)
+            if expected:
+                assert candidates[0]["rule"] == "PY10b_test_smell"
+                assert candidates[0]["symbol"] == "test_case"
+                assert "Counterweight" in candidates[0]["verify"]
 
     def test_test_smell_verify_points_to_its_subprobe_catalogue(self):
         for body, pointer in [
@@ -446,15 +427,14 @@ class Py10DiffReachTests(ExtractorTestCase):
             ("r = obj.items()\nr.append(1)\nobj.items()", "tests.md §2"),
             ('with patch("app.execute"):\n    execute()', "tests.md §5"),
         ]:
-            with self.subTest(pointer=pointer):
-                self.put(
-                    "tests/test_case.py",
-                    "def test_case():\n" + textwrap.indent(body, "    ") + "\n",
-                )
-                candidates = self.scan("--paths", "tests/test_case.py")["candidates"]
-                self.assertEqual(len(candidates), 1)
-                self.assertEqual(candidates[0]["rule"], "PY10b_test_smell")
-                self.assertIn(pointer, candidates[0]["verify"])
+            self.put(
+                "tests/test_case.py",
+                "def test_case():\n" + textwrap.indent(body, "    ") + "\n",
+            )
+            candidates = self.scan("--paths", "tests/test_case.py")["candidates"]
+            assert len(candidates) == 1
+            assert candidates[0]["rule"] == "PY10b_test_smell"
+            assert pointer in candidates[0]["verify"]
 
     def test_getter_recall_is_checked_before_rebinding_its_result(self):
         for replacement, expected in [
@@ -464,20 +444,19 @@ class Py10DiffReachTests(ExtractorTestCase):
             ("result = other.items()", False),
             ("result = []", False),
         ]:
-            with self.subTest(replacement=replacement):
-                self.put(
-                    "tests/test_items.py",
-                    "def test_items():\n"
-                    "    result = obj.items()\n"
-                    "    result.append(1)\n"
-                    f"    {replacement}\n",
-                )
-                candidates = self.scan("--paths", "tests/test_items.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected), candidates)
-                if expected:
-                    self.assertEqual(candidates[0]["rule"], "PY10b_test_smell")
-                    self.assertEqual(candidates[0]["symbol"], "test_items")
-                    self.assertEqual(candidates[0]["span"], [2, 4])
+            self.put(
+                "tests/test_items.py",
+                "def test_items():\n"
+                "    result = obj.items()\n"
+                "    result.append(1)\n"
+                f"    {replacement}\n",
+            )
+            candidates = self.scan("--paths", "tests/test_items.py")["candidates"]
+            assert len(candidates) == int(expected), candidates
+            if expected:
+                assert candidates[0]["rule"] == "PY10b_test_smell"
+                assert candidates[0]["symbol"] == "test_items"
+                assert candidates[0]["span"] == [2, 4]
 
     def test_self_patch_counts_calls_in_other_patch_arguments(self):
         for source, span in [
@@ -494,13 +473,11 @@ class Py10DiffReachTests(ExtractorTestCase):
                 [1, 3],
             ),
         ]:
-            with self.subTest(source=source):
-                self.put("tests/test_patch.py", source)
-                candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
-                self.assertEqual(
-                    [(c["rule"], c["symbol"], c["span"]) for c in candidates],
-                    [("PY10b_test_smell", "test_patch", span)],
-                )
+            self.put("tests/test_patch.py", source)
+            candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
+            assert [(c["rule"], c["symbol"], c["span"]) for c in candidates] == [
+                ("PY10b_test_smell", "test_patch", span)
+            ]
 
     def test_self_patch_calls_require_an_active_window(self):
         for body, span in [
@@ -532,18 +509,14 @@ class Py10DiffReachTests(ExtractorTestCase):
                 [3, 4],
             ),
         ]:
-            with self.subTest(body=body):
-                self.put(
-                    "tests/test_patch.py",
-                    "def test_patch(monkeypatch):\n"
-                    + textwrap.indent(body, "    ")
-                    + "\n",
-                )
-                candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
-                self.assertEqual(
-                    [(c["rule"], c["symbol"], c["span"]) for c in candidates],
-                    [("PY10b_test_smell", "test_patch", span)] if span else [],
-                )
+            self.put(
+                "tests/test_patch.py",
+                "def test_patch(monkeypatch):\n" + textwrap.indent(body, "    ") + "\n",
+            )
+            candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
+            assert [(c["rule"], c["symbol"], c["span"]) for c in candidates] == (
+                [("PY10b_test_smell", "test_patch", span)] if span else []
+            )
 
     def test_self_patch_tracks_bound_patchers_until_their_stop(self):
         for body, span in [
@@ -587,18 +560,14 @@ class Py10DiffReachTests(ExtractorTestCase):
                 [2, 6],
             ),
         ]:
-            with self.subTest(body=body):
-                self.put(
-                    "tests/test_patch.py",
-                    "def test_patch(monkeypatch):\n"
-                    + textwrap.indent(body, "    ")
-                    + "\n",
-                )
-                candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
-                self.assertEqual(
-                    [(c["rule"], c["symbol"], c["span"]) for c in candidates],
-                    [("PY10b_test_smell", "test_patch", span)] if span else [],
-                )
+            self.put(
+                "tests/test_patch.py",
+                "def test_patch(monkeypatch):\n" + textwrap.indent(body, "    ") + "\n",
+            )
+            candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
+            assert [(c["rule"], c["symbol"], c["span"]) for c in candidates] == (
+                [("PY10b_test_smell", "test_patch", span)] if span else []
+            )
 
     def test_self_patch_scoped_windows_recognize_the_patch_family(self):
         cases = [
@@ -635,13 +604,11 @@ class Py10DiffReachTests(ExtractorTestCase):
             ),
         ]
         for source, span in cases:
-            with self.subTest(source=source):
-                self.put("tests/test_patch.py", source)
-                candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
-                self.assertEqual(
-                    [(c["rule"], c["symbol"], c["span"]) for c in candidates],
-                    [("PY10b_test_smell", "test_patch", span)] if span else [],
-                )
+            self.put("tests/test_patch.py", source)
+            candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
+            assert [(c["rule"], c["symbol"], c["span"]) for c in candidates] == (
+                [("PY10b_test_smell", "test_patch", span)] if span else []
+            )
 
     def test_starting_a_bound_patcher_makes_the_sut_call_diff_eligible(self):
         self.init_repo()
@@ -649,26 +616,18 @@ class Py10DiffReachTests(ExtractorTestCase):
             ("", [[2, 4]]),
             ("    p.start()\n    execute()\n    p.stop()\n", [[2, 4], [2, 7]]),
         ]:
-            with self.subTest(previous=previous):
-                prefix = 'def test_patch():\n    p = patch("app.execute")\n' + previous
-                self.put("tests/test_patch.py", prefix + "    execute()\n")
-                base = self.commit()
-                self.put(
-                    "tests/test_patch.py", prefix + "    p.start()\n    execute()\n"
-                )
-                candidates = self.scan("--base", base)["candidates"]
-                self.assertEqual(
-                    [
-                        (c["rule"], c["symbol"], c["span"], c["change_tag"])
-                        for c in candidates
-                    ],
-                    [("PY10b_test_smell", "test_patch", spans[-1], "changed")],
-                )
-                candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
-                self.assertEqual(
-                    [(c["rule"], c["symbol"], c["span"]) for c in candidates],
-                    [("PY10b_test_smell", "test_patch", span) for span in spans],
-                )
+            prefix = 'def test_patch():\n    p = patch("app.execute")\n' + previous
+            self.put("tests/test_patch.py", prefix + "    execute()\n")
+            base = self.commit()
+            self.put("tests/test_patch.py", prefix + "    p.start()\n    execute()\n")
+            candidates = self.scan("--base", base)["candidates"]
+            assert [
+                (c["rule"], c["symbol"], c["span"], c["change_tag"]) for c in candidates
+            ] == [("PY10b_test_smell", "test_patch", spans[-1], "changed")]
+            candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
+            assert [(c["rule"], c["symbol"], c["span"]) for c in candidates] == [
+                ("PY10b_test_smell", "test_patch", span) for span in spans
+            ]
 
     def test_default_hook_identity_checks_are_production_only(self):
         for expression, expected in [
@@ -681,16 +640,15 @@ class Py10DiffReachTests(ExtractorTestCase):
             ("fn != DEFAULT_FN", False),
             ("fn != _DEFAULT_FN != other", False),
         ]:
-            with self.subTest(expression=expression):
-                self.put("app.py", f"if {expression}:\n    execute()\n")
-                self.put("tests/test_app.py", f"assert {expression}\n")
-                candidates = self.scan("--paths", ".")["candidates"]
-                self.assertEqual(len(candidates), int(expected))
-                if expected:
-                    self.assertEqual(candidates[0]["rule"], "PY10b_test_smell")
-                    self.assertEqual(candidates[0]["path"], "app.py")
-                    self.assertEqual(candidates[0]["symbol"], "<module>")
-                    self.assertEqual(candidates[0]["span"], [1, 1])
+            self.put("app.py", f"if {expression}:\n    execute()\n")
+            self.put("tests/test_app.py", f"assert {expression}\n")
+            candidates = self.scan("--paths", ".")["candidates"]
+            assert len(candidates) == int(expected)
+            if expected:
+                assert candidates[0]["rule"] == "PY10b_test_smell"
+                assert candidates[0]["path"] == "app.py"
+                assert candidates[0]["symbol"] == "<module>"
+                assert candidates[0]["span"] == [1, 1]
 
     def test_test_smells_scope_decorators_module_reads_and_diff_spans(self):
         self.init_repo()
@@ -705,12 +663,12 @@ class Py10DiffReachTests(ExtractorTestCase):
         self.put("tests/test_app.py", original)
         base = self.commit()
         audit = self.scan("--paths", ".")["candidates"]
-        self.assertEqual({c["symbol"] for c in audit}, {"test_patched", "test_read"})
+        assert {c["symbol"] for c in audit} == {"test_patched", "test_read"}
         self.put("tests/test_app.py", original + "    obj.items()\n")
         changed = self.scan("--base", base)["candidates"]
-        self.assertEqual(len(changed), 1)
-        self.assertEqual(changed[0]["symbol"], "test_getter")
-        self.assertEqual(changed[0]["change_tag"], "changed")
+        assert len(changed) == 1
+        assert changed[0]["symbol"] == "test_getter"
+        assert changed[0]["change_tag"] == "changed"
 
     def test_module_raw_text_bindings_follow_nested_statements_but_not_scopes(self):
         for setup, expected in [
@@ -728,19 +686,16 @@ class Py10DiffReachTests(ExtractorTestCase):
                 False,
             ),
         ]:
-            with self.subTest(setup=setup):
-                self.put(
-                    "tests/test_read.py",
-                    setup + '\ndef test_read():\n    assert "class" in TEXT\n',
-                )
-                candidates = self.scan("--paths", "tests/test_read.py")["candidates"]
-                self.assertEqual(len(candidates), int(expected), candidates)
-                if expected:
-                    self.assertEqual(candidates[0]["rule"], "PY10b_test_smell")
-                    self.assertEqual(candidates[0]["symbol"], "test_read")
-                    self.assertIn(
-                        "raw source/documentation text", candidates[0]["evidence"]
-                    )
+            self.put(
+                "tests/test_read.py",
+                setup + '\ndef test_read():\n    assert "class" in TEXT\n',
+            )
+            candidates = self.scan("--paths", "tests/test_read.py")["candidates"]
+            assert len(candidates) == int(expected), candidates
+            if expected:
+                assert candidates[0]["rule"] == "PY10b_test_smell"
+                assert candidates[0]["symbol"] == "test_read"
+                assert "raw source/documentation text" in candidates[0]["evidence"]
 
     def test_cross_test_references_aliases_ambiguity_and_production_escape(self):
         self.init_repo()
@@ -758,28 +713,25 @@ class Py10DiffReachTests(ExtractorTestCase):
             for c in result["candidates"]
             if c["rule"] == "PY10c_cross_test_reachability"
         ]
-        self.assertEqual(len(candidates), 3)
-        self.assertEqual({c["change_tag"] for c in candidates}, {"cross-test"})
-        self.assertEqual(result["summary"]["cross_checked_files"], 3)
+        assert len(candidates) == 3
+        assert {c["change_tag"] for c in candidates} == {"cross-test"}
+        assert result["summary"]["cross_checked_files"] == 3
         for candidate in candidates:
-            self.assertIn("prod calls: 0", candidate["evidence"])
-            self.assertIn("test calls: 1", candidate["evidence"])
+            assert "prod calls: 0" in candidate["evidence"]
+            assert "test calls: 1" in candidate["evidence"]
             if candidate["symbol"] == "shared":
-                self.assertIn("ambiguous_defs: 2", candidate["evidence"])
+                assert "ambiguous_defs: 2" in candidate["evidence"]
         for reference in (
             "lonely()",
             "callbacks = [lonely]",
             "from app import lonely as local\nlocal()",
         ):
-            with self.subTest(reference=reference):
-                self.put("caller.py", reference + "\nshared()\n")
-                self.assertFalse(
-                    [
-                        c
-                        for c in self.scan("--paths", "app.py")["candidates"]
-                        if c["rule"] == "PY10c_cross_test_reachability"
-                    ]
-                )
+            self.put("caller.py", reference + "\nshared()\n")
+            assert not [
+                c
+                for c in self.scan("--paths", "app.py")["candidates"]
+                if c["rule"] == "PY10c_cross_test_reachability"
+            ]
 
     def test_cross_own_body_suppresses_only_self_recursion(self):
         self.init_repo()
@@ -793,13 +745,11 @@ class Py10DiffReachTests(ExtractorTestCase):
                 True,
             ),
         ]:
-            with self.subTest(method=method):
-                self.put("app.py", f"class Runner(Base):\n    {method}\n")
-                candidates = self.scan("--paths", "app.py")["candidates"]
-                self.assertEqual(
-                    [(c["symbol"], c["change_tag"]) for c in candidates],
-                    [("Runner.execute", "cross-test")] if flagged else [],
-                )
+            self.put("app.py", f"class Runner(Base):\n    {method}\n")
+            candidates = self.scan("--paths", "app.py")["candidates"]
+            assert [(c["symbol"], c["change_tag"]) for c in candidates] == (
+                [("Runner.execute", "cross-test")] if flagged else []
+            )
 
     def test_cross_super_delegation_reaches_without_binding_parameters(self):
         self.init_repo()
@@ -810,12 +760,9 @@ class Py10DiffReachTests(ExtractorTestCase):
             "        return super().execute(other, retries=5)\n",
         )
         for caller, flagged in [("", False), ("Runner().execute(1)", True)]:
-            with self.subTest(caller=caller):
-                self.put("caller.py", caller + "\n")
-                candidates = self.scan("--paths", "app.py")["candidates"]
-                self.assertEqual(
-                    [c["code"] for c in candidates], ["3"] if flagged else []
-                )
+            self.put("caller.py", caller + "\n")
+            candidates = self.scan("--paths", "app.py")["candidates"]
+            assert [c["code"] for c in candidates] == (["3"] if flagged else [])
 
     def test_cross_default_counts_recursive_bindings(self):
         self.init_repo()
@@ -840,13 +787,10 @@ class Py10DiffReachTests(ExtractorTestCase):
             # A bare name inside a method resolves outside the class, never to it.
             (method, "Tree().walk(tree)", "walk(child, depth=depth + 1)", True),
         ]:
-            with self.subTest(caller=caller, recursion=recursion):
-                self.put("app.py", definition.format(recursion))
-                self.put("caller.py", caller + "\n")
-                candidates = self.scan("--paths", "app.py")["candidates"]
-                self.assertEqual(
-                    [c["code"] for c in candidates], ["0"] if flagged else []
-                )
+            self.put("app.py", definition.format(recursion))
+            self.put("caller.py", caller + "\n")
+            candidates = self.scan("--paths", "app.py")["candidates"]
+            assert [c["code"] for c in candidates] == (["0"] if flagged else [])
 
     def test_cross_default_forwarded_recursive_parameters(self):
         self.init_repo()
@@ -894,13 +838,10 @@ class Py10DiffReachTests(ExtractorTestCase):
                 False,
             ),
         ]:
-            with self.subTest(caller=caller, body=body):
-                self.put("app.py", fixture.format(body))
-                self.put("caller.py", caller + "\n")
-                candidates = self.scan("--paths", "app.py")["candidates"]
-                self.assertEqual(
-                    [c["code"] for c in candidates], ["2"] if flagged else []
-                )
+            self.put("app.py", fixture.format(body))
+            self.put("caller.py", caller + "\n")
+            candidates = self.scan("--paths", "app.py")["candidates"]
+            assert [c["code"] for c in candidates] == (["2"] if flagged else [])
         self.put("caller.py", "Tree().render(tree)\n")
         for header, call in [
             (
@@ -912,13 +853,12 @@ class Py10DiffReachTests(ExtractorTestCase):
                 "cls.render(child, indent=indent, depth=depth + 1)",
             ),
         ]:
-            with self.subTest(call=call):
-                self.put(
-                    "app.py",
-                    f"class Tree:\n    {header}\n        for child in node.children:\n            {call}\n        return indent + depth\n",
-                )
-                candidates = self.scan("--paths", "app.py")["candidates"]
-                self.assertEqual([c["code"] for c in candidates], ["2"])
+            self.put(
+                "app.py",
+                f"class Tree:\n    {header}\n        for child in node.children:\n            {call}\n        return indent + depth\n",
+            )
+            candidates = self.scan("--paths", "app.py")["candidates"]
+            assert [c["code"] for c in candidates] == ["2"]
 
     def test_rebound_import_aliases_are_escapes_instead_of_resolved_calls(self):
         self.init_repo()
@@ -926,27 +866,22 @@ class Py10DiffReachTests(ExtractorTestCase):
         self.put("tests/test_app.py", "configure()\n")
         for binding in ("from other import unrelated as local", "local = unrelated"):
             for nested in (False, True):
-                with self.subTest(binding=binding, nested=nested):
-                    caller = (
-                        f"from app import configure as local\n{binding}\nlocal(True)\n"
-                    )
-                    if nested:
-                        caller = "def caller():\n" + textwrap.indent(caller, "    ")
-                    self.put("caller.py", caller)
-                    self.assertEqual(self.scan("--paths", "app.py")["candidates"], [])
-                    as_test = self.scan(
-                        "--paths", "app.py", "--test-glob", "caller.py"
-                    )["candidates"]
-                    self.assertEqual(len(as_test), 1)
-                    self.assertEqual(as_test[0]["change_tag"], "cross-test")
-                    self.assertIn(
-                        "test calls: 1, test non-call refs: 1", as_test[0]["evidence"]
-                    )
+                caller = f"from app import configure as local\n{binding}\nlocal(True)\n"
+                if nested:
+                    caller = "def caller():\n" + textwrap.indent(caller, "    ")
+                self.put("caller.py", caller)
+                assert self.scan("--paths", "app.py")["candidates"] == []
+                as_test = self.scan("--paths", "app.py", "--test-glob", "caller.py")[
+                    "candidates"
+                ]
+                assert len(as_test) == 1
+                assert as_test[0]["change_tag"] == "cross-test"
+                assert "test calls: 1, test non-call refs: 1" in as_test[0]["evidence"]
         self.put("caller.py", "from app import configure as local\nlocal(True)\n")
         resolved = self.scan("--paths", "app.py")["candidates"]
-        self.assertEqual(len(resolved), 1)
-        self.assertEqual(resolved[0]["change_tag"], "path-audit")
-        self.assertIn("uniform value: True", resolved[0]["evidence"])
+        assert len(resolved) == 1
+        assert resolved[0]["change_tag"] == "path-audit"
+        assert "uniform value: True" in resolved[0]["evidence"]
 
     def test_cross_default_effective_arguments_and_escape_suppression(self):
         self.init_repo()
@@ -1091,23 +1026,20 @@ class Py10DiffReachTests(ExtractorTestCase):
             ),
         ]
         for label, source, calls, uniform in cases:
-            with self.subTest(label=label):
-                self.put("app.py", source)
-                self.put("caller.py", calls + "\n")
-                candidates = [
-                    c
-                    for c in self.scan("--paths", "app.py")["candidates"]
-                    if c["rule"] == "PY10c_cross_test_reachability"
-                ]
-                self.assertEqual(len(candidates), int(uniform is not None), candidates)
-                if uniform is not None:
-                    self.assertEqual(candidates[0]["change_tag"], "path-audit")
-                    self.assertIn(
-                        f"uniform value: {uniform}", candidates[0]["evidence"]
-                    )
-                    self.assertIn("prod call sites", candidates[0]["evidence"])
-                    self.assertEqual(candidates[0]["code"], "False")
-                    self.assertIn("Counterweight", candidates[0]["verify"])
+            self.put("app.py", source)
+            self.put("caller.py", calls + "\n")
+            candidates = [
+                c
+                for c in self.scan("--paths", "app.py")["candidates"]
+                if c["rule"] == "PY10c_cross_test_reachability"
+            ]
+            assert len(candidates) == int(uniform is not None), (label, candidates)
+            if uniform is not None:
+                assert candidates[0]["change_tag"] == "path-audit"
+                assert f"uniform value: {uniform}" in candidates[0]["evidence"]
+                assert "prod call sites" in candidates[0]["evidence"]
+                assert candidates[0]["code"] == "False"
+                assert "Counterweight" in candidates[0]["verify"]
 
     def test_cross_default_keeps_single_uniform_parameter_format(self):
         self.init_repo()
@@ -1123,28 +1055,24 @@ class Py10DiffReachTests(ExtractorTestCase):
                 "configure(True, 1)\nconfigure(flag=True, varying=2)\n",
             ),
         ]:
-            with self.subTest(signature=signature):
-                self.put("app.py", f"def configure({signature}):\n    return {body}\n")
-                self.put("caller.py", calls)
-                self.assertEqual(
-                    self.scan("--paths", "app.py")["candidates"],
-                    [
-                        {
-                            "id": "C01",
-                            "path": "app.py",
-                            "symbol": "configure",
-                            "rule": "PY10c_cross_test_reachability",
-                            "change_tag": "path-audit",
-                            "span": [1, 1],
-                            "code": "False",
-                            "evidence": "Parameter 'flag': 2 resolved prod call sites; "
-                            "uniform value: True",
-                            "verify": "Does every immediate production binding, recursion included, "
-                            "fix this value, so the override is dead while the default's policy stays? "
-                            "Is it an export or extension contract (Counterweight)? See tests.md §4.",
-                        }
-                    ],
-                )
+            self.put("app.py", f"def configure({signature}):\n    return {body}\n")
+            self.put("caller.py", calls)
+            assert self.scan("--paths", "app.py")["candidates"] == [
+                {
+                    "id": "C01",
+                    "path": "app.py",
+                    "symbol": "configure",
+                    "rule": "PY10c_cross_test_reachability",
+                    "change_tag": "path-audit",
+                    "span": [1, 1],
+                    "code": "False",
+                    "evidence": "Parameter 'flag': 2 resolved prod call sites; "
+                    "uniform value: True",
+                    "verify": "Does every immediate production binding, recursion included, "
+                    "fix this value, so the override is dead while the default's policy stays? "
+                    "Is it an export or extension contract (Counterweight)? See tests.md §4.",
+                }
+            ]
 
     def test_cross_default_bundles_only_uniform_parameters_in_declaration_order(self):
         self.init_repo()
@@ -1163,25 +1091,22 @@ class Py10DiffReachTests(ExtractorTestCase):
         )
         self.put("caller.py", "configure(True, 1)\nconfigure(True, 2)\n")
         candidates = self.scan("--paths", "app.py")["candidates"]
-        self.assertEqual(
-            candidates,
-            [
-                {
-                    "id": "C01",
-                    "path": "app.py",
-                    "symbol": "configure",
-                    "rule": "PY10c_cross_test_reachability",
-                    "change_tag": "path-audit",
-                    "span": [2, 6],
-                    "code": 'False; "policy"',
-                    "evidence": "Parameters 'zulu' (uniform value: True), "
-                    "'alpha' (uniform value: <DEFAULT>): 2 resolved prod call sites",
-                    "verify": "Does every immediate production binding, recursion included, "
-                    "fix each value, so the override is dead while the default's policy stays? "
-                    "Is it an export or extension contract (Counterweight)? See tests.md §4.",
-                }
-            ],
-        )
+        assert candidates == [
+            {
+                "id": "C01",
+                "path": "app.py",
+                "symbol": "configure",
+                "rule": "PY10c_cross_test_reachability",
+                "change_tag": "path-audit",
+                "span": [2, 6],
+                "code": 'False; "policy"',
+                "evidence": "Parameters 'zulu' (uniform value: True), "
+                "'alpha' (uniform value: <DEFAULT>): 2 resolved prod call sites",
+                "verify": "Does every immediate production binding, recursion included, "
+                "fix each value, so the override is dead while the default's policy stays? "
+                "Is it an export or extension contract (Counterweight)? See tests.md §4.",
+            }
+        ]
 
     def test_cross_default_bundle_keeps_diff_lost_calls_and_external_base_clauses(self):
         self.init_repo()
@@ -1203,36 +1128,32 @@ class Py10DiffReachTests(ExtractorTestCase):
         base = self.commit()
         self.put("caller.py", calls)
         for changed in (False, True):
-            with self.subTest(changed=changed):
-                if changed:
-                    self.put(
-                        "app.py",
-                        source.replace(
-                            "return zulu, varying, alpha", "return alpha, varying, zulu"
-                        ),
-                    )
-                candidates = self.scan("--base", base)["candidates"]
-                self.assertEqual(len(candidates), 1)
-                candidate = candidates[0]
-                self.assertEqual(candidate["rule"], "PY10c_cross_test_reachability")
-                self.assertEqual(candidate["symbol"], "Panel.configure")
-                self.assertEqual(candidate["path"], "app.py")
-                self.assertEqual(candidate["change_tag"], "changed")
-                self.assertEqual(candidate["span"], [5, 8])
-                self.assertEqual(candidate["code"], 'False; "policy"')
-                unchanged = (
-                    ""
-                    if changed
-                    else "; definition unchanged; triggered by deleted call"
+            if changed:
+                self.put(
+                    "app.py",
+                    source.replace(
+                        "return zulu, varying, alpha", "return alpha, varying, zulu"
+                    ),
                 )
-                self.assertEqual(
-                    candidate["evidence"],
-                    "Parameters 'zulu' (uniform value: True), "
-                    "'alpha' (uniform value: <DEFAULT>): 2 resolved prod call sites"
-                    "; lost call(s): base caller.py:3 (prod)"
-                    f"{unchanged}; enclosing class bases: ui.View (not defined in repo)",
-                )
-                self.assertIn("fix each value", candidate["verify"])
+            candidates = self.scan("--base", base)["candidates"]
+            assert len(candidates) == 1
+            candidate = candidates[0]
+            assert candidate["rule"] == "PY10c_cross_test_reachability"
+            assert candidate["symbol"] == "Panel.configure"
+            assert candidate["path"] == "app.py"
+            assert candidate["change_tag"] == "changed"
+            assert candidate["span"] == [5, 8]
+            assert candidate["code"] == 'False; "policy"'
+            unchanged = (
+                "" if changed else "; definition unchanged; triggered by deleted call"
+            )
+            assert (
+                candidate["evidence"] == "Parameters 'zulu' (uniform value: True), "
+                "'alpha' (uniform value: <DEFAULT>): 2 resolved prod call sites"
+                "; lost call(s): base caller.py:3 (prod)"
+                f"{unchanged}; enclosing class bases: ui.View (not defined in repo)"
+            )
+            assert "fix each value" in candidate["verify"]
 
     def test_module_all_mutations_suppress_constant_default_candidates(self):
         self.init_repo()
@@ -1256,17 +1177,15 @@ class Py10DiffReachTests(ExtractorTestCase):
             # `exports.py` never imports `configure`, so its `__all__` exports nothing.
             ("exports.py", '__all__.append("configure")', False),
         ]:
-            with self.subTest(module=module, exports=exports):
-                own = module == "app.py"
-                self.put("app.py", definitions + (exports + "\n" if own else ""))
-                self.put("exports.py", "" if own else exports + "\n")
-                candidates = self.scan("--paths", "app.py")["candidates"]
-                self.assertEqual(
-                    [(c["symbol"], c["code"]) for c in candidates],
-                    [("sibling", "False")]
-                    if exported
-                    else [("configure", "False"), ("sibling", "False")],
-                )
+            own = module == "app.py"
+            self.put("app.py", definitions + (exports + "\n" if own else ""))
+            self.put("exports.py", "" if own else exports + "\n")
+            candidates = self.scan("--paths", "app.py")["candidates"]
+            assert [(c["symbol"], c["code"]) for c in candidates] == (
+                [("sibling", "False")]
+                if exported
+                else [("configure", "False"), ("sibling", "False")]
+            )
 
     def test_cross_exported_function_skips_reach_but_not_unexported_namesake(self):
         self.init_repo()
@@ -1276,13 +1195,11 @@ class Py10DiffReachTests(ExtractorTestCase):
             ('__all__ = ["helper"]\n', ["other.py"]),
             ("", ["app.py", "other.py"]),
         ]:
-            with self.subTest(exports=exports):
-                self.put("app.py", exports + "def helper():\n    return 1\n")
-                candidates = self.scan("--paths", "app.py", "other.py")["candidates"]
-                self.assertEqual(
-                    [(c["path"], c["symbol"], c["change_tag"]) for c in candidates],
-                    [(path, "helper", "cross-test") for path in flagged],
-                )
+            self.put("app.py", exports + "def helper():\n    return 1\n")
+            candidates = self.scan("--paths", "app.py", "other.py")["candidates"]
+            assert [(c["path"], c["symbol"], c["change_tag"]) for c in candidates] == [
+                (path, "helper", "cross-test") for path in flagged
+            ]
 
     def test_cross_static_reexport_makes_definition_public(self):
         self.init_repo()
@@ -1296,13 +1213,11 @@ class Py10DiffReachTests(ExtractorTestCase):
             ('__all__ = ["helper"]', False),
             ("from .core import helper", False),
         ]:
-            with self.subTest(package=package):
-                self.put("pkg/__init__.py", package + "\n")
-                candidates = self.scan("--paths", "pkg/core.py")["candidates"]
-                self.assertEqual(
-                    [(c["symbol"], c["change_tag"]) for c in candidates],
-                    [] if exported else [("helper", "cross-test")],
-                )
+            self.put("pkg/__init__.py", package + "\n")
+            candidates = self.scan("--paths", "pkg/core.py")["candidates"]
+            assert [(c["symbol"], c["change_tag"]) for c in candidates] == (
+                [] if exported else [("helper", "cross-test")]
+            )
 
     def test_cross_exported_class_public_methods_skip_both_arms(self):
         self.init_repo()
@@ -1333,15 +1248,11 @@ class Py10DiffReachTests(ExtractorTestCase):
             ('from ._client import Client\n__all__ = ["Client"]', private),
             ("from ._client import Client", sorted(public + private)),
         ]:
-            with self.subTest(package=package):
-                self.put("pkg/__init__.py", package + "\n")
-                candidates = self.scan("--paths", "pkg/_client.py")["candidates"]
-                self.assertEqual(
-                    sorted(
-                        (c["symbol"], c["change_tag"], c["code"]) for c in candidates
-                    ),
-                    sorted(expected),
-                )
+            self.put("pkg/__init__.py", package + "\n")
+            candidates = self.scan("--paths", "pkg/_client.py")["candidates"]
+            assert sorted(
+                (c["symbol"], c["change_tag"], c["code"]) for c in candidates
+            ) == sorted(expected)
 
     def test_cross_evidence_labels_aggregates_and_external_bases(self):
         self.init_repo()
@@ -1363,29 +1274,26 @@ class Py10DiffReachTests(ExtractorTestCase):
         self.put("caller.py", "Panel().resize()\n")
         self.put("tests/test_app.py", "refresh()\nlonely()\n")
         candidates = self.scan("--paths", "app.py")["candidates"]
-        self.assertEqual(
-            [(c["symbol"], c["change_tag"]) for c in candidates],
-            [
-                ("Panel.refresh", "cross-test"),
-                ("Panel.resize", "path-audit"),
-                ("refresh", "cross-test"),
-                ("lonely", "cross-test"),
-            ],
-        )
+        assert [(c["symbol"], c["change_tag"]) for c in candidates] == [
+            ("Panel.refresh", "cross-test"),
+            ("Panel.resize", "path-audit"),
+            ("refresh", "cross-test"),
+            ("lonely", "cross-test"),
+        ]
         method, default, function, lonely = (c["evidence"] for c in candidates)
         external = "enclosing class bases: ui.View (not defined in repo)"
         for evidence in (method, function):
-            self.assertIn("aggregates across 2 prod definitions", evidence)
-            self.assertIn("not attributed to this definition", evidence)
-            self.assertIn("test calls: 1, test non-call refs: 0", evidence)
-            self.assertIn("ambiguous_defs: 2", evidence)
-        self.assertIn("aggregates across 1 prod definition;", lonely)
-        self.assertNotIn("ambiguous_defs", lonely)
-        self.assertIn(external, method)
-        self.assertIn(external, default)
-        self.assertIn("uniform value: <DEFAULT>", default)
-        self.assertNotIn("enclosing class bases", function)
-        self.assertNotIn("enclosing class bases", lonely)
+            assert "aggregates across 2 prod definitions" in evidence
+            assert "not attributed to this definition" in evidence
+            assert "test calls: 1, test non-call refs: 0" in evidence
+            assert "ambiguous_defs: 2" in evidence
+        assert "aggregates across 1 prod definition;" in lonely
+        assert "ambiguous_defs" not in lonely
+        assert external in method
+        assert external in default
+        assert "uniform value: <DEFAULT>" in default
+        assert "enclosing class bases" not in function
+        assert "enclosing class bases" not in lonely
 
     def test_cross_orphaned_deleted_calls_and_deleted_file_inventory(self):
         self.init_repo()
@@ -1399,27 +1307,24 @@ class Py10DiffReachTests(ExtractorTestCase):
             ("callbacks = [orphan]\n", []),
             ("", ["orphan"]),
         ]:
-            with self.subTest(remaining=remaining):
-                self.put("caller.py", remaining)
-                result = self.scan("--base", base)
-                candidates = [
-                    c
-                    for c in result["candidates"]
-                    if c["rule"] == "PY10c_cross_test_reachability"
-                ]
-                self.assertEqual([c["symbol"] for c in candidates], expected)
-                if expected:
-                    self.assertEqual(candidates[0]["change_tag"], "orphaned")
-                    self.assertEqual(candidates[0]["path"], "app.py")
+            self.put("caller.py", remaining)
+            result = self.scan("--base", base)
+            candidates = [
+                c
+                for c in result["candidates"]
+                if c["rule"] == "PY10c_cross_test_reachability"
+            ]
+            assert [c["symbol"] for c in candidates] == expected
+            if expected:
+                assert candidates[0]["change_tag"] == "orphaned"
+                assert candidates[0]["path"] == "app.py"
         (self.root / "caller.py").unlink()
         deleted = self.scan("--base", base)
-        self.assertEqual(deleted["summary"]["files_scanned"], 1)
-        self.assertEqual(deleted["summary"]["cross_checked_files"], 1)
-        self.assertEqual(deleted["candidates"][0]["change_tag"], "orphaned")
+        assert deleted["summary"]["files_scanned"] == 1
+        assert deleted["summary"]["cross_checked_files"] == 1
+        assert deleted["candidates"][0]["change_tag"] == "orphaned"
         self.put("tests/test_app.py", "orphan()\n")
-        self.assertEqual(
-            self.scan("--base", base)["candidates"][0]["change_tag"], "cross-test"
-        )
+        assert self.scan("--base", base)["candidates"][0]["change_tag"] == "cross-test"
 
     def test_cross_diff_emits_changed_definitions_not_unchanged_namesakes(self):
         self.init_repo()
@@ -1433,16 +1338,14 @@ class Py10DiffReachTests(ExtractorTestCase):
             ("def shared():\n    return 3\n", ["app.py"]),
             ("def shared():\n    return 5\n", ["app.py", "other.py"]),
         ]:
-            with self.subTest(other=other):
-                self.put("other.py", other)
-                candidates = self.scan("--base", base)["candidates"]
-                self.assertEqual(
-                    [(c["path"], c["symbol"], c["change_tag"]) for c in candidates],
-                    [(path, "shared", "cross-test") for path in flagged],
-                )
-                for candidate in candidates:
-                    self.assertIn("test calls: 1", candidate["evidence"])
-                    self.assertIn("ambiguous_defs: 3", candidate["evidence"])
+            self.put("other.py", other)
+            candidates = self.scan("--base", base)["candidates"]
+            assert [(c["path"], c["symbol"], c["change_tag"]) for c in candidates] == [
+                (path, "shared", "cross-test") for path in flagged
+            ]
+            for candidate in candidates:
+                assert "test calls: 1" in candidate["evidence"]
+                assert "ambiguous_defs: 3" in candidate["evidence"]
 
     def test_cross_diff_deleted_calls_trigger_on_net_loss_naming_lost_sites(self):
         self.init_repo()
@@ -1490,26 +1393,24 @@ class Py10DiffReachTests(ExtractorTestCase):
             self.put(path, source)
         base = self.commit()
         for label, changes, lost in cases:
-            with self.subTest(label):
-                for path in tip_only:
-                    (self.root / path).unlink(missing_ok=True)
-                for path, source in base_files.items():
+            for path in tip_only:
+                (self.root / path).unlink(missing_ok=True)
+            for path, source in base_files.items():
+                self.put(path, source)
+            for path, source in changes.items():
+                if source is None:
+                    (self.root / path).unlink()
+                else:
                     self.put(path, source)
-                for path, source in changes.items():
-                    if source is None:
-                        (self.root / path).unlink()
-                    else:
-                        self.put(path, source)
-                candidates = self.scan("--base", base)["candidates"]
-                self.assertEqual(
-                    [(c["path"], c["symbol"], c["code"]) for c in candidates],
-                    [("app.py", "helper", "3")] if lost else [],
-                )
-                if lost:
-                    evidence = candidates[0]["evidence"]
-                    self.assertIn("uniform value: <DEFAULT>", evidence)
-                    self.assertIn(f"lost call(s): {lost}", evidence)
-                    self.assertIn("definition unchanged", evidence)
+            candidates = self.scan("--base", base)["candidates"]
+            assert [(c["path"], c["symbol"], c["code"]) for c in candidates] == (
+                [("app.py", "helper", "3")] if lost else []
+            ), label
+            if lost:
+                evidence = candidates[0]["evidence"]
+                assert "uniform value: <DEFAULT>" in evidence
+                assert f"lost call(s): {lost}" in evidence
+                assert "definition unchanged" in evidence
 
     def test_cross_snapshot_isolation_exact_tip_and_default_merge_base(self):
         self.init_repo()
@@ -1520,17 +1421,16 @@ class Py10DiffReachTests(ExtractorTestCase):
         self.put("app.py", "def reachable():\n    return 2\n")
         tip = self.commit()
         for flags in [("--tip", tip), ("--merge-base",)]:
-            with self.subTest(flags=flags):
-                self.put("caller.py", "value = 0\n")
-                committed = self.scan("--base", base, *flags)
-                self.put("caller.py", "reachable()\n")
-                isolated = self.scan("--base", base, *flags)
-                self.assertEqual(isolated, committed)
-                candidates = isolated["candidates"]
-                self.assertEqual(len(candidates), 1)
-                self.assertEqual(candidates[0]["change_tag"], "cross-test")
-                self.assertIn("prod calls: 0", candidates[0]["evidence"])
-        self.assertEqual(self.scan("--base", base)["candidates"], [])
+            self.put("caller.py", "value = 0\n")
+            committed = self.scan("--base", base, *flags)
+            self.put("caller.py", "reachable()\n")
+            isolated = self.scan("--base", base, *flags)
+            assert isolated == committed
+            candidates = isolated["candidates"]
+            assert len(candidates) == 1
+            assert candidates[0]["change_tag"] == "cross-test"
+            assert "prod calls: 0" in candidates[0]["evidence"]
+        assert self.scan("--base", base)["candidates"] == []
 
     def test_cross_cli_parses_each_active_file_at_most_once(self):
         base, tip = self.use_git_fixture(
@@ -1556,29 +1456,25 @@ class Py10DiffReachTests(ExtractorTestCase):
                 [str(SCRIPT), "--base", base, "--tip", tip, "--format", "json"],
             ),
             patch("ast.parse", wraps=ast.parse) as parse,
-            self.assertRaises(SystemExit) as exit_,
+            pytest.raises(SystemExit) as exit_,
         ):
             runpy.run_path(str(SCRIPT), run_name="__main__")
-        self.assertEqual(exit_.exception.code, 0)
+        assert exit_.value.code == 0
         counts = Counter(call.kwargs.get("filename") for call in parse.call_args_list)
-        self.assertEqual(counts["base:app.py"], 1)
-        self.assertEqual(counts["app.py"], 1)
-        self.assertEqual(counts["caller.py"], 1)
-        self.assertEqual(counts["broken.py"], 1)
-        self.assertEqual(counts["unrelated.py"], 0)
-        self.assertTrue(
-            all(
-                count <= 1
-                for filename, count in counts.items()
-                if filename and not filename.startswith("base:")
-            )
+        assert counts["base:app.py"] == 1
+        assert counts["app.py"] == 1
+        assert counts["caller.py"] == 1
+        assert counts["broken.py"] == 1
+        assert counts["unrelated.py"] == 0
+        assert all(
+            count <= 1
+            for filename, count in counts.items()
+            if filename and not filename.startswith("base:")
         )
         result = json.loads(stdout.getvalue())
-        self.assertEqual(result["summary"]["cross_checked_files"], 4)
-        self.assertEqual(result["summary"]["parse_error_count"], 2)
-        self.assertEqual(
-            sum(e["error"].startswith("base: ") for e in result["parse_errors"]), 1
-        )
+        assert result["summary"]["cross_checked_files"] == 4
+        assert result["summary"]["parse_error_count"] == 2
+        assert sum(e["error"].startswith("base: ") for e in result["parse_errors"]) == 1
 
     def test_cross_target_filters_decorators_diff_scope_and_no_targets(self):
         self.init_repo()
@@ -1606,18 +1502,16 @@ class Py10DiffReachTests(ExtractorTestCase):
             "\n".join(f"{name}()" for name in [*names, "run", "__magic__"]) + "\n",
         )
         result = self.scan("--paths", "app.py")
-        self.assertEqual([c["symbol"] for c in result["candidates"]], ["ordinary"])
+        assert [c["symbol"] for c in result["candidates"]] == ["ordinary"]
         base = self.commit()
         self.put("app.py", source + "value = 1\n")
-        self.assertEqual(self.scan("--base", base)["summary"]["cross_checked_files"], 0)
+        assert self.scan("--base", base)["summary"]["cross_checked_files"] == 0
         self.put("app.py", source.replace("return 1", "return 2", 1))
-        self.assertEqual(
-            self.scan("--base", base)["candidates"][0]["symbol"], "ordinary"
-        )
+        assert self.scan("--base", base)["candidates"][0]["symbol"] == "ordinary"
         self.put("filtered.py", "@app.getaway\ndef viable():\n    return 1\n")
         self.put("tests/test_filtered.py", "viable()\n")
-        self.assertEqual(
-            self.scan("--paths", "filtered.py")["candidates"][0]["symbol"], "viable"
+        assert (
+            self.scan("--paths", "filtered.py")["candidates"][0]["symbol"] == "viable"
         )
 
     def test_cross_universe_exclusions_and_test_roles(self):
@@ -1641,11 +1535,9 @@ class Py10DiffReachTests(ExtractorTestCase):
         result = self.scan(
             "--paths", "app.py", "--exclude", "omit/*", "--test-glob", "checks/*"
         )
-        self.assertEqual(result["summary"]["cross_checked_files"], 2)
-        self.assertEqual(result["candidates"][0]["change_tag"], "cross-test")
-        self.assertEqual(
-            self.scan("--paths", "app.py", "--exclude", "omit/*")["candidates"], []
-        )
+        assert result["summary"]["cross_checked_files"] == 2
+        assert result["candidates"][0]["change_tag"] == "cross-test"
+        assert self.scan("--paths", "app.py", "--exclude", "omit/*")["candidates"] == []
 
     def test_base_decode_failure_is_reported_without_disabling_post_analysis(self):
         base = self.use_git_fixture(
@@ -1660,12 +1552,12 @@ class Py10DiffReachTests(ExtractorTestCase):
             },
         )
         result = self.scan("--base", base)
-        self.assertEqual(result["summary"]["files_scanned"], 2)
-        self.assertEqual(result["summary"]["parse_error_count"], 2)
-        self.assertTrue(
-            all(error["error"].startswith("base: ") for error in result["parse_errors"])
+        assert result["summary"]["files_scanned"] == 2
+        assert result["summary"]["parse_error_count"] == 2
+        assert all(
+            error["error"].startswith("base: ") for error in result["parse_errors"]
         )
-        self.assertEqual(result["candidates"][0]["rule"], "PY01_reflect_default")
+        assert result["candidates"][0]["rule"] == "PY01_reflect_default"
 
     def test_cross_non_call_counts_deleted_test_calls_and_default_diff_tags(self):
         self.init_repo()
@@ -1680,12 +1572,12 @@ class Py10DiffReachTests(ExtractorTestCase):
         base = self.commit()
         self.put("tests/test_app.py", "callbacks = [callback]\n")
         orphaned = self.scan("--base", base)["candidates"]
-        self.assertEqual(
-            [(c["symbol"], c["change_tag"]) for c in orphaned], [("idle", "orphaned")]
-        )
+        assert [(c["symbol"], c["change_tag"]) for c in orphaned] == [
+            ("idle", "orphaned")
+        ]
         lost = "lost call(s): base tests/test_app.py:2 (test)"
-        self.assertIn(lost, orphaned[0]["evidence"])
-        self.assertIn("definition unchanged", orphaned[0]["evidence"])
+        assert lost in orphaned[0]["evidence"]
+        assert "definition unchanged" in orphaned[0]["evidence"]
         self.put(
             "app.py",
             "async def callback():\n    return 2\n"
@@ -1694,26 +1586,20 @@ class Py10DiffReachTests(ExtractorTestCase):
         )
         candidates = self.scan("--base", base)["candidates"]
         callback = next(c for c in candidates if c["symbol"] == "callback")
-        self.assertEqual(callback["change_tag"], "cross-test")
-        self.assertIn("test calls: 0, test non-call refs: 1", callback["evidence"])
-        self.assertNotIn("lost call(s)", callback["evidence"])
+        assert callback["change_tag"] == "cross-test"
+        assert "test calls: 0, test non-call refs: 1" in callback["evidence"]
+        assert "lost call(s)" not in callback["evidence"]
         idle = next(c for c in candidates if c["symbol"] == "idle")
-        self.assertEqual(idle["change_tag"], "orphaned")
-        self.assertIn(lost, idle["evidence"])
-        self.assertNotIn("definition unchanged", idle["evidence"])
+        assert idle["change_tag"] == "orphaned"
+        assert lost in idle["evidence"]
+        assert "definition unchanged" not in idle["evidence"]
         defaults = [c for c in candidates if c["symbol"] == "configure"]
-        self.assertEqual(len(defaults), 1)
-        self.assertEqual(defaults[0]["change_tag"], "changed")
-        self.assertEqual(defaults[0]["code"], "False; None")
+        assert len(defaults) == 1
+        assert defaults[0]["change_tag"] == "changed"
+        assert defaults[0]["code"] == "False; None"
         self.put("exports.py", 'from app import configure\n__all__ = ["configure"]\n')
-        self.assertFalse(
-            [
-                c
-                for c in self.scan("--base", base)["candidates"]
-                if c["symbol"] == "configure"
-            ]
-        )
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert not [
+            c
+            for c in self.scan("--base", base)["candidates"]
+            if c["symbol"] == "configure"
+        ]

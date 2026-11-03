@@ -6,9 +6,9 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import tempfile
 import textwrap
-import unittest
+
+import pytest
 
 
 sys.dont_write_bytecode = True
@@ -21,20 +21,19 @@ if SCRIPT_DIR not in sys.path:
 import scan_python  # noqa: E402
 
 
-class ExtractorTestCase(unittest.TestCase):
+class ExtractorTestCase:
+    @pytest.fixture(autouse=True, scope="class")
     @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls._class_temp = tempfile.TemporaryDirectory()
-        cls.git_template = Path(cls._class_temp.name) / "template"
-        cls.git_template.mkdir(parents=True, exist_ok=True)
+    def _class_workspace(cls, tmp_path_factory):
+        cls._class_temp = tmp_path_factory.mktemp(cls.__name__)
+        cls.git_template = cls._class_temp / "template"
+        cls.git_template.mkdir()
         cls.run_git(cls.git_template, "init", "-q", "-b", "main")
         cls._fixtures = {}
 
-    @classmethod
-    def tearDownClass(cls):
-        cls._class_temp.cleanup()
-        super().tearDownClass()
+    @pytest.fixture(autouse=True)
+    def _workspace(self, tmp_path):
+        self.root = tmp_path
 
     @classmethod
     def run_git(cls, cwd, *args):
@@ -86,7 +85,7 @@ class ExtractorTestCase(unittest.TestCase):
     @classmethod
     def git_fixture(cls, name, *snapshots, working_files=None):
         if name not in cls._fixtures:
-            repo = Path(cls._class_temp.name) / "fixtures" / name
+            repo = cls._class_temp / "fixtures" / name
             shutil.copytree(cls.git_template / ".git", repo / ".git")
             commits = []
             for files in snapshots:
@@ -101,20 +100,15 @@ class ExtractorTestCase(unittest.TestCase):
             cls._fixtures[name] = (repo, tuple(commits))
         return cls._fixtures[name]
 
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-
     def put(self, path, source):
         return self.write_source(self.root, path, source)
 
     def check_cli_result(self, returncode, stdout, stderr, code):
-        self.assertEqual(returncode, code, stderr)
+        assert returncode == code, stderr
         if code == 0:
-            self.assertEqual(stderr, "")
+            assert stderr == ""
         else:
-            self.assertTrue(stderr)
+            assert stderr
         return stdout
 
     def cli(self, *args, code=0, cwd=None):

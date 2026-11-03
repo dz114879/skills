@@ -6,6 +6,7 @@ dependencies = []
 
 [dependency-groups]
 dev = [
+    "pytest>=9.2.0",
     "ruff>=0.17.3",
 ]
 
@@ -25,8 +26,16 @@ select = [
     "BLE",         # blind `except Exception` (Error Washing)
     "ARG",         # unused arguments (Dead Plumbing)
     "PGH",         # blanket noqa / type: ignore
+    "PT",          # flake8-pytest-style
 ]
 
 [tool.ruff.lint.isort]
 force-sort-within-sections = true
 lines-after-imports = 2
+
+[tool.pytest.ini_options]
+testpaths = ["engineering/anti-defensive-coding/tests"]
+python_classes = ["*Tests", "Test*"]
+# The read-only worktree test asserts `git status --ignored` is unchanged, so
+# pytest must not create `.pytest_cache`; run as `python -B -m pytest`.
+addopts = ["-p", "no:cacheprovider"]
