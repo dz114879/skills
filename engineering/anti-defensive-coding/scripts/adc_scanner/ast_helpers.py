@@ -1318,16 +1318,29 @@ class CandidateRecords(IndexedVisitor):
             self.generic_visit(node)
 
     def source_segment(self, node):
-        start, end = node.lineno - 1, node.end_lineno - 1
-        if start == end:
-            return self.source_lines[start][
-                node.col_offset : node.end_col_offset
-            ].decode()
+        start = node.lineno, node.col_offset
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            first = node.body[0]
+            return self.source_slice(start, (first.lineno, first.col_offset)).rstrip()
+        segment = self.source_slice(start, (node.end_lineno, node.end_col_offset))
+        if isinstance(node, ast.ExceptHandler) and len(" ".join(segment.split())) > 200:
+            first = node.body[0]
+            header = self.source_slice(start, (first.lineno, first.col_offset)).rstrip()
+            segment = header + " " + self.source_segment(first)
+            if len(node.body) > 1:
+                segment += "; ...; " + self.source_segment(node.body[-1])
+        return segment
+
+    def source_slice(self, start, end):
+        start_line, start_col = start
+        end_line, end_col = end
+        if start_line == end_line:
+            return self.source_lines[start_line - 1][start_col:end_col].decode()
         return b"".join(
             [
-                self.source_lines[start][node.col_offset :],
-                *self.source_lines[start + 1 : end],
-                self.source_lines[end][: node.end_col_offset],
+                self.source_lines[start_line - 1][start_col:],
+                *self.source_lines[start_line : end_line - 1],
+                self.source_lines[end_line - 1][:end_col],
             ]
         ).decode()
 

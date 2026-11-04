@@ -209,7 +209,7 @@ class TestProbes(CandidateRecords):
             self.smell(
                 node,
                 evidence_text("PY10b_legacy", attribute=node.attr),
-                variant_key="PY10b_legacy",
+                variant_key="PY10b:legacy",
             )
         self.generic_visit(node)
 
@@ -268,7 +268,7 @@ class TestProbes(CandidateRecords):
                     site,
                     evidence_text("PY10b_self_patch", symbol=symbol),
                     related,
-                    variant_key="PY10b_self_patch",
+                    variant_key="PY10b:patch",
                 )
         self.generic_visit(node)
         self.symbols.pop()
@@ -282,7 +282,7 @@ class TestProbes(CandidateRecords):
                 node,
                 evidence_text("PY10b_raw_text"),
                 tuple(dict.fromkeys(origin[1])),
-                variant_key="PY10b_raw_text",
+                variant_key="PY10b:raw-text",
             )
 
     def getter_mutations(self, nodes):
@@ -330,6 +330,6 @@ class TestProbes(CandidateRecords):
                         "PY10b_getter_mutation", method=getter.method, name=name
                     ),
                     (*getter.mutations, node),
-                    variant_key="PY10b_getter_mutation",
+                    variant_key="PY10b:mutation",
                 )
                 getter.mutations.clear()

@@ -15,7 +15,7 @@ from .reachability import (
     moved_defenses,
     target_name,
 )
-from .registry import evidence_text, verify_text
+from .registry import VERIFY_KEYS, evidence_text, verify_text
 from .scope import git, intersects, role, touches
 
 
@@ -26,21 +26,38 @@ def render(result, output_format):
     summary = result["summary"]
     print(
         f"Scanned {summary['files_scanned']} files "
-        f"({summary['cross_checked_files']} cross-checked); "
+        f"({summary['cross_checked_files']} cross-checked) in {summary['mode']} mode; "
         f"{summary['candidate_count']} candidates, "
         f"{summary['parse_error_count']} parse errors"
     )
     for error in result["parse_errors"]:
         print(f"[PARSE_ERROR] {error['path']}: {error['error']}")
-    for candidate in result["candidates"]:
+    candidates = result["candidates"]
+    if candidates:
+        print("Verification Legend:")
+        for verify in dict.fromkeys(candidate["verify"] for candidate in candidates):
+            print(f"  [{VERIFY_KEYS[verify]}] {verify}")
+    default_tag = "path-audit" if summary["mode"] == "paths" else "changed"
+    path = None
+    for candidate in candidates:
+        if candidate["path"] != path:
+            path = candidate["path"]
+            print(f"=== {path} ===")
+        short_key = VERIFY_KEYS[candidate["verify"]]
         start, end = candidate["span"]
+        span = str(start) if start == end else f"{start}-{end}"
+        tag = candidate["change_tag"]
+        tag_suffix = "" if tag == default_tag else f" [{tag}]"
         print(
-            f"[{candidate['id']}] {candidate['path']}:{start}-{end} "
-            f"({candidate['symbol']}) — {candidate['rule']} [{candidate['change_tag']}]"
+            f"[{candidate['id']}] :{span} "
+            f"({candidate['symbol']}) {short_key}{tag_suffix}"
         )
-        print(f"  Code: {candidate['code']}")
+        if short_key not in {"PY10c:default", "PY10c:bundle"} and not (
+            candidate["rule"] == "PY04_lossy_falsy_coalesce"
+            and not candidate["evidence"].startswith("fallback ")
+        ):
+            print(f"  Code: {candidate['code']}")
         print(f"  Evidence: {candidate['evidence']}")
-        print(f"  Verify: {candidate['verify']}")
 
 
 def bundle_coalesces(candidates):
@@ -59,6 +76,30 @@ def bundle_coalesces(candidates):
         members.sort(key=lambda item: (item["span"][0], item["_coalesce"][0]))
         candidate = members[0]
         if len(members) >= 2:
+            top_level, sites = [], []
+            for item in members:
+                col, end_col, fallback = item["_coalesce"]
+                code = item["code"]
+                line, end_line = item["span"]
+                for index, outer in enumerate(top_level):
+                    outer_col, outer_end, _ = outer["_coalesce"]
+                    if (
+                        line == end_line == outer["span"][0] == outer["span"][1]
+                        and outer_col <= col
+                        and end_col <= outer_end
+                        and (col, end_col) != (outer_col, outer_end)
+                    ):
+                        sites[index] += evidence_text(
+                            "PY04_bundle_inner", code=code, fallback=fallback
+                        )
+                        break
+                else:
+                    top_level.append(item)
+                    sites.append(
+                        evidence_text(
+                            "PY04_bundle_site", line=line, code=code, fallback=fallback
+                        )
+                    )
             candidate["span"] = [
                 min(item["span"][0] for item in members),
                 max(item["span"][1] for item in members),
@@ -66,20 +107,10 @@ def bundle_coalesces(candidates):
             candidate["evidence"] = evidence_text(
                 "PY04_bundle",
                 count=len(members),
-                symbol=candidate["symbol"],
-                sites="; ".join(
-                    evidence_text(
-                        "PY04_bundle_site",
-                        line=item["span"][0],
-                        code=item["code"],
-                        fallback=item["_coalesce"][1],
-                    )
-                    for item in members
-                ),
+                sites="; ".join(sites),
             )
-            candidate["code"] = "; ".join(item["code"] for item in members)
             if len({item["verify"] for item in members}) > 1:
-                candidate["verify"] = verify_text("PY04_mixed")
+                candidate["verify"] = verify_text("PY04:mixed")
         bundled.append(candidate)
     return bundled
 
@@ -159,7 +190,9 @@ def scan(root, files, base, tip, args):
     for index, candidate in enumerate(candidates, 1):
         candidate.pop("_scope")
         candidate.pop("_coalesce", None)
-        candidate["code"] = candidate["code"][:200]
+        code = candidate["code"]
+        if len(code) > 200:
+            candidate["code"] = code[:197] + "..."
         candidate["id"] = f"C{index:02d}"
     return {
         "summary": {

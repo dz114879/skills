@@ -26,8 +26,8 @@ from .ast_helpers import (
 )
 from .probes_prod import CandidateProbes
 from .registry import (
-    PY10A_BASE_SECTIONS,
     PY10C_FRAMEWORK_DECORATORS,
+    RULES,
     evidence_text,
     verify_text,
 )
@@ -100,9 +100,7 @@ def moved_defenses(
                 signature=", ".join(parts),
                 origins=", ".join(lost[signature]),
             )
-            candidate["verify"] = verify_text(
-                "PY10a_moved_defense", base_section=PY10A_BASE_SECTIONS[rule]
-            )
+            candidate["verify"] = verify_text(f"PY10a:{RULES[rule]['family']}")
 
 
 def snapshot_sources(root, tip, excludes):
@@ -395,15 +393,21 @@ def constant_defaults(definition, calls, change_tag, clauses):
         evidence = evidence_text(
             "PY10c_constant_default_single",
             name=name,
+            default=unparse(default),
             calls=len(calls),
             value=value,
             clauses=clauses,
         )
-        verify_variant = "PY10c_constant_default_single"
+        verify_variant = "PY10c:default"
     else:
         params = ", ".join(
-            evidence_text("PY10c_constant_parameter", name=name, value=value)
-            for name, _, value in uniform
+            evidence_text(
+                "PY10c_constant_parameter",
+                name=name,
+                default=unparse(default),
+                value=value,
+            )
+            for name, default, value in uniform
         )
         evidence = evidence_text(
             "PY10c_constant_default_bundle",
@@ -411,7 +415,7 @@ def constant_defaults(definition, calls, change_tag, clauses):
             calls=len(calls),
             clauses=clauses,
         )
-        verify_variant = "PY10c_constant_default_bundle"
+        verify_variant = "PY10c:bundle"
     record = CandidateRecords(source)
     record.symbols = symbol.split(".")
     record.add(
@@ -610,7 +614,6 @@ def cross_reachability(root, tip, args, selected, lost, active_trees, errors):
         evidence = evidence_text(
             "PY10c_references",
             definitions=len(defs),
-            definition_label="definition" if len(defs) == 1 else "definitions",
             prod_calls=len(prod.calls),
             prod_refs=prod.non_calls,
             test_calls=len(test.calls),
@@ -629,9 +632,7 @@ def cross_reachability(root, tip, args, selected, lost, active_trees, errors):
                 "PY10c_cross_test_reachability",
                 node,
                 evidence + clauses(path, node),
-                verify_text(
-                    "PY10c_cross_test" if tag == "cross-test" else "PY10c_orphaned"
-                ),
+                verify_text("PY10c:reach"),
             )
             candidates.append({**record.candidates[0], "path": path, "change_tag": tag})
     return candidates, len(paths)

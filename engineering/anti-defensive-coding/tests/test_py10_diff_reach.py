@@ -50,21 +50,21 @@ class Py10DiffReachTests(ExtractorTestCase):
         assert {c["path"] for c in moved} == {f"{name}.py" for name in defenses}
         expected_moved = {
             "reflect.py": (
-                "Receiver item; parameter item: <unannotated> at line 4; "
-                "receiver class unknown; same PY01_reflect_default signature "
+                "item; parameter item: <unannotated> at :4; "
+                "same PY01_reflect_default signature "
                 "'value' lost from base reflect.py:2 (original) "
                 "(signature match only)",
                 "python.md §1",
             ),
             "handler.py": (
-                "Handler catches (TypeError, KeyError) at line 8; "
+                "Handler catches (TypeError, KeyError) at :8; "
                 "broad/multi-exception handler has a non-raising exit; "
                 "same PY02_error_washing signature KeyError, TypeError "
                 "lost from base handler.py:4 (original) (signature match only)",
                 "python.md §4",
             ),
             "coalesce.py": (
-                "Lookup coalesces to 30 at line 6; "
+                "fallback 30; "
                 "same PY04_lossy_falsy_coalesce signature 'value' "
                 "lost from base coalesce.py:2 (original) (signature match only)",
                 "python.md §6",
@@ -107,8 +107,8 @@ class Py10DiffReachTests(ExtractorTestCase):
         assert candidates[0]["symbol"] == "Owner.destination"
         assert candidates[0]["path"] == "new.py"
         assert (
-            "Receiver item; parameter item: <unannotated> at line 45; "
-            "receiver class unknown; same PY01_reflect_default signature "
+            "item; parameter item: <unannotated> at :45; "
+            "same PY01_reflect_default signature "
             "'value' lost from base old.py:43 (Owner.original) "
             "(signature match only)" in candidates[0]["evidence"]
         )
@@ -222,7 +222,7 @@ class Py10DiffReachTests(ExtractorTestCase):
             assert len(candidates) == len(gained)
             assert set(moved) == set(expected)
             for symbol, names in expected.items():
-                assert "Handler catches Exception at line" in moved[symbol]
+                assert "Handler catches Exception at :" in moved[symbol]
                 assert (
                     "; same PY02_error_washing signature Exception lost from "
                     in moved[symbol]
@@ -717,8 +717,8 @@ class Py10DiffReachTests(ExtractorTestCase):
         assert {c["change_tag"] for c in candidates} == {"cross-test"}
         assert result["summary"]["cross_checked_files"] == 3
         for candidate in candidates:
-            assert "prod calls: 0" in candidate["evidence"]
-            assert "test calls: 1" in candidate["evidence"]
+            assert "prod_calls=0" in candidate["evidence"]
+            assert "test_calls=1" in candidate["evidence"]
             if candidate["symbol"] == "shared":
                 assert "ambiguous_defs: 2" in candidate["evidence"]
         for reference in (
@@ -876,12 +876,12 @@ class Py10DiffReachTests(ExtractorTestCase):
                 ]
                 assert len(as_test) == 1
                 assert as_test[0]["change_tag"] == "cross-test"
-                assert "test calls: 1, test non-call refs: 1" in as_test[0]["evidence"]
+                assert "test_calls=1, test_refs=1" in as_test[0]["evidence"]
         self.put("caller.py", "from app import configure as local\nlocal(True)\n")
         resolved = self.scan("--paths", "app.py")["candidates"]
         assert len(resolved) == 1
         assert resolved[0]["change_tag"] == "path-audit"
-        assert "uniform value: True" in resolved[0]["evidence"]
+        assert "uniform: True" in resolved[0]["evidence"]
 
     def test_cross_default_effective_arguments_and_escape_suppression(self):
         self.init_repo()
@@ -1036,8 +1036,8 @@ class Py10DiffReachTests(ExtractorTestCase):
             assert len(candidates) == int(uniform is not None), (label, candidates)
             if uniform is not None:
                 assert candidates[0]["change_tag"] == "path-audit"
-                assert f"uniform value: {uniform}" in candidates[0]["evidence"]
-                assert "prod call sites" in candidates[0]["evidence"]
+                assert f"uniform: {uniform}" in candidates[0]["evidence"]
+                assert "prod calls" in candidates[0]["evidence"]
                 assert candidates[0]["code"] == "False"
                 assert "Counterweight" in candidates[0]["verify"]
 
@@ -1066,8 +1066,7 @@ class Py10DiffReachTests(ExtractorTestCase):
                     "change_tag": "path-audit",
                     "span": [1, 1],
                     "code": "False",
-                    "evidence": "Parameter 'flag': 2 resolved prod call sites; "
-                    "uniform value: True",
+                    "evidence": "Param 'flag'=False: 2 prod calls; uniform: True",
                     "verify": "Does every immediate production binding, recursion included, "
                     "fix this value, so the override is dead while the default's policy stays? "
                     "Is it an export or extension contract (Counterweight)? See tests.md §4.",
@@ -1100,8 +1099,8 @@ class Py10DiffReachTests(ExtractorTestCase):
                 "change_tag": "path-audit",
                 "span": [2, 6],
                 "code": 'False; "policy"',
-                "evidence": "Parameters 'zulu' (uniform value: True), "
-                "'alpha' (uniform value: <DEFAULT>): 2 resolved prod call sites",
+                "evidence": "Params 'zulu'=False (uniform: True), "
+                "'alpha'='policy' (uniform: <DEFAULT>): 2 prod calls",
                 "verify": "Does every immediate production binding, recursion included, "
                 "fix each value, so the override is dead while the default's policy stays? "
                 "Is it an export or extension contract (Counterweight)? See tests.md §4.",
@@ -1148,8 +1147,8 @@ class Py10DiffReachTests(ExtractorTestCase):
                 "" if changed else "; definition unchanged; triggered by deleted call"
             )
             assert (
-                candidate["evidence"] == "Parameters 'zulu' (uniform value: True), "
-                "'alpha' (uniform value: <DEFAULT>): 2 resolved prod call sites"
+                candidate["evidence"] == "Params 'zulu'=False (uniform: True), "
+                "'alpha'='policy' (uniform: <DEFAULT>): 2 prod calls"
                 "; lost call(s): base caller.py:3 (prod)"
                 f"{unchanged}; enclosing class bases: ui.View (not defined in repo)"
             )
@@ -1237,11 +1236,11 @@ class Py10DiffReachTests(ExtractorTestCase):
         self.put("tests/test_client.py", "Client().fetch()\nClient()._fetch_raw()\n")
         private = [
             ("Client._prepare", "path-audit", "3"),
-            ("Client._fetch_raw", "cross-test", "def _fetch_raw(self): return 1"),
+            ("Client._fetch_raw", "cross-test", "def _fetch_raw(self):"),
         ]
         public = [
             ("Client.send", "path-audit", "3"),
-            ("Client.fetch", "cross-test", "def fetch(self): return 1"),
+            ("Client.fetch", "cross-test", "def fetch(self):"),
         ]
         # The package module mentions no method name; `__all__` admits it.
         for package, expected in [
@@ -1283,17 +1282,22 @@ class Py10DiffReachTests(ExtractorTestCase):
         method, default, function, lonely = (c["evidence"] for c in candidates)
         external = "enclosing class bases: ui.View (not defined in repo)"
         for evidence in (method, function):
-            assert "aggregates across 2 prod definitions" in evidence
-            assert "not attributed to this definition" in evidence
-            assert "test calls: 1, test non-call refs: 0" in evidence
+            assert evidence.startswith("defs=2, prod_calls=0, prod_refs=0, ")
+            assert "test_calls=1, test_refs=0" in evidence
             assert "ambiguous_defs: 2" in evidence
-        assert "aggregates across 1 prod definition;" in lonely
+        assert lonely == "defs=1, prod_calls=0, prod_refs=0, test_calls=1, test_refs=0"
         assert "ambiguous_defs" not in lonely
         assert external in method
         assert external in default
-        assert "uniform value: <DEFAULT>" in default
+        assert "uniform: <DEFAULT>" in default
         assert "enclosing class bases" not in function
         assert "enclosing class bases" not in lonely
+        for candidate in (candidates[0], candidates[2], candidates[3]):
+            assert "Counts are terminal-name aggregates" in candidate["verify"]
+            assert (
+                "test references are not attributed to a specific definition"
+                in candidate["verify"]
+            )
 
     def test_cross_orphaned_deleted_calls_and_deleted_file_inventory(self):
         self.init_repo()
@@ -1344,7 +1348,7 @@ class Py10DiffReachTests(ExtractorTestCase):
                 (path, "shared", "cross-test") for path in flagged
             ]
             for candidate in candidates:
-                assert "test calls: 1" in candidate["evidence"]
+                assert "test_calls=1" in candidate["evidence"]
                 assert "ambiguous_defs: 3" in candidate["evidence"]
 
     def test_cross_diff_deleted_calls_trigger_on_net_loss_naming_lost_sites(self):
@@ -1408,7 +1412,7 @@ class Py10DiffReachTests(ExtractorTestCase):
             ), label
             if lost:
                 evidence = candidates[0]["evidence"]
-                assert "uniform value: <DEFAULT>" in evidence
+                assert "uniform: <DEFAULT>" in evidence
                 assert f"lost call(s): {lost}" in evidence
                 assert "definition unchanged" in evidence
 
@@ -1429,7 +1433,7 @@ class Py10DiffReachTests(ExtractorTestCase):
             candidates = isolated["candidates"]
             assert len(candidates) == 1
             assert candidates[0]["change_tag"] == "cross-test"
-            assert "prod calls: 0" in candidates[0]["evidence"]
+            assert "prod_calls=0" in candidates[0]["evidence"]
         assert self.scan("--base", base)["candidates"] == []
 
     def test_cross_cli_parses_each_active_file_at_most_once(self):
@@ -1587,7 +1591,7 @@ class Py10DiffReachTests(ExtractorTestCase):
         candidates = self.scan("--base", base)["candidates"]
         callback = next(c for c in candidates if c["symbol"] == "callback")
         assert callback["change_tag"] == "cross-test"
-        assert "test calls: 0, test non-call refs: 1" in callback["evidence"]
+        assert "test_calls=0, test_refs=1" in callback["evidence"]
         assert "lost call(s)" not in callback["evidence"]
         idle = next(c for c in candidates if c["symbol"] == "idle")
         assert idle["change_tag"] == "orphaned"
@@ -1602,4 +1606,34 @@ class Py10DiffReachTests(ExtractorTestCase):
             c
             for c in self.scan("--base", base)["candidates"]
             if c["symbol"] == "configure"
+        ]
+
+    def test_cross_reach_code_keeps_only_sync_and_async_signatures(self):
+        self.init_repo()
+        source = (
+            "def lost(value: int):\n"
+            '    """This body is never code context."""\n'
+            "    return value + 1\n"
+            "async def callback(\n"
+            "    café: str,\n"
+            "):\n"
+            '    """Async body also stays out of code context."""\n'
+            "    return café\n"
+            'def short(): return "same-line body"\n'
+        )
+        self.put("app.py", source)
+        self.put("caller.py", "lost(1)\n")
+        self.put("tests/test_app.py", 'callback("x")\nshort()\n')
+        base = self.commit()
+        candidates = self.scan("--paths", "app.py")["candidates"]
+        assert [(c["symbol"], c["change_tag"], c["code"]) for c in candidates] == [
+            ("callback", "cross-test", "async def callback( café: str, ):"),
+            ("short", "cross-test", "def short():"),
+        ]
+        self.put("caller.py", "")
+        self.put("app.py", source.replace("return café", 'return café + "!"'))
+        candidates = self.scan("--base", base)["candidates"]
+        assert [(c["symbol"], c["change_tag"], c["code"]) for c in candidates] == [
+            ("lost", "orphaned", "def lost(value: int):"),
+            ("callback", "cross-test", "async def callback( café: str, ):"),
         ]

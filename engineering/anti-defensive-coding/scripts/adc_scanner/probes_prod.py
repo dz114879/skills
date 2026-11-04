@@ -59,7 +59,6 @@ from .registry import (
     PY08_COPY_CALLS,
     PY08_ROUNDTRIP_PAIRS,
     PY09_TX_TOKENS,
-    RULES,
     evidence_text,
     verify_text,
 )
@@ -171,7 +170,6 @@ class CandidateProbes(CandidateRecords):
                         and test.operand.id == name
                     )
                     if matches and exits(guard.body) & {"raise", "bare", "return"}:
-                        note = verify_text("PY03_get_default_note") if via_get else ""
                         self.add(
                             "PY03_default_shadows_check",
                             statement,
@@ -181,9 +179,7 @@ class CandidateProbes(CandidateRecords):
                                 default_line=statement.lineno,
                                 guard_line=guard.lineno,
                             ),
-                            verify_text(
-                                "PY03_default_shadows_check", name=name, note=note
-                            ),
+                            verify_text("PY03:get" if via_get else "PY03"),
                             related=(guard.test, *guard.body),
                         )
                 if any(name in binding_names(child) for child in local_walk(guard)):
@@ -203,7 +199,7 @@ class CandidateProbes(CandidateRecords):
                 "PY10b_test_smell",
                 node,
                 evidence_text("PY10b_default_hook"),
-                verify_text("PY10b_default_hook"),
+                verify_text("PY10b:hook"),
             )
         self.generic_visit(node)
 
@@ -221,20 +217,20 @@ class CandidateProbes(CandidateRecords):
                 for value in node.values[:-1]
             )
         ):
-            verify = verify_text("PY04_truthy" if truth else "PY04_falsy")
+            verify = verify_text("PY04:truthy" if truth else "PY04:falsy")
             self.add(
                 "PY04_lossy_falsy_coalesce",
                 node,
                 evidence_text(
                     "PY04_lossy_falsy_coalesce",
                     fallback=unparse(fallback),
-                    line=node.lineno,
                 ),
                 verify,
                 signature=lookup_signature(node.values[:-1]),
             )
             self.candidates[-1]["_coalesce"] = (
                 node.col_offset,
+                node.end_col_offset,
                 unparse(fallback),
             )
         self.generic_visit(node)
@@ -298,7 +294,7 @@ class CandidateProbes(CandidateRecords):
                         for context in contexts
                     ),
                 ),
-                verify_text("PY09_tx_check"),
+                verify_text("PY09:tx-check"),
                 related=(*checks[1:], *contexts),
             )
 
@@ -323,7 +319,7 @@ class CandidateProbes(CandidateRecords):
                             for method, load in readers
                         ),
                     ),
-                    verify_text("PY07_return_stash", attribute=attr),
+                    verify_text("PY07:stash"),
                     related=(returned, *(load for _, load in readers)),
                 )
             if isinstance(child, ast.Dict):
@@ -344,7 +340,7 @@ class CandidateProbes(CandidateRecords):
                             try_line=child.lineno,
                             reset_line=resets[attr][0].lineno,
                         ),
-                        verify_text("PY07_state_smuggling", attribute=attr),
+                        verify_text("PY07:try"),
                         related=related,
                     )
             for assignment in write_targets(child):
@@ -373,7 +369,7 @@ class CandidateProbes(CandidateRecords):
                 value=unparse(value),
                 line=key.lineno,
             ),
-            verify_text("PY07_dict_dependency"),
+            verify_text("PY07:dict"),
             related=() if assignment is not None else (value,),
         )
 
@@ -476,7 +472,7 @@ class CandidateProbes(CandidateRecords):
             evidence_text(
                 "PY05_dead_param_evasion", name=name, fact=fact, line=node.lineno
             ),
-            verify_text("PY05_dead_param_evasion", name=name),
+            verify_text("PY05"),
             related=related,
         )
 
@@ -520,7 +516,7 @@ class CandidateProbes(CandidateRecords):
                                 *factory_facts,
                             ]
                         ),
-                        verify_text("PY08_comprehension", name=name),
+                        verify_text("PY08:comp"),
                         related=(generator.target,),
                     )
                     break
@@ -554,18 +550,18 @@ class CandidateProbes(CandidateRecords):
                     inner=unparse(inner.func),
                     line=node.lineno,
                 ),
-                verify_text("PY08_roundtrip_copy"),
+                verify_text("PY08:roundtrip"),
             )
 
-    def lock_candidate(self, node, fact, variant_key):
+    def lock_candidate(self, node, fact):
         contexts = self.lock_contexts[node]
-        catalogue = (
-            RULES["PY09_io_or_tx_in_lock"]["catalogue_sections"][2]
+        variant_key = (
+            "PY09:tx"
             if any(
                 context_tokens(context) & PY09_TX_TOKENS["protected"]
                 for context in contexts
             )
-            else RULES["PY09_io_or_tx_in_lock"]["catalogue_sections"][0]
+            else "PY09:lock"
         )
         self.add(
             "PY09_io_or_tx_in_lock",
@@ -583,7 +579,7 @@ class CandidateProbes(CandidateRecords):
                     for context in contexts
                 ),
             ),
-            verify_text(variant_key, catalogue=catalogue),
+            verify_text(variant_key),
             related=tuple(contexts),
         )
 
@@ -591,9 +587,7 @@ class CandidateProbes(CandidateRecords):
         for item in node.items:
             context = item.context_expr
             if context in self.transaction_contexts and context in self.lock_contexts:
-                self.lock_candidate(
-                    context, evidence_text("PY09_nested_tx_fact"), "PY09_nested_tx"
-                )
+                self.lock_candidate(context, evidence_text("PY09_nested_tx_fact"))
         self.generic_visit(node)
 
     visit_AsyncWith = visit_With
@@ -665,9 +659,7 @@ class CandidateProbes(CandidateRecords):
             binding, annotation = self.receiver_binding(receiver)
             facts.extend(binding)
             cls = named_class(annotation, self.classes)
-        if cls is None:
-            facts.append(evidence_text("PY01_unknown_class"))
-        else:
+        if cls is not None:
             bases = ", ".join(unparse(base) for base in cls.bases) or evidence_text(
                 "PY01_implicit_base"
             )
@@ -675,9 +667,7 @@ class CandidateProbes(CandidateRecords):
                 evidence_text("PY01_receiver_class", name=cls.name, bases=bases)
             )
             facts.extend(
-                evidence_text(
-                    "PY01_declared_attribute", name=cls.name, attribute=attr, line=line
-                )
+                evidence_text("PY01_declared_attribute", attribute=attr, line=line)
                 for line in sorted(self.attributes.get((cls, attr), []))
             )
         return "; ".join(facts)
@@ -722,7 +712,6 @@ class CandidateProbes(CandidateRecords):
             self.lock_candidate(
                 node,
                 evidence_text("PY09_lock_io_fact", callable=unparse(node.func)),
-                "PY09_lock_io",
             )
         contexts = (
             self.iteration_contexts(node)
@@ -744,7 +733,7 @@ class CandidateProbes(CandidateRecords):
                         for loop, _ in contexts
                     ),
                 ),
-                verify_text("PY08_iteration_copy"),
+                verify_text("PY08:loop"),
                 related=tuple(header for _, headers in contexts for header in headers),
             )
         if (
@@ -775,7 +764,7 @@ class CandidateProbes(CandidateRecords):
                 "PY01_reflect_default",
                 node,
                 self.reflection_evidence(node.args[0], cls, attr),
-                verify_text("PY01_reflect_default"),
+                verify_text("PY01"),
                 signature=(repr(attr),),
             )
         self.generic_visit(node)
@@ -847,9 +836,7 @@ class CandidateProbes(CandidateRecords):
                     else evidence_text("PY02_bare_except")
                 )
                 verify = (
-                    verify_text("PY02_hook_diagnostic")
-                    if washes_hook
-                    else verify_text("PY02_error_washing")
+                    verify_text("PY02:hook") if washes_hook else verify_text("PY02")
                 )
                 self.add(
                     "PY02_error_washing",

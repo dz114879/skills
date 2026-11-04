@@ -1,5 +1,6 @@
 """Immutable rule metadata, exact wording templates, and probe vocabularies."""
 
+from collections.abc import Mapping
 import json
 from pathlib import Path
 from types import MappingProxyType
@@ -19,6 +20,9 @@ RULES = MappingProxyType(
     }
 )
 VERIFY_TEMPLATES = MappingProxyType(_catalogue["verify_templates"])
+VERIFY_KEYS: Mapping[str, str] = MappingProxyType(
+    {text: key for key, text in VERIFY_TEMPLATES.items()}
+)
 EVIDENCE_TEMPLATES = MappingProxyType(_catalogue["evidence_templates"])
 
 SKIP_SEGMENTS: frozenset[str] = frozenset(_vocabularies["skip_segments"])
@@ -41,7 +45,6 @@ PY09_TX_TOKENS = MappingProxyType(
 PY09_IO_CALLS = MappingProxyType(
     {name: tuple(calls) for name, calls in _vocabularies["py09_io_calls"].items()}
 )
-PY10A_BASE_SECTIONS = MappingProxyType(_vocabularies["py10a_base_sections"])
 PY10B_PATCH_METHODS = MappingProxyType(
     {
         name: frozenset(methods)
@@ -53,9 +56,8 @@ PY10C_FRAMEWORK_DECORATORS: frozenset[str] = frozenset(
 )
 
 
-def verify_text(variant_key: str, **kwargs: object) -> str:
-    template = VERIFY_TEMPLATES[variant_key]
-    return template.format(**kwargs) if kwargs else template
+def verify_text(variant_key: str) -> str:
+    return VERIFY_TEMPLATES[variant_key]
 
 
 def evidence_text(variant_key: str, **kwargs: object) -> str:

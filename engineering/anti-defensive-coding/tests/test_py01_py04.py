@@ -83,10 +83,10 @@ class Py01Py04Tests(ExtractorTestCase):
             evidence = candidates["inspect"]["evidence"]
             assert "item: Record" in evidence
             if visible:
-                assert "'cache' at line 6" in evidence
+                assert "'cache' at :6" in evidence
             else:
-                assert "class unknown" in evidence
-                assert "'cache' at line 6" not in evidence
+                assert "class " not in evidence
+                assert "'cache' at :6" not in evidence
 
     def test_constructor_helpers_distinguish_lazy_writes_from_declarations(self):
         for body, expected in (
@@ -238,15 +238,15 @@ class Py01Py04Tests(ExtractorTestCase):
         assert len(result["candidates"]) == 3
         first, second, third = result["candidates"]
         assert first["symbol"] == "Second.read.nested"
-        assert "Receiver self" in first["evidence"]
+        assert "self" in first["evidence"]
         assert "class Second" in first["evidence"]
         assert "First" not in first["evidence"]
-        assert "'value' at line 8" in first["evidence"]
-        assert "'value' at line 10" in first["evidence"]
-        assert "'other' at line 11" in second["evidence"]
+        assert "'value' at :8" in first["evidence"]
+        assert "'value' at :10" in first["evidence"]
+        assert "'other' at :11" in second["evidence"]
         assert third["symbol"] == "<module>"
-        assert "Receiver local" in third["evidence"]
-        assert "class unknown" in third["evidence"]
+        assert "local" in third["evidence"]
+        assert "class " not in third["evidence"]
         assert "Second" not in third["evidence"]
 
     def test_receiver_evidence_stops_at_inner_bindings_but_preserves_closure_annotations(
@@ -277,10 +277,10 @@ class Py01Py04Tests(ExtractorTestCase):
             assert len(candidates) == 1
             evidence = candidates[0]["evidence"]
             if known:
-                assert re.search(r"item: Record.*line 3", evidence)
-                assert "'value' at line 2" in evidence
+                assert re.search(r"item: Record.*:3", evidence)
+                assert "'value' at :2" in evidence
             else:
-                assert "class unknown" in evidence
+                assert "class " not in evidence
                 assert "Record" not in evidence
 
     def test_receiver_evidence_reports_annotations_bindings_and_owning_class(self):
@@ -307,27 +307,27 @@ class Py01Py04Tests(ExtractorTestCase):
             for candidate in self.scan("--paths", ".")["candidates"]
             if candidate["rule"] == "PY01_reflect_default"
         }
-        assert "Receiver self" in evidence["Record.read"]
+        assert "self" in evidence["Record.read"]
         assert "class Record" in evidence["Record.read"]
         assert re.search(r"bases:.*Base.*external.Mixin", evidence["Record.read"])
-        assert "'cache' at line 8" in evidence["Record.read"]
-        assert re.search(r"item: Record.*line 13", evidence["typed"])
-        assert "'value' at line 4" in evidence["typed"]
-        assert "'value' at line 4" in evidence["forward"]
-        assert re.search(r"item: Any.*line 15", evidence["unknown"])
-        assert "class unknown" in evidence["unknown"]
-        assert "Receiver item.child" in evidence["member"]
-        assert re.search(r"item: Record.*line 17", evidence["member"])
-        assert "class unknown" in evidence["member"]
-        assert "'value' at line 4" not in evidence["member"]
+        assert "'cache' at :8" in evidence["Record.read"]
+        assert re.search(r"item: Record.*:13", evidence["typed"])
+        assert "'value' at :4" in evidence["typed"]
+        assert "'value' at :4" in evidence["forward"]
+        assert re.search(r"item: Any.*:15", evidence["unknown"])
+        assert "class " not in evidence["unknown"]
+        assert "item.child" in evidence["member"]
+        assert re.search(r"item: Record.*:17", evidence["member"])
+        assert "class " not in evidence["member"]
+        assert "'value' at :4" not in evidence["member"]
         assert re.search(
-            r"local binding cls = load_plugin\(\).*line 20", evidence["plugin"]
+            r"local binding cls = load_plugin\(\).*:20", evidence["plugin"]
         )
         assert "control-flow unresolved" in evidence["plugin"]
-        assert "class unknown" in evidence["plugin"]
-        assert re.search(r"item = Record\(\).*line 23", evidence["assigned"])
+        assert "class " not in evidence["plugin"]
+        assert re.search(r"item = Record\(\).*:23", evidence["assigned"])
         assert "control-flow unresolved" in evidence["assigned"]
-        assert "class unknown" in evidence["assigned"]
+        assert "class " not in evidence["assigned"]
         for facts in evidence.values():
             assert "Unrelated" not in facts
 
@@ -357,11 +357,11 @@ class Py01Py04Tests(ExtractorTestCase):
         )
         candidates = self.scan("--paths", ".")["candidates"]
         for candidate in candidates[:3]:
-            assert "declares attribute" not in candidate["evidence"]
-        assert "'real' at line 9" in candidates[3]["evidence"]
-        assert "'one' at line 3" in candidates[4]["evidence"]
-        assert "'two' at line 3" in candidates[5]["evidence"]
-        assert "declares attribute" not in candidates[6]["evidence"]
+            assert "declares " not in candidate["evidence"]
+        assert "'real' at :9" in candidates[3]["evidence"]
+        assert "'one' at :3" in candidates[4]["evidence"]
+        assert "'two' at :3" in candidates[5]["evidence"]
+        assert "declares " not in candidates[6]["evidence"]
 
     def test_lossy_coalesce_bundles_falsy_sites_but_keeps_singletons(self):
         self.put(
@@ -399,30 +399,28 @@ class Py01Py04Tests(ExtractorTestCase):
                 "<module>",
                 [1, 1],
                 'data.get("zero") or 0',
-                "Lookup coalesces to 0 at line 1",
+                "fallback 0",
                 falsy_verify,
             ),
             (
                 "<module>",
                 [2, 2],
                 'data["empty"] or ""',
-                "Lookup coalesces to '' at line 2",
+                "fallback ''",
                 falsy_verify,
             ),
             (
                 "single",
                 [5, 5],
                 "data.value or False",
-                "Lookup coalesces to False at line 5",
+                "fallback False",
                 falsy_verify,
             ),
             (
                 "load",
                 [8, 11],
-                'data.get("count") or 0; data.items or []',
-                "2 coalescing lookups in load: "
-                'line 8: data.get("count") or 0 -> 0; '
-                "line 10: data.items or [] -> []",
+                'data.get("count") or 0',
+                '2 sites: :8 data.get("count") or 0 -> 0; :10 data.items or [] -> []',
                 falsy_verify,
             ),
         ]
@@ -477,11 +475,11 @@ class Py01Py04Tests(ExtractorTestCase):
             candidate = candidates[0]
             assert candidate["rule"] == "PY04_lossy_falsy_coalesce"
             assert candidate["span"] == [2, 5]
-            assert candidate["code"] == 'data.get("' + "x" * 190
+            assert candidate["code"] == 'data.get("' + "x" * 187 + "..."
             assert (
-                candidate["evidence"] == "2 coalescing lookups in load: "
-                f'line 2: data.get("{long_key}") or 30 -> 30; '
-                f'line 4: data["name"] or {fallback} -> {fallback}'
+                candidate["evidence"] == "2 sites: "
+                f':2 data.get("{long_key}") or 30 -> 30; '
+                f':4 data["name"] or {fallback} -> {fallback}'
             )
             assert candidate["verify"] == verify
 
@@ -520,24 +518,20 @@ class Py01Py04Tests(ExtractorTestCase):
             ("C02", "a.py", "Record.label", [11, 15]),
             ("C03", "b.py", "Record.label", [3, 3]),
         ]
+        assert candidates[0]["code"] == 'data.get("key") or "default"'
         assert (
-            candidates[0]["code"]
-            == 'data.get("key") or "default"; data.get("value") or ""; '
-            'data.get("next") or 0; data.get("last") or []'
+            candidates[0]["evidence"] == "4 sites: "
+            ':3 data.get("key") or "default" -> \'default\'; '
+            ':4 data.get("value") or "" -> \'\'; '
+            ':5 data.get("next") or 0 -> 0; '
+            ':6 data.get("last") or [] -> []'
         )
         assert (
-            candidates[0]["evidence"] == "4 coalescing lookups in Record: "
-            'line 3: data.get("key") or "default" -> \'default\'; '
-            'line 4: data.get("value") or "" -> \'\'; '
-            'line 5: data.get("next") or 0 -> 0; '
-            'line 6: data.get("last") or [] -> []'
+            candidates[1]["evidence"] == "2 sites: "
+            ':11 self._row.get("label") or "" -> \'\'; '
+            ':15 self._row["setter"] or "" -> \'\''
         )
-        assert (
-            candidates[1]["evidence"] == "2 coalescing lookups in Record.label: "
-            'line 11: self._row.get("label") or "" -> \'\'; '
-            'line 15: self._row["setter"] or "" -> \'\''
-        )
-        assert candidates[2]["evidence"] == "Lookup coalesces to '' at line 3"
+        assert candidates[2]["evidence"] == "fallback ''"
 
     def test_lossy_coalesce_bundles_only_eligible_sites_after_moved_promotion(self):
         self.init_repo()
@@ -579,20 +573,18 @@ class Py01Py04Tests(ExtractorTestCase):
             coalesced, moved = candidates
             if remaining == 1:
                 assert coalesced["code"] == 'data.get("first") or []'
-                assert coalesced["evidence"] == "Lookup coalesces to [] at line 6"
+                assert coalesced["evidence"] == "fallback []"
             else:
+                assert coalesced["code"] == 'data.get("first") or []'
                 assert (
-                    coalesced["code"] == 'data.get("first") or []; data["last"] or ""'
-                )
-                assert (
-                    coalesced["evidence"] == "2 coalescing lookups in destination: "
-                    'line 6: data.get("first") or [] -> []; '
-                    'line 8: data["last"] or "" -> \'\''
+                    coalesced["evidence"] == "2 sites: "
+                    ':6 data.get("first") or [] -> []; '
+                    ':8 data["last"] or "" -> \'\''
                 )
             assert "distinct legitimate one" in coalesced["verify"]
             assert moved["code"] == 'data.get("moved") or 30'
             assert (
-                moved["evidence"] == "Lookup coalesces to 30 at line 7; "
+                moved["evidence"] == "fallback 30; "
                 "same PY04_lossy_falsy_coalesce signature 'moved' "
                 "lost from base coalesce.py:2 (original) (signature match only)"
             )
@@ -602,8 +594,9 @@ class Py01Py04Tests(ExtractorTestCase):
                 assert candidate["symbol"] == "destination"
                 assert not any(key.startswith("_") for key in candidate)
             compact = self.cli("--base", base)
-            assert "PY04_lossy_falsy_coalesce [changed]" in compact
-            assert "PY10a_moved_defense [moved-defense]" in compact
+            assert "(destination) PY04:falsy" in compact
+            assert "(destination) PY10a:PY04 [moved-defense]" in compact
+            assert "[changed]" not in compact
 
     def test_lossy_coalesce_separates_truthy_and_falsy_fallback_prompts(self):
         prompts = {True: set(), False: set()}
@@ -638,8 +631,7 @@ class Py01Py04Tests(ExtractorTestCase):
                 candidate = candidates[0]
                 assert candidate["rule"] == "PY04_lossy_falsy_coalesce"
                 assert candidate["span"] == [2, 2]
-                assert fallback in candidate["evidence"]
-                assert "line 2" in candidate["evidence"]
+                assert candidate["evidence"] == f"fallback {fallback}"
                 assert "Counterweight" in candidate["verify"]
                 truthy = fallback in {"30", "'default'", "True", "-1"}
                 prompts[truthy].add(candidate["verify"])
@@ -656,3 +648,37 @@ class Py01Py04Tests(ExtractorTestCase):
         ]:
             self.put("coalesce.py", f"def load():\n    return {expression}\n")
             assert self.scan("--paths", "coalesce.py")["candidates"] == []
+
+    def test_lossy_coalesce_folds_only_same_line_inner_sites_into_top_level_sites(self):
+        self.put(
+            "coalesce.py",
+            "def load(data):\n"
+            '    value = data.get(data.get(data["key"] or "id") or "key", '
+            'data["other"] or "x") or ""\n'
+            '    left = data["a"] or 0; right = data["b"] or 1\n'
+            "    return (\n"
+            '        data.get(data["nested"] or "n")\n'
+            '        or ""\n'
+            "    )\n",
+        )
+        candidates = self.scan("--paths", ".")["candidates"]
+        assert len(candidates) == 1
+        candidate = candidates[0]
+        outer = (
+            'data.get(data.get(data["key"] or "id") or "key", '
+            'data["other"] or "x") or ""'
+        )
+        assert candidate["span"] == [2, 6]
+        assert candidate["code"] == outer
+        assert candidate["evidence"] == (
+            f"8 sites: :2 {outer} -> ''"
+            ' [inner: data.get(data["key"] or "id") or "key" -> \'key\']'
+            ' [inner: data["key"] or "id" -> \'id\']'
+            ' [inner: data["other"] or "x" -> \'x\']; '
+            ':3 data["a"] or 0 -> 0; :3 data["b"] or 1 -> 1; '
+            ':5 data.get(data["nested"] or "n") or "" -> \'\'; '
+            ':5 data["nested"] or "n" -> \'n\''
+        )
+        compact = self.cli("--paths", ".")
+        assert "  Code:" not in compact
+        assert f"  Evidence: {candidate['evidence']}" in compact

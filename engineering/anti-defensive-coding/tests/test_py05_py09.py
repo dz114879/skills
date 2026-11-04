@@ -58,10 +58,8 @@ class Py05Py09Tests(ExtractorTestCase):
                 candidate = candidates[0]
                 assert candidate["rule"] == "PY03_default_shadows_check"
                 assert candidate["span"] == [2, 4 + len(intervening.splitlines())]
-                assert "line 2" in candidate["evidence"]
-                assert (
-                    f"line {3 + len(intervening.splitlines())}" in candidate["evidence"]
-                )
+                assert ":2" in candidate["evidence"]
+                assert f":{3 + len(intervening.splitlines())}" in candidate["evidence"]
                 assert "Counterweight" in candidate["verify"]
         self.put(
             "defaults.py",
@@ -175,7 +173,7 @@ class Py05Py09Tests(ExtractorTestCase):
                 assert candidates[0]["span"] == [3, 3]
                 assert "discard" in candidates[0]["evidence"]
                 assert "'old'" in candidates[0]["evidence"]
-                assert "line 3" in candidates[0]["evidence"]
+                assert ":3" in candidates[0]["evidence"]
                 assert "caller" in candidates[0]["verify"]
                 assert "Counterweight" in candidates[0]["verify"]
         self.put(
@@ -271,7 +269,7 @@ class Py05Py09Tests(ExtractorTestCase):
                 assert "dual-parameter" in candidate["evidence"]
                 assert "'old'" in candidate["evidence"]
                 assert "'new'" in candidate["evidence"]
-                assert "default None at line 1" in candidate["evidence"]
+                assert "default None at :1" in candidate["evidence"]
                 assert candidate["span"] == [
                     2 + len(before.splitlines()),
                     3 + len(before.splitlines()),
@@ -399,7 +397,7 @@ class Py05Py09Tests(ExtractorTestCase):
                 assert candidate["symbol"] == "Provider.build"
                 assert candidate["span"] == span
                 assert "self._last" in candidate["evidence"]
-                assert f"dump at line {span[1]}" in candidate["evidence"]
+                assert f"dump at :{span[1]}" in candidate["evidence"]
 
     def test_dict_dependency_smuggling_requires_final_key_token_and_object_value(self):
         for key, expected in [
@@ -430,7 +428,7 @@ class Py05Py09Tests(ExtractorTestCase):
                     candidate = candidates[0]
                     assert candidate["rule"] == "PY07_state_smuggling"
                     assert key in candidate["evidence"]
-                    assert "line 2" in candidate["evidence"]
+                    assert ":2" in candidate["evidence"]
                     assert "Counterweight" in candidate["verify"]
         for expression in [
             'data["session"] = None',
@@ -470,7 +468,7 @@ class Py05Py09Tests(ExtractorTestCase):
             if expected:
                 assert candidates[0]["rule"] == "PY08_roundtrip_and_copy"
                 assert candidates[0]["code"] == expression
-                assert "line 1" in candidates[0]["evidence"]
+                assert ":1" in candidates[0]["evidence"]
                 assert "Counterweight" in candidates[0]["verify"]
 
     def test_dict_comprehension_rewrap_requires_exact_target_argument(self):
@@ -491,7 +489,7 @@ class Py05Py09Tests(ExtractorTestCase):
             if expected:
                 assert candidates[0]["rule"] == "PY08_roundtrip_and_copy"
                 assert "row" in candidates[0]["evidence"]
-                assert "line 1" in candidates[0]["evidence"]
+                assert ":1" in candidates[0]["evidence"]
 
     def test_dict_rewrap_evidence_names_the_enclosing_function_row_factory(self):
         self.put(
@@ -531,10 +529,8 @@ class Py05Py09Tests(ExtractorTestCase):
             if candidate["rule"] == "PY08_roundtrip_and_copy"
         }
         assert set(evidence) == {"Store.tagged", "Store.untagged", "Store.nested"}
-        assert (
-            "conn.row_factory = self.db.dict_row at line 12" in evidence["Store.tagged"]
-        )
-        assert "self.conn.row_factory = None at line 14" in evidence["Store.tagged"]
+        assert "conn.row_factory = self.db.dict_row at :12" in evidence["Store.tagged"]
+        assert "self.conn.row_factory = None at :14" in evidence["Store.tagged"]
         for symbol in ["Store.untagged", "Store.nested"]:
             assert "row_factory" not in evidence[symbol]
 
@@ -581,7 +577,6 @@ class Py05Py09Tests(ExtractorTestCase):
                 candidate = candidates[0]
                 assert candidate["rule"] == "PY08_roundtrip_and_copy"
                 assert "iteration" in candidate["evidence"]
-                assert "line" in candidate["evidence"]
                 assert "Counterweight" in candidate["verify"]
 
     def test_lock_io_and_hashing_use_context_tokens_and_stop_at_nested_scopes(self):
@@ -618,7 +613,7 @@ class Py05Py09Tests(ExtractorTestCase):
                     candidate = candidates[0]
                     assert candidate["rule"] == "PY09_io_or_tx_in_lock"
                     assert candidate["span"] == [2, 3]
-                    assert "line 2" in candidate["evidence"]
+                    assert ":2" in candidate["evidence"]
                     assert context in candidate["evidence"]
                     assert "Counterweight" in candidate["verify"]
                     prompts[context.startswith(("conn.", "db."))].add(
@@ -771,7 +766,7 @@ class Py05Py09Tests(ExtractorTestCase):
                 assert candidate["rule"] == "PY09_io_or_tx_in_lock"
                 assert candidate["symbol"] == "run"
                 assert "in_transaction" in candidate["evidence"]
-                assert "line 2" in candidate["evidence"]
+                assert ":2" in candidate["evidence"]
                 assert context in candidate["evidence"]
                 assert "Counterweight" in candidate["verify"]
         self.put(
@@ -807,7 +802,7 @@ class Py05Py09Tests(ExtractorTestCase):
             candidates = self.scan("--paths", "locking.py")["candidates"]
             assert len(candidates) == 1
             assert candidates[0]["rule"] == "PY09_io_or_tx_in_lock"
-            assert f"line {line}" in candidates[0]["evidence"]
+            assert f":{line}" in candidates[0]["evidence"]
 
     def test_lock_header_added_around_unchanged_io_is_diff_eligible(self):
         base = self.use_git_fixture(
@@ -822,7 +817,7 @@ class Py05Py09Tests(ExtractorTestCase):
         assert candidates[0]["rule"] == "PY09_io_or_tx_in_lock"
         assert candidates[0]["change_tag"] == "changed"
         assert candidates[0]["span"] == [2, 3]
-        assert "with lock at line 2" in candidates[0]["evidence"]
+        assert "with lock at :2" in candidates[0]["evidence"]
 
     def test_state_and_lock_diff_eligibility_uses_only_contributing_children(self):
         self.init_repo()

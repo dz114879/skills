@@ -95,7 +95,7 @@ class Py02Tests(ExtractorTestCase):
                 assert candidate["symbol"] == "load"
                 assert candidate["span"] == [4, 4 + len(body.splitlines())]
                 assert (caught or "bare except") in candidate["evidence"]
-                assert "line 4" in candidate["evidence"]
+                assert ":4" in candidate["evidence"]
 
     def test_error_washing_saved_retry_requires_post_loop_propagation(self):
         for following, escape, finalizer, expected in [
@@ -323,7 +323,7 @@ class Py02Tests(ExtractorTestCase):
             assert candidate["rule"] == "PY02_error_washing"
             assert candidate["symbol"] == symbol
             assert candidate["evidence"].split("; ")[1:] == [
-                f"json.loads(object_pairs_hook=...) at line {line} is not bare re-raised on every path"
+                f"json.loads(object_pairs_hook=...) at :{line} is not bare re-raised on every path"
             ]
 
     def test_error_washing_json_hook_preserves_only_all_path_bare_reraises(self):
@@ -356,7 +356,7 @@ class Py02Tests(ExtractorTestCase):
                 candidate = candidates[0]
                 assert candidate["rule"] == "PY02_error_washing"
                 assert "object_pairs_hook" in candidate["evidence"]
-                assert "line 3" in candidate["evidence"]
+                assert ":3" in candidate["evidence"]
                 if caught == "Exception":
                     assert "non-raising" in candidate["evidence"]
         for body in [
@@ -408,3 +408,31 @@ class Py02Tests(ExtractorTestCase):
             ] == [
                 ("PY02_error_washing", span, code, "changed") for span, code in expected
             ]
+
+    def test_error_washing_long_handlers_keep_header_first_and_last_statements(self):
+        for body, expected in [
+            ('log("short")\nreturn {}', 'except Exception: log("short") return {}'),
+            (
+                'log("start")\nlog("' + "x" * 220 + '")\nreturn {}',
+                'except Exception: log("start"); ...; return {}',
+            ),
+            (
+                'return "' + "x" * 220 + '"',
+                ('except Exception: return "' + "x" * 220 + '"')[:197] + "...",
+            ),
+        ]:
+            self.put(
+                "handler.py",
+                "def load():\n    try:\n        work()\n    except Exception:\n"
+                + textwrap.indent(body, "        ")
+                + "\n",
+            )
+            candidates = self.scan("--paths", ".")["candidates"]
+            assert len(candidates) == 1
+            candidate = candidates[0]
+            assert candidate["code"] == expected
+            assert candidate["span"] == [4, 4 + len(body.splitlines())]
+            assert candidate["evidence"] == (
+                "Handler catches Exception at :4; "
+                "broad/multi-exception handler has a non-raising exit"
+            )

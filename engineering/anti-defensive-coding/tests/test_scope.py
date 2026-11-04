@@ -11,6 +11,49 @@ from helpers import SCRIPT, SKILLS_ROOT, ExtractorTestCase
 import pytest
 
 
+def test_verify_templates_form_a_static_short_key_bijection():
+    from adc_scanner.registry import VERIFY_KEYS, VERIFY_TEMPLATES, verify_text
+
+    expected_keys = {
+        "PY01",
+        "PY02",
+        "PY02:hook",
+        "PY03",
+        "PY03:get",
+        "PY04:falsy",
+        "PY04:truthy",
+        "PY04:mixed",
+        "PY05",
+        "PY07:stash",
+        "PY07:try",
+        "PY07:dict",
+        "PY08:comp",
+        "PY08:roundtrip",
+        "PY08:loop",
+        "PY09:tx-check",
+        "PY09:lock",
+        "PY09:tx",
+        "PY10a:PY01",
+        "PY10a:PY02",
+        "PY10a:PY04",
+        "PY10b:hook",
+        "PY10b:legacy",
+        "PY10b:raw-text",
+        "PY10b:mutation",
+        "PY10b:patch",
+        "PY10c:default",
+        "PY10c:bundle",
+        "PY10c:reach",
+    }
+    assert set(VERIFY_TEMPLATES) == expected_keys
+    assert len(VERIFY_KEYS) == len(VERIFY_TEMPLATES) == 29
+    for key, text in VERIFY_TEMPLATES.items():
+        assert verify_text(key) == text
+        assert VERIFY_KEYS[text] == key
+        assert "{" not in text
+        assert "}" not in text
+
+
 class ScopeTests(ExtractorTestCase):
     def test_relative_non_git_paths_schema_and_non_execution(self):
         self.put(
@@ -52,11 +95,13 @@ class ScopeTests(ExtractorTestCase):
         assert candidate["symbol"] == "Record.read"
         assert candidate["change_tag"] == "path-audit"
         assert candidate["code"] == 'getattr(self, "value", 0)'
-        assert "Receiver self" in candidate["evidence"]
+        assert "self" in candidate["evidence"]
         assert "class Record" in candidate["evidence"]
-        assert "'value' at line 3" in candidate["evidence"]
+        assert "'value' at :3" in candidate["evidence"]
 
     def test_candidates_share_schema_compact_output_and_production_role_gate(self):
+        from adc_scanner.registry import VERIFY_KEYS
+
         source = """
             def washed():
                 try:
@@ -115,12 +160,16 @@ class ScopeTests(ExtractorTestCase):
             assert len(candidate["code"]) <= 200
         compact = self.cli("--paths", ".", "--format", "compact")
         assert (
-            "Scanned 2 files (2 cross-checked); 7 candidates, 0 parse errors" in compact
+            "Scanned 2 files (2 cross-checked) in paths mode; 7 candidates, 0 parse errors"
+            in compact
         )
         for candidate in result["candidates"]:
-            assert f"— {candidate['rule']} [path-audit]" in compact
+            assert (
+                f"[{VERIFY_KEYS[candidate['verify']]}] {candidate['verify']}" in compact
+            )
             assert f"  Evidence: {candidate['evidence']}" in compact
-            assert f"  Verify: {candidate['verify']}" in compact
+        assert "  Verify:" not in compact
+        assert "[path-audit]" not in compact
 
     def test_mixed_parse_failures_keep_valid_candidates_in_both_formats(self):
         self.put("good.py", 'hasattr(item, "value")\n')
@@ -156,22 +205,24 @@ class ScopeTests(ExtractorTestCase):
         compact = self.cli("--paths", ".").splitlines()
         assert (
             compact[0]
-            == "Scanned 7 files (0 cross-checked); 3 candidates, 3 parse errors"
+            == "Scanned 7 files (0 cross-checked) in paths mode; 3 candidates, 3 parse errors"
         )
         assert compact[1:4] == [
             f"[PARSE_ERROR] {error['path']}: {error['error']}" for error in errors
         ]
-        assert len(compact) == 16
+        assert compact[4:6] == [
+            "Verification Legend:",
+            f"  [PY01] {result['candidates'][0]['verify']}",
+        ]
+        assert len(compact) == 18
         for index, candidate in enumerate(result["candidates"]):
-            start = 4 + index * 4
-            assert (
-                compact[start] == f"[{candidate['id']}] {candidate['path']}:"
-                f"{candidate['span'][0]}-{candidate['span'][1]} "
-                f"({candidate['symbol']}) — {candidate['rule']} [path-audit]"
+            start = 6 + index * 4
+            assert compact[start] == f"=== {candidate['path']} ==="
+            assert compact[start + 1] == (
+                f"[{candidate['id']}] :{candidate['span'][0]} (<module>) PY01"
             )
-            assert compact[start + 1] == f"  Code: {candidate['code']}"
-            assert compact[start + 2] == f"  Evidence: {candidate['evidence']}"
-            assert compact[start + 3] == f"  Verify: {candidate['verify']}"
+            assert compact[start + 2] == f"  Code: {candidate['code']}"
+            assert compact[start + 3] == f"  Evidence: {candidate['evidence']}"
 
     def test_non_text_codec_cookie_is_a_parse_error_without_aborting(self):
         self.put("good.py", 'hasattr(item, "value")\n')
@@ -478,6 +529,10 @@ class ScopeTests(ExtractorTestCase):
             ("C03", "z.py", [1, 1]),
         ]
         assert len(candidates[2]["code"]) == 200
+        assert (
+            candidates[2]["code"]
+            == ('getattr(item, "value", "' + "x" * 300)[:197] + "..."
+        )
         assert "\n" not in candidates[2]["code"]
 
     def test_all_modes_leave_full_tree_and_git_status_unchanged(self):
@@ -541,3 +596,109 @@ class ScopeTests(ExtractorTestCase):
             == before_skills_status
         )
         assert snapshot() == before_tree
+
+    def test_compact_legend_first_seen_order_file_groups_and_spans(self):
+        from adc_scanner.registry import verify_text
+
+        self.put(
+            "a.py",
+            'zero = data.value or 0\nhasattr(item, "value")\n'
+            'empty = data["name"] or ""\n',
+        )
+        self.put(
+            "b.py",
+            "def washed():\n    try:\n        work()\n"
+            "    except Exception:\n        return {}\n",
+        )
+        assert self.cli("--paths", ".", "--format", "compact").splitlines() == [
+            "Scanned 2 files (2 cross-checked) in paths mode; 4 candidates, 0 parse errors",
+            "Verification Legend:",
+            f"  [PY04:falsy] {verify_text('PY04:falsy')}",
+            f"  [PY01] {verify_text('PY01')}",
+            f"  [PY02] {verify_text('PY02')}",
+            "=== a.py ===",
+            "[C01] :1 (<module>) PY04:falsy",
+            "  Code: data.value or 0",
+            "  Evidence: fallback 0",
+            "[C02] :2 (<module>) PY01",
+            '  Code: hasattr(item, "value")',
+            "  Evidence: item",
+            "[C03] :3 (<module>) PY04:falsy",
+            '  Code: data["name"] or ""',
+            "  Evidence: fallback ''",
+            "=== b.py ===",
+            "[C04] :4-5 (washed) PY02",
+            "  Code: except Exception: return {}",
+            "  Evidence: Handler catches Exception at :4; "
+            "broad/multi-exception handler has a non-raising exit",
+        ]
+
+    def test_compact_without_candidates_has_no_legend_or_file_groups(self):
+        self.put("empty.py", "value = 1\n")
+        self.put("broken.py", "def broken(:\n")
+        result = self.scan("--paths", ".")
+        error = result["parse_errors"][0]
+        assert self.cli("--paths", ".").splitlines() == [
+            "Scanned 2 files (0 cross-checked) in paths mode; 0 candidates, 1 parse errors",
+            f"[PARSE_ERROR] broken.py: {error['error']}",
+        ]
+
+    def test_compact_paths_tags_and_redundant_code_omission(self):
+        self.put(
+            "app.py",
+            "def configure(flag=False):\n    return flag\n"
+            "def options(a=False, b=None):\n    return a, b\n"
+            "def helper():\n    return 1\n"
+            "def coalesced(data):\n"
+            '    return data.get("a") or 0, data["b"] or ""\n'
+            "def single(data):\n    return data.value or 0\n",
+        )
+        self.put("caller.py", "configure(True)\noptions(False, None)\n")
+        self.put("tests/test_app.py", "helper()\n")
+        compact = self.cli("--paths", "app.py")
+        assert "[path-audit]" not in compact
+        assert "(configure) PY10c:default\n" in compact
+        assert "(options) PY10c:bundle\n" in compact
+        assert "(helper) PY10c:reach [cross-test]\n" in compact
+        assert [
+            line for line in compact.splitlines() if line.startswith("  Code:")
+        ] == [
+            "  Code: def helper():",
+            "  Code: data.value or 0",
+        ]
+        assert "  Evidence: Param 'flag'=False: 1 prod calls; uniform: True" in compact
+        assert (
+            "  Evidence: Params 'a'=False (uniform: False), 'b'=None (uniform: None)"
+            in compact
+        )
+        assert "  Evidence: 2 sites:" in compact
+        assert "  Verify:" not in compact
+
+    def test_compact_diff_filters_changed_tag_but_keeps_nondefault_tags(self):
+        self.init_repo()
+        self.put(
+            "app.py",
+            'def original(data):\n    return hasattr(data, "token")\n'
+            "def destination(data):\n    return data\n"
+            "def idle():\n    return 1\n"
+            "async def callback():\n    return 1\n",
+        )
+        self.put("caller.py", "idle()\n")
+        self.put("tests/test_app.py", "callback()\n")
+        base = self.commit()
+        self.put(
+            "app.py",
+            "def original(data):\n    return data\n"
+            "def destination(data):\n    value = data.value or 0\n"
+            '    return hasattr(data, "token")\n'
+            "def idle():\n    return 1\n"
+            "async def callback():\n    return 2\n",
+        )
+        self.put("caller.py", "")
+        compact = self.cli("--base", base)
+        assert "in diff mode;" in compact
+        assert "[changed]" not in compact
+        assert "(destination) PY04:falsy\n" in compact
+        assert "(destination) PY10a:PY01 [moved-defense]\n" in compact
+        assert "(idle) PY10c:reach [orphaned]\n" in compact
+        assert "(callback) PY10c:reach [cross-test]\n" in compact
