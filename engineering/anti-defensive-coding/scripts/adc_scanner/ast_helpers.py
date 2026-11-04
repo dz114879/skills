@@ -1344,29 +1344,40 @@ class CandidateRecords(IndexedVisitor):
             ]
         ).decode()
 
-    def add(self, rule, node, evidence, verify, related=(), signature=None, scope=()):
+    def add(
+        self,
+        rule,
+        node,
+        evidence,
+        verify,
+        related=(),
+        signature=None,
+        scope=(),
+        reflect=None,
+    ):
         """`scope` line ranges make the candidate diff-eligible outside its `span`;
         `signature` is a tuple of display strings that `PY10a` pairs and prints.
         Code stays lossless for bundle evidence until final output truncation."""
         nodes = (node, *related)
         spans = [(item.lineno, item.end_lineno) for item in nodes]
         code = "; ".join(self.source_segment(item) for item in nodes)
-        self.candidates.append(
-            {
-                "rule": rule,
-                "span": [
-                    min(start for start, _ in spans),
-                    max(end for _, end in spans),
-                ],
-                "symbol": ".".join(self.symbols) or "<module>",
-                "code": " ".join(code.split()),
-                "evidence": evidence,
-                "verify": verify,
-                "_scope": [*spans, *scope],
-            }
-        )
+        record = {
+            "rule": rule,
+            "span": [
+                min(start for start, _ in spans),
+                max(end for _, end in spans),
+            ],
+            "symbol": ".".join(self.symbols) or "<module>",
+            "code": " ".join(code.split()),
+            "evidence": evidence,
+            "verify": verify,
+            "_scope": [*spans, *scope],
+        }
+        if reflect is not None:
+            record["_reflect"] = reflect
+        self.candidates.append(record)
         if signature is not None and self.function_depth:
-            self.defenses.append(((rule, signature), self.candidates[-1]))
+            self.defenses.append(((rule, signature), record))
 
 
 def has_conflict(source):

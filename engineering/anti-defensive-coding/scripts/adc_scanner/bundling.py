@@ -53,11 +53,83 @@ def render(result, output_format):
             f"({candidate['symbol']}) {short_key}{tag_suffix}"
         )
         if short_key not in {"PY10c:default", "PY10c:bundle"} and not (
-            candidate["rule"] == "PY04_lossy_falsy_coalesce"
-            and not candidate["evidence"].startswith("fallback ")
+            candidate["rule"] in {"PY01_reflect_default", "PY04_lossy_falsy_coalesce"}
+            and candidate["evidence"].split(" sites: :", 1)[0].isdigit()
         ):
             print(f"  Code: {candidate['code']}")
         print(f"  Evidence: {candidate['evidence']}")
+
+
+def same_line_inner(outer_span, outer_col, outer_end, item_span, col, end_col):
+    line, end_line = item_span
+    return (
+        line == end_line == outer_span[0] == outer_span[1]
+        and outer_col <= col
+        and end_col <= outer_end
+        and (col, end_col) != (outer_col, outer_end)
+    )
+
+
+def bundle_reflections(candidates):
+    groups = {}
+    bundled = []
+    for candidate in candidates:
+        if (
+            candidate["rule"] == "PY01_reflect_default"
+            and candidate["symbol"] != "<module>"
+        ):
+            key = candidate["path"], candidate["symbol"], candidate["change_tag"]
+            groups.setdefault(key, []).append(candidate)
+        else:
+            bundled.append(candidate)
+    for members in groups.values():
+        members.sort(key=lambda item: (item["span"][0], item["_reflect"][0]))
+        candidate = members[0]
+        if len(members) >= 2:
+            top_level, sites = [], []
+            folded_outers = set()
+            for item in members:
+                col, end_col, unparsed_call = item["_reflect"]
+                code = item["code"]
+                line = item["span"][0]
+                for index, outer in enumerate(top_level):
+                    outer_col, outer_end, _ = outer["_reflect"]
+                    if same_line_inner(
+                        outer["span"], outer_col, outer_end, item["span"], col, end_col
+                    ):
+                        sites[index] += evidence_text("PY01_bundle_inner", code=code)
+                        if outer["evidence"] == unparsed_call:
+                            folded_outers.add(id(outer))
+                        break
+                else:
+                    top_level.append(item)
+                    sites.append(
+                        evidence_text("PY01_bundle_site", line=line, code=code)
+                    )
+            receiver_clauses = {}
+            for item in members:
+                if id(item) in folded_outers:
+                    continue
+                clauses = item["evidence"].split("; ")
+                bucket = receiver_clauses.setdefault(clauses[0], [])
+                for clause in clauses:
+                    if clause not in bucket:
+                        bucket.append(clause)
+            receivers = "; ".join(
+                "; ".join(clauses) for clauses in receiver_clauses.values()
+            )
+            candidate["span"] = [
+                min(item["span"][0] for item in members),
+                max(item["span"][1] for item in members),
+            ]
+            candidate["evidence"] = evidence_text(
+                "PY01_bundle",
+                count=len(members),
+                sites="; ".join(sites),
+                receivers=receivers,
+            )
+        bundled.append(candidate)
+    return bundled
 
 
 def bundle_coalesces(candidates):
@@ -80,14 +152,11 @@ def bundle_coalesces(candidates):
             for item in members:
                 col, end_col, fallback = item["_coalesce"]
                 code = item["code"]
-                line, end_line = item["span"]
+                line = item["span"][0]
                 for index, outer in enumerate(top_level):
                     outer_col, outer_end, _ = outer["_coalesce"]
-                    if (
-                        line == end_line == outer["span"][0] == outer["span"][1]
-                        and outer_col <= col
-                        and end_col <= outer_end
-                        and (col, end_col) != (outer_col, outer_end)
+                    if same_line_inner(
+                        outer["span"], outer_col, outer_end, item["span"], col, end_col
                     ):
                         sites[index] += evidence_text(
                             "PY04_bundle_inner", code=code, fallback=fallback
@@ -186,10 +255,12 @@ def scan(root, files, base, tip, args):
     )
     candidates.extend(cross)
     candidates = bundle_coalesces(candidates)
+    candidates = bundle_reflections(candidates)
     candidates.sort(key=lambda item: (item["path"], item["span"][0], item["rule"]))
     for index, candidate in enumerate(candidates, 1):
         candidate.pop("_scope")
         candidate.pop("_coalesce", None)
+        candidate.pop("_reflect", None)
         code = candidate["code"]
         if len(code) > 200:
             candidate["code"] = code[:197] + "..."

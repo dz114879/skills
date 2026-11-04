@@ -766,6 +766,7 @@ class CandidateProbes(CandidateRecords):
                 self.reflection_evidence(node.args[0], cls, attr),
                 verify_text("PY01"),
                 signature=(repr(attr),),
+                reflect=(node.col_offset, node.end_col_offset, unparse(node)),
             )
         self.generic_visit(node)
 

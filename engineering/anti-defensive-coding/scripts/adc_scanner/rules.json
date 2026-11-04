@@ -5,7 +5,7 @@
       "catalogue_sections": [
         "python.md §1"
       ],
-      "bundling_policy": "singleton",
+      "bundling_policy": "per_function_after_moved_defense",
       "diff_scope_mode": "candidate_scope"
     },
     "PY02_error_washing": {
@@ -164,6 +164,9 @@
     "PY01_implicit_base": "object (implicit)",
     "PY01_receiver_class": "class {name} (bases: {bases})",
     "PY01_declared_attribute": "declares '{attribute}' at :{line}",
+    "PY01_bundle_site": ":{line} {code}",
+    "PY01_bundle_inner": " [inner: {code}]",
+    "PY01_bundle": "{count} sites: {sites} | {receivers}",
     "PY08_iteration": "{kind} at :{line}",
     "PY02_non_raising": "broad/multi-exception handler has a non-raising exit",
     "PY02_noreturn": "re-raises via `{helper}` (NoReturn)",

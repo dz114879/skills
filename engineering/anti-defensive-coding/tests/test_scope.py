@@ -651,7 +651,12 @@ class ScopeTests(ExtractorTestCase):
             "def helper():\n    return 1\n"
             "def coalesced(data):\n"
             '    return data.get("a") or 0, data["b"] or ""\n'
-            "def single(data):\n    return data.value or 0\n",
+            "def single(data):\n    return data.value or 0\n"
+            'getattr(item, "first", None)\nhasattr(item, "second")\n'
+            'def reflected(item):\n    return getattr(item, "value", None)\n'
+            'def union(item: Foo | None):\n    return hasattr(item, "value")\n'
+            "def reflected_bundle(item):\n"
+            '    return getattr(item, "first", None), hasattr(item, "second")\n',
         )
         self.put("caller.py", "configure(True)\noptions(False, None)\n")
         self.put("tests/test_app.py", "helper()\n")
@@ -665,6 +670,10 @@ class ScopeTests(ExtractorTestCase):
         ] == [
             "  Code: def helper():",
             "  Code: data.value or 0",
+            '  Code: getattr(item, "first", None)',
+            '  Code: hasattr(item, "second")',
+            '  Code: getattr(item, "value", None)',
+            '  Code: hasattr(item, "value")',
         ]
         assert "  Evidence: Param 'flag'=False: 1 prod calls; uniform: True" in compact
         assert (
@@ -672,6 +681,10 @@ class ScopeTests(ExtractorTestCase):
             in compact
         )
         assert "  Evidence: 2 sites:" in compact
+        assert "(reflected_bundle) PY01\n  Evidence: 2 sites: :" in compact
+        assert "(reflected) PY01\n  Code:" in compact
+        assert "(union) PY01\n  Code:" in compact
+        assert "parameter item: Foo | None" in compact
         assert "  Verify:" not in compact
 
     def test_compact_diff_filters_changed_tag_but_keeps_nondefault_tags(self):

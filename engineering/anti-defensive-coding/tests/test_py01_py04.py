@@ -355,13 +355,141 @@ class Py01Py04Tests(ExtractorTestCase):
                 hasattr(item, "uninitialized")
         """,
         )
-        candidates = self.scan("--paths", ".")["candidates"]
-        for candidate in candidates[:3]:
-            assert "declares " not in candidate["evidence"]
-        assert "'real' at :9" in candidates[3]["evidence"]
-        assert "'one' at :3" in candidates[4]["evidence"]
-        assert "'two' at :3" in candidates[5]["evidence"]
-        assert "declares " not in candidates[6]["evidence"]
+        [candidate] = self.scan("--paths", ".")["candidates"]
+        assert candidate["span"] == [12, 18]
+        assert candidate["evidence"] == (
+            '7 sites: :12 hasattr(item, "foreign"); :13 hasattr(item, "child"); '
+            ':14 hasattr(item, "nested"); :15 hasattr(item, "real"); '
+            ':16 hasattr(item, "one"); :17 hasattr(item, "two"); '
+            ':18 hasattr(item, "uninitialized")'
+            " | item; parameter item: Model at :11; "
+            "class Model (bases: object (implicit)); "
+            "declares 'real' at :9; declares 'one' at :3; declares 'two' at :3"
+        )
+
+    def test_reflection_preserves_singletons_union_annotations_and_module_sites(self):
+        from adc_scanner.registry import verify_text
+
+        self.put(
+            "reflect.py",
+            """
+            getattr(x, "first", None)
+            hasattr(x, "second")
+
+            def single(x):
+                return getattr(x, "value", None)
+            def union(x: Foo | None):
+                return hasattr(x, "value")
+            """,
+        )
+        candidates = self.scan("--paths", "reflect.py")["candidates"]
+        assert [
+            (c["symbol"], c["span"], c["code"], c["evidence"]) for c in candidates
+        ] == [
+            ("<module>", [1, 1], 'getattr(x, "first", None)', "x"),
+            ("<module>", [2, 2], 'hasattr(x, "second")', "x"),
+            (
+                "single",
+                [5, 5],
+                'getattr(x, "value", None)',
+                "x; parameter x: <unannotated> at :4",
+            ),
+            (
+                "union",
+                [7, 7],
+                'hasattr(x, "value")',
+                "x; parameter x: Foo | None at :6",
+            ),
+        ]
+        for candidate in candidates:
+            assert candidate["rule"] == "PY01_reflect_default"
+            assert candidate["change_tag"] == "path-audit"
+            assert candidate["verify"] == verify_text("PY01")
+
+    def test_reflection_bundles_merge_receiver_bindings_and_declarations(self):
+        self.put(
+            "reflect.py",
+            """
+            class Record:
+                first: int
+                second = 0
+                def __init__(self):
+                    self.first = 1
+                def read(self):
+                    getattr(self, "first", None)
+                    return hasattr(self, "second")
+            def inspect(item: Record, other):
+                getattr(item, "first", None)
+                hasattr(other, "flag")
+                hasattr(item, "second")
+                return getattr(item, "first", 0)
+            def plugin():
+                item = load_plugin()
+                getattr(item, "first", None)
+                return hasattr(item, "second")
+            """,
+        )
+        candidates = self.scan("--paths", "reflect.py")["candidates"]
+        assert [(c["symbol"], c["span"], c["code"]) for c in candidates] == [
+            ("Record.read", [7, 8], 'getattr(self, "first", None)'),
+            ("inspect", [10, 13], 'getattr(item, "first", None)'),
+            ("plugin", [16, 17], 'getattr(item, "first", None)'),
+        ]
+        assert candidates[0]["evidence"] == (
+            '2 sites: :7 getattr(self, "first", None); :8 hasattr(self, "second")'
+            " | self; class Record at :1; class Record (bases: object (implicit)); "
+            "declares 'first' at :2; declares 'first' at :5; declares 'second' at :3"
+        )
+        assert candidates[1]["evidence"] == (
+            '4 sites: :10 getattr(item, "first", None); :11 hasattr(other, "flag"); '
+            ':12 hasattr(item, "second"); :13 getattr(item, "first", 0)'
+            " | item; parameter item: Record at :9; "
+            "class Record (bases: object (implicit)); "
+            "declares 'first' at :2; declares 'first' at :5; declares 'second' at :3; "
+            "other; parameter other: <unannotated> at :9"
+        )
+        assert candidates[2]["evidence"] == (
+            '2 sites: :16 getattr(item, "first", None); :17 hasattr(item, "second")'
+            " | item; local binding item = load_plugin() at :15 "
+            "(control-flow unresolved)"
+        )
+        assert len({candidate["verify"] for candidate in candidates}) == 1
+        for candidate in candidates:
+            assert candidate["rule"] == "PY01_reflect_default"
+            assert not any(key.startswith("_") for key in candidate)
+
+    def test_reflection_folds_same_line_nested_calls_before_covering_the_span(self):
+        self.put(
+            "reflect.py",
+            """
+            def load(x):
+                value = getattr(getattr(x, "a", None), "b", None)
+                return hasattr(x, "c")
+            """,
+        )
+        [candidate] = self.scan("--paths", "reflect.py")["candidates"]
+        assert candidate["span"] == [2, 3]
+        assert candidate["code"] == 'getattr(getattr(x, "a", None), "b", None)'
+        assert candidate["evidence"] == (
+            '3 sites: :2 getattr(getattr(x, "a", None), "b", None)'
+            ' [inner: getattr(x, "a", None)]; :3 hasattr(x, "c")'
+            " | x; parameter x: <unannotated> at :1"
+        )
+
+    def test_reflection_bundles_keep_full_member_expressions_before_code_clipping(self):
+        attribute = "x" * 220
+        first = f'getattr(item, "{attribute}", None)'
+        self.put(
+            "reflect.py",
+            f"def load(item):\n    {first}\n    return hasattr(item, 'last')\n",
+        )
+        [candidate] = self.scan("--paths", "reflect.py")["candidates"]
+        assert candidate["span"] == [2, 3]
+        assert candidate["code"] == first[:197] + "..."
+        assert candidate["evidence"] == (
+            f"2 sites: :2 {first}; :3 hasattr(item, 'last')"
+            " | item; parameter item: <unannotated> at :1"
+        )
 
     def test_lossy_coalesce_bundles_falsy_sites_but_keeps_singletons(self):
         self.put(

@@ -258,6 +258,15 @@ class Py10DiffReachTests(ExtractorTestCase):
                     ("PY10a_moved_defense", "moved-defense", [7, 7]),
                 ],
             ),
+            (
+                '    first = getattr(item, "value", 0)\n'
+                '    second = hasattr(item, "other")\n'
+                '    return getattr(other, "value", 1)\n',
+                [
+                    ("PY01_reflect_default", "changed", [6, 7]),
+                    ("PY10a_moved_defense", "moved-defense", [8, 8]),
+                ],
+            ),
         ]:
             self.put(
                 "app.py",
@@ -275,6 +284,79 @@ class Py10DiffReachTests(ExtractorTestCase):
                         "; same PY01_reflect_default signature 'value' "
                         "lost from base app.py:2 (original)" in candidate["evidence"]
                     )
+                elif candidate["span"] == [6, 6]:
+                    assert candidate["evidence"] == (
+                        "item; parameter item: <unannotated> at :5"
+                    )
+                else:
+                    assert candidate["evidence"] == (
+                        '2 sites: :6 getattr(item, "value", 0); '
+                        ':7 hasattr(item, "other")'
+                        " | item; parameter item: <unannotated> at :5"
+                    )
+
+    @pytest.mark.parametrize("remaining", [1, 2])
+    def test_moved_reflection_bundles_only_remaining_diff_eligible_sites(
+        self, remaining
+    ):
+        self.init_repo()
+        self.put(
+            "reflect.py",
+            """
+            def original(item):
+                return getattr(item, "moved", None)
+
+            def destination(item):
+                ignored = hasattr(item, "unchanged")
+                return item
+            """,
+        )
+        base = self.commit()
+        extra = '    last = hasattr(item, "last")\n' if remaining == 2 else ""
+        self.put(
+            "reflect.py",
+            "def original(item):\n"
+            "    return item\n\n"
+            "def destination(item):\n"
+            '    ignored = hasattr(item, "unchanged")\n'
+            '    first = getattr(item, "first", None)\n'
+            '    moved = getattr(item, "moved", 0)\n' + extra + "    return item\n",
+        )
+        candidates = self.scan("--base", base)["candidates"]
+        assert [(c["rule"], c["change_tag"], c["span"]) for c in candidates] == [
+            (
+                "PY01_reflect_default",
+                "changed",
+                [6, 6] if remaining == 1 else [6, 8],
+            ),
+            ("PY10a_moved_defense", "moved-defense", [7, 7]),
+        ]
+        reflected, moved = candidates
+        assert reflected["code"] == 'getattr(item, "first", None)'
+        if remaining == 1:
+            assert reflected["evidence"] == (
+                "item; parameter item: <unannotated> at :4"
+            )
+        else:
+            assert reflected["evidence"] == (
+                '2 sites: :6 getattr(item, "first", None); :8 hasattr(item, "last")'
+                " | item; parameter item: <unannotated> at :4"
+            )
+        assert moved["code"] == 'getattr(item, "moved", 0)'
+        assert moved["evidence"] == (
+            "item; parameter item: <unannotated> at :4; "
+            "same PY01_reflect_default signature 'moved' lost from "
+            "base reflect.py:2 (original) (signature match only)"
+        )
+        assert "under python.md §1." in moved["verify"]
+        for candidate in candidates:
+            assert candidate["symbol"] == "destination"
+            assert not any(key.startswith("_") for key in candidate)
+        compact = self.cli("--base", base, "--format", "compact")
+        assert "(destination) PY10a:PY01 [moved-defense]" in compact
+        assert ('  Code: getattr(item, "first", None)' in compact) == (remaining == 1)
+        assert '  Code: getattr(item, "moved", 0)' in compact
+        assert "[changed]" not in compact
 
     def test_moved_defense_handles_non_named_exception_types_without_crashing(self):
         base = self.use_git_fixture(
