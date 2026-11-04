@@ -1,7 +1,7 @@
 # ADC Testing & Benchmark Verification Map
 
 Verification for `engineering/anti-defensive-coding` operates in two tiers:
-1. **Tier 1 (In-Repo)**: Deterministic unit tests (native `pytest` since `v0.4.3`, `166` collected cases across 5 modules including `2` module-level registry tests in `v0.5.1`) and linter/formatter gates (`ruff`, including `PT` `flake8-pytest-style`) in `/home/roocode/skills`.
+1. **Tier 1 (In-Repo)**: Deterministic unit tests (native `pytest` since `v0.4.3`, `166` collected cases across 5 modules including `2` module-level registry tests in `v0.5`) and linter/formatter gates (`ruff`, including `PT` `flake8-pytest-style`) in `/home/roocode/skills`.
 2. **Tier 2 (Cross-Repo Benchmark, `~8s`)**: Snapshot capture, multiset version diffing, and lossless site verification in `/home/roocode/adc_scanning_test`.
 
 ---
@@ -26,7 +26,7 @@ Always invoke `pytest` through `python -B`: `helpers.py` sets `sys.dont_write_by
 
 Shared test infrastructure lives in `tests/helpers.py` (plain `ExtractorTestCase` base class collected via `python_classes = ["*Tests", "Test*"]`; sets `sys.dont_write_bytecode = True`; a class-scoped `autouse` `@classmethod` fixture builds the read-only Git template under `tmp_path_factory` and a function-scoped `autouse` fixture binds `self.root` to `tmp_path`; runs `scan_python.main(argv)` in-process via `cli` / `scan`, provides `cli_subprocess` for real subprocess CLI checks, and manages class-level read-only Git fixtures via `git_template` / `git_fixture` / `use_git_fixture`). Tests use plain `assert`, `pytest.raises`, `@pytest.mark.skipif`, and parametrized independent cases. The agreed test seams are the CLI/scanner output and registry contracts; tests do not call `handler_stratum` or bundlers directly. There are no runtime dependencies beyond the standard library.
 
-Current `v0.5.1` counts: `166` cases from `121` test functions/methods (`20` `test_py01_py04`, `59` `test_py02` from `15` methods, `21` `test_py05_py09`, `44` `test_py10_diff_reach` from `43` methods, and `22` `test_scope` including `2` module-level registry tests). The historical `103` migrated cases grew to `111` in `v0.4.4`, `117` after Ticket 01, and `166` after Ticket 02 (`48` new parametrized handler cases + `1` registry contract). The full warning-as-error suite passed in `14.82s`; lint/format and the `1` `scope.py:diff_scope` candidate / `0` parse-error self-scan gates passed.
+Current `v0.5` counts: `166` cases from `121` test functions/methods (`20` `test_py01_py04`, `59` `test_py02` from `15` methods, `21` `test_py05_py09`, `44` `test_py10_diff_reach` from `43` methods, and `22` `test_scope` including `2` module-level registry tests). The historical `103` migrated cases grew to `111` in `v0.4.4`, `117` after Ticket 01, and `166` after Ticket 02 (`48` new parametrized handler cases + `1` registry contract). The full warning-as-error suite passed in `14.82s`; lint/format and the `1` `scope.py:diff_scope` candidate / `0` parse-error self-scan gates passed.
 
 | Test Module & Class | Subsystem / Rule | Test Method Prefix / Pattern | What Is Tested |
 | --- | --- | --- | --- |
@@ -72,9 +72,9 @@ python3 scripts/audit_helper.py snapshot --tag <new-tag> --note "<summary>"
 # 2. Capture diff-mode (HEAD~5..HEAD) snapshot across all 6 targets
 python3 scripts/audit_helper.py snapshot --tag <new-tag>-diff-head5 --mode diff --base-ref HEAD~5 --tip-ref HEAD --note "<summary>"
 
-# 3. Compare against the previous official baseline (e.g. v0.3 and v0.3-diff-head5)
-python3 scripts/audit_helper.py compare v0.3 <new-tag>
-python3 scripts/audit_helper.py compare v0.3-diff-head5 <new-tag>-diff-head5
+# 3. Compare against the previous official baseline (e.g. v0.4 and v0.4-diff-head5)
+python3 scripts/audit_helper.py compare v0.4 <new-tag>
+python3 scripts/audit_helper.py compare v0.4-diff-head5 <new-tag>-diff-head5
 
 # 4. Regenerate reports/VERSION_LEDGER.md
 python3 scripts/audit_helper.py ledger
@@ -99,34 +99,31 @@ python3 scripts/audit_helper.py ledger
     3. **`PY10a` moved-defense pairings (`(target, path, tuple(span), symbol, base_rule, signature, origins)`)**:
        - Extract `base_rule`, `signature`, and all `origins` from the unchanged `; same <base_rule> signature <signature> lost from <origins> (signature match only)` suffix. Compare these tuples independently of the concise base evidence prefix.
 
-### 2.4 P1 Validation & Work-in-Progress Gates (`v0.5.0` / `v0.5.1`)
+### 2.4 P1 Validation & Official `v0.5` Benchmark Baseline (`v0.5.0` → `v0.5.1` → `v0.5`)
 
 **P1.1 Goldfish Reviewer gate (completed):** `/home/roocode/adc_scanning_test/reports/audits/v0.4-bundling-reviewer-validation.md` records a stateless review of `16` `v0.4.4` compact bundles (`11` `PY04` bundles / `66` sites, `5` `PY10c` bundles / `13` parameters). Results are `11/11` `PY04` TP recall, `11/11` severity agreement, and `13/13` `PY10c` parameter agreement, with `0` missed TPs. This validates the whole-function `(path, symbol, change_tag)` policy adopted by `bundle_reflections`, without receiver splitting.
 
-**`PY01` lossless unpacking recipe (Ticket 01):**
+**`PY01` lossless unpacking recipe (Ticket 01 → `v0.5`):**
 
-1. Compare `v0.4` → `v0.5-wip-01` (paths) and `v0.4-diff-head5` → `v0.5-wip-01-diff` (diff) at fixed target HEADs/diff endpoints. Select `PY01_reflect_default` plus `PY10a_moved_defense` records whose unchanged signature suffix names `PY01_reflect_default`.
+1. Compare `v0.4` → `v0.5` (paths) and `v0.4-diff-head5` → `v0.5-diff-head5` (diff) at fixed target HEADs/diff endpoints. Select `PY01_reflect_default` plus `PY10a_moved_defense` records whose unchanged signature suffix names `PY01_reflect_default`.
 2. Detect bundles only when `evidence.split(" sites: :", 1)[0].isdigit()`; a singleton receiver annotation may contain ` | ` and must not be mistaken for a bundle. Singletons/promotions contribute `(target, path, symbol, change_tag, span[0], code)`. Recover any clipped full call from the unchanged source AST and validate the emitted `[:197] + "..."` prefix before comparing full whitespace-normalized calls.
 3. For bundles, unpack each `:{line} {code}` member before the structural ` | {receivers}` separator and every ` [inner: {code}]` member, inheriting its containing site's line. Parse delimiters outside quoted expressions/nested brackets; do not split arbitrary expression strings on `; ` or ` | `. Assert the expanded count equals the numeric prefix, including every folded member. Shared `same_line_inner` folds only strict same-line containment; multiline and equal intervals remain separate.
-4. Compare `Counter`s of those site tuples, including same-line multiplicity, with exact code (no quote normalization for member sites). Require `0` lost / `0` added across `767` paths sites and `37` diff `PY01` sites plus `2` `PY01`-origin `PY10a` sites.
+4. Compare `Counter`s of those site tuples, including same-line multiplicity, with exact code (no quote normalization for member sites). Require `0` lost / `0` added across `767` paths sites (`158` bundles + `209` singletons) and `37` diff `PY01` sites (`9` bundles + `13` singletons) plus `2` `PY01`-origin `PY10a` sites.
 5. Verify root receiver provenance separately: collect the old singleton receiver/binding/declaration clauses; omit only the intermediate receiver expressions whose unparsed call matches a folded inner call (quote-insensitive). Require the new receiver section to preserve every root receiver's clauses exactly once, merging distinct same-receiver declarations in source order. Check covering span, first member's JSON `code`, absence of `_reflect` in public output, and unchanged `PY01_bundle_site` / `PY01_bundle_inner` / `PY01_bundle` formatting. Compact `Code:` is suppressed on multi-site `PY01` / `PY04` bundles with the numeric-prefix predicate above and retained on singleton/module calls, including union annotations.
-6. Require `0` non-`PY01` candidate changes for Ticket 01. Expected record compaction is `767 → 367` paths (`-400`, `52.2%`) and `37 → 22` diff (`-15`, `40.5%`), without losing promoted sites.
+6. Require `0` non-`PY01`/`PY02` candidate changes (`1,763 == 1,763` paths / `48 == 48` diff `PY04` sites; `94 == 94` paths / `17 == 17` diff `PY10c` uniform parameters; `4 == 4` diff `PY10a` pairings; `874` paths / `52` diff non-`PY01`/`PY02` records `100%` unchanged). Record compaction is `767 → 367` paths (`-400`, `52.2%`) and `37 → 22` diff (`-15`, `40.5%`), without losing promoted sites.
 
-**`PY02` evidence-only gate (Ticket 02):**
+**Official `v0.5` & `v0.5-diff-head5` snapshots and `PY02` stratum verification (Tickets 02 & 03):**
 
-```sh
-python3 -B scripts/audit_helper.py snapshot --tag v0.5-wip-02 --note "PY02 handler exit strata"
-python3 -B scripts/audit_helper.py snapshot --tag v0.5-wip-02-diff --mode diff --base-ref HEAD~5 --tip-ref HEAD --note "PY02 handler exit strata"
-python3 -B scripts/audit_helper.py compare v0.5-wip-01 v0.5-wip-02
-python3 -B scripts/audit_helper.py compare v0.5-wip-01-diff v0.5-wip-02-diff
-```
+- **Scanner fingerprint (`skills` HEAD `3149d54ec19e`, `skills_dirty: false`)**: Combined scanner SHA256 `449a84d405a7` (full: `449a84d405a73efb2e8bf9c9a74984f370f5318dd7b88a3b8ad715786a5a24ea`), `SKILL.md` SHA256 `1e4635823d61`, `references/*.md` SHA256 `86a88d2784fe`, overall skill SHA256 `70b1950e9c51`.
+- **`v0.5` (`paths` mode, `meta.json` SHA256 `baae5067974b2629ac112664cd0055d32c5b4b8867c37ea57599e81789435bda`)**: `2,625` candidates (`anti-defensive-coding` `1`, `Clonoth` `1,090`, `fox-dayi-bot` `350`, `Zoaholic` `791`, `dc_dojo_bot_moli` `362`, `httpx` `31`), `0` parse errors, `8.067s` wall-clock.
+- **`v0.5-diff-head5` (`diff` mode `HEAD~5..HEAD`, `meta.json` SHA256 `c650123afb3f1ea83e7bc79d803656ba49201896f713955bfac14ca96296a2ae`)**: `158` candidates (`anti-defensive-coding` `0`, `Clonoth` `16`, `fox-dayi-bot` `9`, `Zoaholic` `57`, `dc_dojo_bot_moli` `76`, `httpx` `0`), `0` parse errors, `9.114s` wall-clock.
 
-Captured results (uncommitted implementation on outer HEAD `9544e9f58050`; official promotion and ledger refresh remain Ticket 03):
-
-| Mode | Total Candidates | Removed / Added / Modified | Modified by Target |
+| Comparison Report | Total Candidates | Removed / Added / Modified | Delta Breakdown |
 | --- | ---: | --- | --- |
-| Paths | `2,625` | `-0 / +0 / ~1,383` | `Clonoth` `498`, `Zoaholic` `411`, `fox-dayi-bot` `193`, `dc_dojo_bot_moli` `278`, `httpx` `3`, self `0` |
-| Diff | `158` | `-0 / +0 / ~83` | `Clonoth` `4`, `Zoaholic` `24`, `fox-dayi-bot` `2`, `dc_dojo_bot_moli` `53`, `httpx` / self `0` |
+| `reports/comparisons/v0.4-vs-v0.5.md` (`paths`) | `3,025 → 2,625` (`-400`) | `-543 / +143 / ~1,398` | `PY01` bundling (`-543 / +143 / ~15`, net `-400`) + `PY02` stratum evidence (`~1,383`: `Clonoth` `498`, `Zoaholic` `411`, `fox-dayi-bot` `193`, `dc_dojo_bot_moli` `278`, `httpx` `3`, self `0`) |
+| `reports/comparisons/v0.4-diff-head5-vs-v0.5-diff-head5.md` (`diff`) | `173 → 158` (`-15`) | `-21 / +6 / ~86` | `PY01` bundling (`-21 / +6 / ~3`, net `-15`) + `PY02` stratum evidence (`~83`: `Clonoth` `4`, `Zoaholic` `24`, `fox-dayi-bot` `2`, `dc_dojo_bot_moli` `53`, `httpx` / self `0`) |
+
+Temporary `v0.5-wip-*` snapshots and comparisons were removed after verification, and `reports/VERSION_LEDGER.md` was regenerated with all `12` official snapshots (`v0-baseline` through `v0.5-diff-head5`).
 
 Compare multisets of `(target, path, span, symbol, rule, change_tag, code, verify)` and all non-evidence fields, requiring equality. Only the existing non-raising `PY02` evidence changes. Paths partition into `353` `silent-pass` (`PY02_silent_pass`), `330` `returns-fallback: {value}` (`PY02_returns_fallback`), `151` `fallthrough-logged-exc-info` (`PY02_fallthrough_exc_info`), and `549` `fallthrough-no-traceback` (`PY02_fallthrough_no_tb`). Diff partitions are `20 / 19 / 21 / 23`. Each mode retains the unchanged `NoReturn`-only `dc_dojo_bot_moli/core/quiz_eligibility.py:[182, 183]` record. Synthetic cases also verify raising-only hook facts and `"; "` ordering behind a stratum for mixed exits.
 
