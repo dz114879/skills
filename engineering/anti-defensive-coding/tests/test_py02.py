@@ -1,9 +1,182 @@
 import textwrap
 
 from helpers import ExtractorTestCase
+import pytest
 
 
 class Py02Tests(ExtractorTestCase):
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "pass",
+            "...",
+            "continue",
+            "break",
+            "'Handler documentation'\npass",
+            "'Handler documentation'\n...",
+            "'Handler documentation'",
+            "pass\n...\ncontinue\nbreak",
+        ],
+    )
+    def test_error_washing_silent_handler_stratum(self, body):
+        self.put(
+            "handler.py",
+            "def load():\n    while pending:\n        try:\n            work()\n"
+            "        except Exception:\n"
+            + textwrap.indent(body, "            ")
+            + "\n",
+        )
+        result = self.scan("--paths", "handler.py")
+        assert result["parse_errors"] == []
+        assert len(result["candidates"]) == 1
+        assert result["candidates"][0]["evidence"] == (
+            "Handler catches Exception at :5; silent-pass"
+        )
+
+    @pytest.mark.parametrize(
+        ("body", "value"),
+        [
+            ("return {}", "{}"),
+            ("return", "None"),
+            (
+                "if retry:\n    return zeta\nif cached:\n    return alpha\nreturn zeta",
+                "zeta, alpha",
+            ),
+            ("if retry:\n    return\nreturn None", "None"),
+            ("return '" + "x" * 78 + "'", "'" + "x" * 78 + "'"),
+            ("return '" + "x" * 79 + "'", "'" + "x" * 76 + "..."),
+            ("def nested():\n    return 'ignored'\nreturn fallback", "fallback"),
+            ("async def nested():\n    return 'ignored'\nreturn fallback", "fallback"),
+            ("read = lambda: 'ignored'\nreturn fallback", "fallback"),
+            ("logger.exception('failed')\nreturn []", "[]"),
+        ],
+    )
+    def test_error_washing_return_handler_stratum(self, body, value):
+        self.put(
+            "handler.py",
+            "def load():\n    try:\n        work()\n    except Exception:\n"
+            + textwrap.indent(body, "        ")
+            + "\n",
+        )
+        result = self.scan("--paths", "handler.py")
+        assert result["parse_errors"] == []
+        assert len(result["candidates"]) == 1
+        assert result["candidates"][0]["evidence"] == (
+            f"Handler catches Exception at :4; returns-fallback: {value}"
+        )
+
+    @pytest.mark.parametrize(
+        ("body", "stratum"),
+        [
+            ("logger.exception('failed')", "fallthrough-logged-exc-info"),
+            ("logger.error('failed', exc_info=True)", "fallthrough-logged-exc-info"),
+            ("logger.error('failed', exc_info=exc)", "fallthrough-logged-exc-info"),
+            ("logger.error('failed', exc_info=1)", "fallthrough-logged-exc-info"),
+            ("traceback.print_exc()", "fallthrough-logged-exc-info"),
+            ("traceback.format_exc()", "fallthrough-logged-exc-info"),
+            ("traceback.print_exception(exc)", "fallthrough-logged-exc-info"),
+            ("traceback.format_exception(exc)", "fallthrough-logged-exc-info"),
+            ("print_exc()", "fallthrough-logged-exc-info"),
+            ("format_exc()", "fallthrough-logged-exc-info"),
+            ("logger.exception('failed', exc_info=False)", "fallthrough-no-traceback"),
+            ("logger.exception('failed', exc_info=None)", "fallthrough-no-traceback"),
+            ("logger.exception('failed', exc_info=0)", "fallthrough-no-traceback"),
+            ("logger.error('failed', exc_info=False)", "fallthrough-no-traceback"),
+            ("logger.error('failed', exc_info=None)", "fallthrough-no-traceback"),
+            ("logger.error('failed', exc_info=0)", "fallthrough-no-traceback"),
+            ("logger.error('failed')", "fallthrough-no-traceback"),
+            ("fallback = {}", "fallthrough-no-traceback"),
+            (
+                "def nested():\n    logger.exception('failed')\n    return {}",
+                "fallthrough-no-traceback",
+            ),
+            (
+                "async def nested():\n    logger.exception('failed')\n    return {}",
+                "fallthrough-no-traceback",
+            ),
+            ("report = lambda: logger.exception('failed')", "fallthrough-no-traceback"),
+            (
+                "class Nested:\n    def run(self):\n        return {}",
+                "fallthrough-no-traceback",
+            ),
+            (
+                "logger.exception('failed', exc_info=False)\ntraceback.print_exc()",
+                "fallthrough-logged-exc-info",
+            ),
+        ],
+    )
+    def test_error_washing_fallthrough_handler_stratum(self, body, stratum):
+        self.put(
+            "handler.py",
+            "def load():\n    try:\n        work()\n    except Exception as exc:\n"
+            + textwrap.indent(body, "        ")
+            + "\n",
+        )
+        result = self.scan("--paths", "handler.py")
+        assert result["parse_errors"] == []
+        assert len(result["candidates"]) == 1
+        assert result["candidates"][0]["evidence"] == (
+            f"Handler catches Exception at :4; {stratum}"
+        )
+
+    @pytest.mark.parametrize(
+        ("body", "hook", "facts"),
+        [
+            ("reject()", False, "re-raises via `reject` (NoReturn)"),
+            (
+                "if stop:\n    return None\nreject()",
+                False,
+                "returns-fallback: None; re-raises via `reject` (NoReturn)",
+            ),
+            (
+                "if stop:\n    continue\nreject()",
+                False,
+                "fallthrough-no-traceback; re-raises via `reject` (NoReturn)",
+            ),
+            (
+                "raise DomainError()",
+                True,
+                "json.loads(object_pairs_hook=...) at :6 is not bare re-raised on every path",
+            ),
+            (
+                "if stop:\n    return {}\nraise DomainError()",
+                True,
+                "returns-fallback: {}; json.loads(object_pairs_hook=...) at :6 "
+                "is not bare re-raised on every path",
+            ),
+            (
+                "reject()",
+                True,
+                "re-raises via `reject` (NoReturn); "
+                "json.loads(object_pairs_hook=...) at :6 is not bare re-raised on every path",
+            ),
+            (
+                "if stop:\n    return None\nreject()",
+                True,
+                "returns-fallback: None; re-raises via `reject` (NoReturn); "
+                "json.loads(object_pairs_hook=...) at :6 is not bare re-raised on every path",
+            ),
+        ],
+    )
+    def test_error_washing_handler_stratum_preserves_abort_and_hook_facts(
+        self, body, hook, facts
+    ):
+        call = "json.loads(raw, object_pairs_hook=unique)" if hook else "work()"
+        self.put(
+            "handler.py",
+            "def reject() -> NoReturn:\n    raise Rejected()\n"
+            "def load():\n    while pending:\n        try:\n"
+            f"            {call}\n        except Exception:\n"
+            + textwrap.indent(body, "            ")
+            + "\n",
+        )
+        result = self.scan("--paths", "handler.py")
+        assert result["parse_errors"] == []
+        assert len(result["candidates"]) == 1
+        assert result["candidates"][0]["evidence"] == (
+            f"Handler catches Exception at :7; {facts}"
+        )
+
     def test_error_washing_in_exception_group_handler(self):
         self.put(
             "groups.py",
@@ -19,7 +192,9 @@ class Py02Tests(ExtractorTestCase):
         assert len(candidates) == 1
         assert candidates[0]["rule"] == "PY02_error_washing"
         assert candidates[0]["span"] == [4, 5]
-        assert "Exception" in candidates[0]["evidence"]
+        assert (
+            candidates[0]["evidence"] == "Handler catches Exception at :4; silent-pass"
+        )
 
     def test_error_washing_broad_handlers_follow_control_flow(self):
         cases = [
@@ -125,7 +300,7 @@ class Py02Tests(ExtractorTestCase):
             if expected:
                 assert candidates[0]["rule"] == "PY02_error_washing"
                 assert candidates[0]["symbol"] == "send"
-                assert "non-raising exit" in candidates[0]["evidence"]
+                assert "fallthrough-no-traceback" in candidates[0]["evidence"]
         for condition, expected in [("True", True), ("1", True), ("pending", False)]:
             self.put(
                 "retry.py",
@@ -139,18 +314,23 @@ class Py02Tests(ExtractorTestCase):
             if expected:
                 assert candidates[0]["rule"] == "PY02_error_washing"
                 assert candidates[0]["symbol"] == "send"
-                assert "non-raising exit" in candidates[0]["evidence"]
+                assert "fallthrough-no-traceback" in candidates[0]["evidence"]
 
     def test_error_washing_bounded_retry_requires_final_attempt_reraise(self):
-        for condition, prefix, finalizer, expected in [
-            ("attempt == 2", "log()", "", False),
-            ("attempt == 3 - 1", "log()", "", False),
-            ("attempt == 1", "log()", "", True),
-            ("attempt == 2", "attempt = 0", "", True),
-            ("attempt == 2", "if stop:\n    return None", "", True),
-            ("attempt == 2", "if stop:\n    continue", "", True),
-            ("attempt == 2", "if stop:\n    break", "", True),
-            ("attempt == 2", "log()", "finally:\n    return None\n", True),
+        for condition, prefix, finalizer, stratum in [
+            ("attempt == 2", "log()", "", None),
+            ("attempt == 3 - 1", "log()", "", None),
+            ("attempt == 1", "log()", "", "fallthrough-no-traceback"),
+            ("attempt == 2", "attempt = 0", "", "fallthrough-no-traceback"),
+            ("attempt == 2", "if stop:\n    return None", "", "returns-fallback: None"),
+            ("attempt == 2", "if stop:\n    continue", "", "fallthrough-no-traceback"),
+            ("attempt == 2", "if stop:\n    break", "", "fallthrough-no-traceback"),
+            (
+                "attempt == 2",
+                "log()",
+                "finally:\n    return None\n",
+                "fallthrough-no-traceback",
+            ),
         ]:
             self.put(
                 "retry.py",
@@ -162,10 +342,10 @@ class Py02Tests(ExtractorTestCase):
                 + textwrap.indent(finalizer, "        "),
             )
             candidates = self.scan("--paths", "retry.py")["candidates"]
-            assert len(candidates) == int(expected)
-            if expected:
+            assert len(candidates) == int(stratum is not None)
+            if stratum:
                 assert candidates[0]["rule"] == "PY02_error_washing"
-                assert "non-raising exit" in candidates[0]["evidence"]
+                assert stratum in candidates[0]["evidence"]
 
     def test_error_washing_cleanup_preserves_primary_or_cleanup_failure(self):
         for mutation, finalizer, expected_cleanup in [
@@ -195,25 +375,25 @@ class Py02Tests(ExtractorTestCase):
                 assert "cleanup_error" in candidates[1]["code"]
 
     def test_error_washing_noreturn_helper_stays_with_truthful_evidence(self):
-        for annotation, call, prefix, duplicate, helper, nonraising in [
-            ("NoReturn", "self._reject()", "", "", "self._reject", False),
-            ("typing.NoReturn", "self._reject()", "", "", "self._reject", False),
+        for annotation, call, prefix, duplicate, helper, stratum in [
+            ("NoReturn", "self._reject()", "", "", "self._reject", None),
+            ("typing.NoReturn", "self._reject()", "", "", "self._reject", None),
             (
                 "typing_extensions.Never",
                 "await cls._reject()",
                 "",
                 "",
                 "cls._reject",
-                False,
+                None,
             ),
-            ("Never", "await _reject()", "", "", "_reject", False),
+            ("Never", "await _reject()", "", "", "_reject", None),
             (
                 "Never",
                 "_reject()",
                 "",
                 "def _reject() -> NoReturn:\n    raise Rejected()\n",
                 "_reject",
-                False,
+                None,
             ),
             (
                 "NoReturn",
@@ -221,7 +401,7 @@ class Py02Tests(ExtractorTestCase):
                 "if stop:\n    return None",
                 "",
                 "self._reject",
-                True,
+                "returns-fallback: None",
             ),
             (
                 "NoReturn",
@@ -229,12 +409,26 @@ class Py02Tests(ExtractorTestCase):
                 "",
                 "def _reject() -> None:\n    pass\n",
                 None,
-                True,
+                "fallthrough-no-traceback",
             ),
-            ("NoReturn", "other._reject()", "", "", None, True),
-            ("None", "self._reject()", "", "", None, True),
-            ("NoReturn", "self._reject()", "return None", "", None, True),
-            ("NoReturn", "return self._reject()", "", "", None, True),
+            ("NoReturn", "other._reject()", "", "", None, "fallthrough-no-traceback"),
+            ("None", "self._reject()", "", "", None, "fallthrough-no-traceback"),
+            (
+                "NoReturn",
+                "self._reject()",
+                "return None",
+                "",
+                None,
+                "returns-fallback: None",
+            ),
+            (
+                "NoReturn",
+                "return self._reject()",
+                "",
+                "",
+                None,
+                "returns-fallback: self._reject()",
+            ),
         ]:
             self.put(
                 "helpers.py",
@@ -253,11 +447,10 @@ class Py02Tests(ExtractorTestCase):
             candidate = candidates[0]
             assert candidate["rule"] == "PY02_error_washing"
             assert candidate["symbol"] == "Client.check"
-            assert ("non-raising exit" in candidate["evidence"]) == nonraising
+            facts = [stratum] if stratum else []
             if helper:
-                assert f"re-raises via `{helper}` (NoReturn)" in candidate["evidence"]
-            else:
-                assert "re-raises via" not in candidate["evidence"]
+                facts.append(f"re-raises via `{helper}` (NoReturn)")
+            assert candidate["evidence"].split("; ")[1:] == facts
 
     def test_error_washing_noreturn_helper_keeps_earlier_loop_exits(self):
         for escape in ("break", "continue"):
@@ -271,8 +464,10 @@ class Py02Tests(ExtractorTestCase):
             )
             candidates = self.scan("--paths", "helpers.py")["candidates"]
             assert len(candidates) == 1
-            assert "non-raising exit" in candidates[0]["evidence"]
-            assert "re-raises via `reject` (NoReturn)" in candidates[0]["evidence"]
+            assert candidates[0]["evidence"].split("; ")[1:] == [
+                "fallthrough-no-traceback",
+                "re-raises via `reject` (NoReturn)",
+            ]
 
     def test_error_washing_deferred_propagation_keeps_hook_fact(self):
         self.put(
@@ -358,7 +553,7 @@ class Py02Tests(ExtractorTestCase):
                 assert "object_pairs_hook" in candidate["evidence"]
                 assert ":3" in candidate["evidence"]
                 if caught == "Exception":
-                    assert "non-raising" in candidate["evidence"]
+                    assert "returns-fallback: {}" in candidate["evidence"]
         for body in [
             "return json.loads(raw)",
             "def nested():\n    return json.loads(raw, object_pairs_hook=unique)",
@@ -410,15 +605,21 @@ class Py02Tests(ExtractorTestCase):
             ]
 
     def test_error_washing_long_handlers_keep_header_first_and_last_statements(self):
-        for body, expected in [
-            ('log("short")\nreturn {}', 'except Exception: log("short") return {}'),
+        for body, expected, stratum in [
+            (
+                'log("short")\nreturn {}',
+                'except Exception: log("short") return {}',
+                "returns-fallback: {}",
+            ),
             (
                 'log("start")\nlog("' + "x" * 220 + '")\nreturn {}',
                 'except Exception: log("start"); ...; return {}',
+                "returns-fallback: {}",
             ),
             (
                 'return "' + "x" * 220 + '"',
                 ('except Exception: return "' + "x" * 220 + '"')[:197] + "...",
+                "returns-fallback: '" + "x" * 76 + "...",
             ),
         ]:
             self.put(
@@ -433,6 +634,5 @@ class Py02Tests(ExtractorTestCase):
             assert candidate["code"] == expected
             assert candidate["span"] == [4, 4 + len(body.splitlines())]
             assert candidate["evidence"] == (
-                "Handler catches Exception at :4; "
-                "broad/multi-exception handler has a non-raising exit"
+                f"Handler catches Exception at :4; {stratum}"
             )

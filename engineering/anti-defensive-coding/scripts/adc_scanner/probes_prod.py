@@ -19,6 +19,7 @@ from .ast_helpers import (
     exits,
     get_call,
     guarded_self_writes,
+    handler_stratum,
     identifier_tokens,
     import_bindings,
     io_or_hash_call,
@@ -814,7 +815,7 @@ class CandidateProbes(CandidateRecords):
                 helper = last_noreturn_call(handler.body, self.noreturn_helpers)
                 effective = (outcomes - {"next"}) | {"raise"} if helper else outcomes
                 if not effective <= {"bare", "raise"}:
-                    facts.append(evidence_text("PY02_non_raising"))
+                    facts.append(handler_stratum(handler))
                 if helper:
                     facts.append(evidence_text("PY02_noreturn", helper=helper))
             washes_hook = (

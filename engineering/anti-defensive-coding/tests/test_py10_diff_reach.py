@@ -58,7 +58,7 @@ class Py10DiffReachTests(ExtractorTestCase):
             ),
             "handler.py": (
                 "Handler catches (TypeError, KeyError) at :8; "
-                "broad/multi-exception handler has a non-raising exit; "
+                "returns-fallback: None; "
                 "same PY02_error_washing signature KeyError, TypeError "
                 "lost from base handler.py:4 (original) (signature match only)",
                 "python.md §4",

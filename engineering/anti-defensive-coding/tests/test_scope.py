@@ -54,6 +54,22 @@ def test_verify_templates_form_a_static_short_key_bijection():
         assert "}" not in text
 
 
+def test_py02_evidence_templates_cover_the_four_nonraising_exit_strata():
+    from adc_scanner.registry import EVIDENCE_TEMPLATES, evidence_text
+
+    assert {
+        key: evidence_text(key, value="None")
+        for key in EVIDENCE_TEMPLATES
+        if key.startswith(("PY02_silent", "PY02_returns", "PY02_fallthrough"))
+    } == {
+        "PY02_silent_pass": "silent-pass",
+        "PY02_returns_fallback": "returns-fallback: None",
+        "PY02_fallthrough_exc_info": "fallthrough-logged-exc-info",
+        "PY02_fallthrough_no_tb": "fallthrough-no-traceback",
+    }
+    assert "PY02_non_raising" not in EVIDENCE_TEMPLATES
+
+
 class ScopeTests(ExtractorTestCase):
     def test_relative_non_git_paths_schema_and_non_execution(self):
         self.put(
@@ -629,8 +645,7 @@ class ScopeTests(ExtractorTestCase):
             "=== b.py ===",
             "[C04] :4-5 (washed) PY02",
             "  Code: except Exception: return {}",
-            "  Evidence: Handler catches Exception at :4; "
-            "broad/multi-exception handler has a non-raising exit",
+            "  Evidence: Handler catches Exception at :4; returns-fallback: {}",
         ]
 
     def test_compact_without_candidates_has_no_legend_or_file_groups(self):

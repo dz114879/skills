@@ -794,6 +794,70 @@ def statement_exits(node):
     return {"next"}
 
 
+def handler_stratum(handler):
+    statements = [
+        stmt
+        for stmt in handler.body
+        if not (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        )
+    ]
+    if not statements or all(
+        isinstance(stmt, (ast.Pass, ast.Continue, ast.Break))
+        or (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and stmt.value.value is Ellipsis
+        )
+        for stmt in statements
+    ):
+        return evidence_text("PY02_silent_pass")
+    returns = [
+        node
+        for stmt in handler.body
+        for node in local_walk(stmt)
+        if isinstance(node, ast.Return)
+    ]
+    if returns:
+        values = list(
+            dict.fromkeys(
+                unparse(ret.value) if ret.value is not None else "None"
+                for ret in returns
+            )
+        )
+        value = ", ".join(values)
+        if len(value) > 80:
+            value = value[:77] + "..."
+        return evidence_text("PY02_returns_fallback", value=value)
+    for stmt in handler.body:
+        for node in local_walk(stmt):
+            if isinstance(node, ast.Call):
+                exc_info_kw = next(
+                    (kw.value for kw in node.keywords if kw.arg == "exc_info"),
+                    None,
+                )
+                exc_info_disabled = isinstance(
+                    exc_info_kw, ast.Constant
+                ) and exc_info_kw.value in (False, None, 0)
+                func = unparse(node.func)
+                if not exc_info_disabled and (
+                    func.endswith(
+                        (
+                            ".exception",
+                            "print_exc",
+                            "format_exc",
+                            "print_exception",
+                            "format_exception",
+                        )
+                    )
+                    or exc_info_kw is not None
+                ):
+                    return evidence_text("PY02_fallthrough_exc_info")
+    return evidence_text("PY02_fallthrough_no_tb")
+
+
 def is_none(node):
     return isinstance(node, ast.Constant) and node.value is None
 
