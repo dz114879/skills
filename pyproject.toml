@@ -16,7 +16,7 @@ extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = [
-    "E4", "E7", "E9", "F",  # ruff defaults
+    "E4", "E7", "E9", "F", "W",  # pycodestyle/pyflakes defaults + warnings
     "B",           # bugbear: likely bugs, incl. silent zip truncation
     "PLE", "PLW",  # pylint errors/warnings, incl. subprocess.run without check=
     "I",           # import order
@@ -27,7 +27,13 @@ select = [
     "ARG",         # unused arguments (Dead Plumbing)
     "PGH",         # blanket noqa / type: ignore
     "PT",          # flake8-pytest-style
+    "N",           # pep8-naming
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# CandidateProbes and TestProbes inherit from ast.NodeVisitor via CandidateRecords;
+# `visit_<ASTNode>` methods and class-attribute aliases follow stdlib visitor dispatch.
+"engineering/anti-defensive-coding/scripts/adc_scanner/probes_*.py" = ["N802", "N815"]
 
 [tool.ruff.lint.isort]
 force-sort-within-sections = true
