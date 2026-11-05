@@ -23,9 +23,11 @@ def main(argv=None):
     parser.add_argument(
         "-j",
         "--jobs",
-        type=int,
-        default=1,
-        help="Number of worker threads for per-file git diff and AST stages",
+        default="auto",
+        help=(
+            "Worker threads for per-file git diff and AST stages "
+            "('auto' or integer >= 1)"
+        ),
     )
     parser.add_argument("--tip", help="Tip commit; omit for working tree")
     parser.add_argument(
@@ -50,8 +52,13 @@ def main(argv=None):
     )
     parser.add_argument("--format", choices=("compact", "json"), default="compact")
     args = parser.parse_args(argv)
-    if args.jobs < 1:
-        parser.error("--jobs must be >= 1")
+    if args.jobs != "auto":
+        try:
+            args.jobs = int(args.jobs)
+        except ValueError:
+            parser.error("--jobs must be >= 1 or 'auto'")
+        if args.jobs < 1:
+            parser.error("--jobs must be >= 1 or 'auto'")
     if args.base == "" or args.tip == "":
         parser.error("Git references must not be empty")
     if not args.base and (args.tip or args.merge_base):

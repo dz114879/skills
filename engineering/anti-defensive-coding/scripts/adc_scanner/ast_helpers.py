@@ -10,9 +10,13 @@ from functools import cached_property, lru_cache
 import gc
 import io
 from itertools import pairwise
+import os
 import re
+import sys
+import sysconfig
 import threading
 import tokenize
+from typing import Literal
 import weakref
 
 from .registry import PY09_IO_CALLS, PY09_LOCK_TOKENS, evidence_text
@@ -71,13 +75,15 @@ PROBE_TYPES = frozenset(
 )
 STATE_TYPES = frozenset({ast.Assign, ast.AnnAssign, ast.Dict, ast.Try, ast.TryStar})
 _PARALLEL_ACTIVE = 0
+_FREE_THREADED_GC = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
 
 
 @contextmanager
 def allocation_batch():
-    """Retained ASTs are acyclic; collect young temporaries once per scan batch."""
+    """Batch generational GC; free-threaded builds need native heap thresholds."""
     enabled = (
-        threading.current_thread() is threading.main_thread()
+        not _FREE_THREADED_GC
+        and threading.current_thread() is threading.main_thread()
         and _PARALLEL_ACTIVE == 0
         and gc.isenabled()
     )
@@ -91,18 +97,29 @@ def allocation_batch():
             gc.enable()
 
 
-def parallel_map(fn, items, jobs):
+def resolve_jobs(jobs: int | Literal["auto"] = "auto") -> int:
+    """Select worker count from an explicit integer or live GIL/CPU state."""
+    if jobs == "auto":
+        is_gil_enabled = getattr(sys, "_is_gil_enabled", None)
+        if is_gil_enabled is None or is_gil_enabled():
+            return 1
+        return os.process_cpu_count() or 1
+    return jobs
+
+
+def parallel_map(fn, items, jobs: int | Literal["auto"] = "auto"):
     """Map in input order; only the orchestration thread owns pool/GC state."""
     # GC is process-global; the strict lint profile runs without PLW enabled.
     global _PARALLEL_ACTIVE  # noqa: PLW0603, RUF100
-    if jobs <= 1 or len(items) <= 1:
+    workers = resolve_jobs(jobs)
+    if workers <= 1 or len(items) <= 1:
         return [fn(item) for item in items]
     enabled = gc.isenabled()
     _PARALLEL_ACTIVE += 1
     if not enabled:
         gc.enable()
     try:
-        with ThreadPoolExecutor(max_workers=min(jobs, len(items))) as executor:
+        with ThreadPoolExecutor(max_workers=min(workers, len(items))) as executor:
             return list(executor.map(fn, items))
     finally:
         _PARALLEL_ACTIVE -= 1
@@ -123,6 +140,7 @@ def ast_field_parts():
         "module",
         "level",
         "is_async",
+        "is_lazy",
         "simple",
         "conversion",
         "kind",

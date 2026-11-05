@@ -1,4 +1,5 @@
 from contextlib import chdir, redirect_stdout
+import gc
 import hashlib
 import io
 import json
@@ -71,15 +72,129 @@ def test_py02_evidence_templates_cover_the_four_nonraising_exit_strata():
     assert "PY02_non_raising" not in EVIDENCE_TEMPLATES
 
 
+@pytest.mark.parametrize("free_threaded", [False, True])
+def test_allocation_batch_respects_build_collector(free_threaded, monkeypatch):
+    from adc_scanner import ast_helpers
+
+    monkeypatch.setattr(ast_helpers, "_FREE_THREADED_GC", free_threaded)
+    assert gc.isenabled()
+    with (
+        patch.object(gc, "disable", wraps=gc.disable) as disable,
+        patch.object(gc, "collect", wraps=gc.collect) as collect,
+        patch.object(gc, "enable", wraps=gc.enable) as enable,
+    ):
+        with ast_helpers.allocation_batch():
+            assert gc.isenabled() is free_threaded
+            collect.assert_not_called()
+        assert gc.isenabled()
+        if free_threaded:
+            disable.assert_not_called()
+            collect.assert_not_called()
+            enable.assert_not_called()
+        else:
+            disable.assert_called_once_with()
+            collect.assert_called_once_with(0)
+            enable.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("jobs", "gil_enabled", "cpu_count", "workers"),
+    [
+        (None, None, 8, 1),
+        ("auto", True, 8, 1),
+        (None, False, 8, 8),
+        ("auto", False, 2, 2),
+        ("auto", False, None, 1),
+        ("auto", False, 0, 1),
+        (1, False, 8, 1),
+        (4, True, 8, 4),
+        (4, False, 8, 4),
+    ],
+)
+@pytest.mark.parametrize("item_count", [0, 1, 3])
+def test_runtime_worker_selection_preserves_order_and_bounds_pools(
+    jobs, gil_enabled, cpu_count, workers, item_count, monkeypatch
+):
+    from adc_scanner import ast_helpers
+
+    if gil_enabled is None:
+        monkeypatch.delattr(sys, "_is_gil_enabled", raising=False)
+    else:
+        monkeypatch.setattr(sys, "_is_gil_enabled", lambda: gil_enabled, raising=False)
+    options = {} if jobs is None else {"jobs": jobs}
+    with (
+        patch.object(os, "process_cpu_count", return_value=cpu_count, create=True),
+        patch.object(
+            ast_helpers, "ThreadPoolExecutor", wraps=ast_helpers.ThreadPoolExecutor
+        ) as pool,
+    ):
+        assert ast_helpers.resolve_jobs(**options) == workers
+        assert (
+            ast_helpers.parallel_map(str, [3, 1, 2][:item_count], **options)
+            == [
+                "3",
+                "1",
+                "2",
+            ][:item_count]
+        )
+        if workers <= 1 or item_count <= 1:
+            pool.assert_not_called()
+        else:
+            pool.assert_called_once_with(max_workers=min(workers, item_count))
+
+
 class ScopeTests(ExtractorTestCase):
-    @pytest.mark.parametrize("jobs", [0, -1])
-    def test_jobs_rejects_nonpositive_worker_counts(self, jobs, capsys):
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "import example\n",
+            "from example import value\n",
+            pytest.param(
+                "lazy import example\n",
+                marks=pytest.mark.skipif(
+                    sys.version_info < (3, 15),
+                    reason="Lazy imports require Python 3.15",
+                ),
+            ),
+            pytest.param(
+                "lazy from example import value\n",
+                marks=pytest.mark.skipif(
+                    sys.version_info < (3, 15),
+                    reason="Lazy imports require Python 3.15",
+                ),
+            ),
+        ],
+    )
+    def test_imports_keep_ast_scans_read_only_and_preserve_candidates(self, source):
+        self.put("imports.py", source)
+        self.put("candidate.py", 'hasattr(item, "value")\n')
+        result = self.scan("--paths", ".")
+        assert result["summary"] == {
+            "mode": "paths",
+            "files_scanned": 2,
+            "cross_checked_files": 0,
+            "candidate_count": 1,
+            "parse_error_count": 0,
+        }
+        assert [(c["path"], c["rule"]) for c in result["candidates"]] == [
+            ("candidate.py", "PY01_reflect_default")
+        ]
+        assert {
+            path.relative_to(self.root).as_posix(): path.read_bytes()
+            for path in self.root.rglob("*")
+        } == {
+            "imports.py": source.encode(),
+            "candidate.py": b'hasattr(item, "value")\n',
+        }
+
+    @pytest.mark.parametrize("jobs", ["0", "-1", "invalid", ""])
+    def test_jobs_rejects_invalid_worker_counts(self, jobs, capsys):
         from scan_python import main
 
         with pytest.raises(SystemExit) as error:
-            main(["--paths", str(self.root), "--jobs", str(jobs)])
+            main(["--paths", str(self.root), "--jobs", jobs])
         assert error.value.code == 2
-        assert "--jobs must be >= 1" in capsys.readouterr().err
+        assert "--jobs must be >= 1 or 'auto'" in capsys.readouterr().err
 
     @pytest.mark.parametrize("mode", ["paths", "worktree", "commit"])
     def test_jobs_preserves_exact_output_across_multifile_pipeline(self, mode):
@@ -193,7 +308,8 @@ class ScopeTests(ExtractorTestCase):
                     {"snapshot_error.py", "z_error.py"}
                     | ({"base_error.py"} if mode != "paths" else set())
                 )
-            for jobs in [2, 4]:
+            assert self.cli(*args).encode() == expected.encode()
+            for jobs in ["auto", 2, 4]:
                 assert (
                     self.cli(*args, "--jobs", str(jobs)).encode() == expected.encode()
                 )
