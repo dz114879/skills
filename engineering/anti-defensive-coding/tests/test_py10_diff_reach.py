@@ -459,7 +459,11 @@ class Py10DiffReachTests(ExtractorTestCase):
             ("no_mutation", "r = obj.items()\nobj.items()", False),
             ("other_getter", "r = obj.items()\nr.clear()\nother.items()", False),
             ("wrong_order", "r = obj.items()\nobj.items()\nr.pop()", False),
-            ("patch", 'with mock.patch("app.execute"):\n    execute()', True),
+            (
+                "patch",
+                'import app\nwith mock.patch("app.execute"):\n    app.execute()',
+                True,
+            ),
             (
                 "patch_object",
                 'with patch.object(app, "execute"):\n    app.execute()',
@@ -472,7 +476,9 @@ class Py10DiffReachTests(ExtractorTestCase):
             ),
             (
                 "monkeypatch_string",
-                'monkeypatch.setattr("app.execute", replacement)\nexecute()',
+                "import app\n"
+                'monkeypatch.setattr("app.execute", replacement)\n'
+                "app.execute()",
                 True,
             ),
             ("other_patch", 'with patch("app.dependency"):\n    execute()', False),
@@ -507,7 +513,10 @@ class Py10DiffReachTests(ExtractorTestCase):
             ("obj._legacy_read()", "tests.md §4"),
             ('assert "class" in Path("app.py").read_text()', "tests.md §6"),
             ("r = obj.items()\nr.append(1)\nobj.items()", "tests.md §2"),
-            ('with patch("app.execute"):\n    execute()', "tests.md §5"),
+            (
+                'import app\nwith patch("app.execute"):\n    app.execute()',
+                "tests.md §5",
+            ),
         ]:
             self.put(
                 "tests/test_case.py",
@@ -517,6 +526,601 @@ class Py10DiffReachTests(ExtractorTestCase):
             assert len(candidates) == 1
             assert candidates[0]["rule"] == "PY10b_test_smell"
             assert pointer in candidates[0]["verify"]
+
+    @pytest.mark.parametrize(
+        ("assertions", "counts"),
+        [
+            ('assert "a" in src or "b" in src', [2]),
+            ('assert ("a" in src or "b" in src or "c" not in src)', [3]),
+            ('assert "a" in src\nassert "b" in src', [1, 1]),
+            ('assert "a" in src; assert "b" in src', [1, 1]),
+            ('self.assertTrue("a" in src or "b" in src)', [2]),
+            ('self.assertTrue(src.startswith("a") and src.find("b") >= 0)', [2]),
+            ('self.assertIn("a", src)\nself.assertNotIn("b", src)', [1, 1]),
+            (
+                'self.assertTrue(self.assertIn("a", src) or self.assertIn("b", src))',
+                [1, 1],
+            ),
+            ('assert "a" in src or "b" in response.text', [1]),
+            ('self.assertions.check("a" in src)', []),
+        ],
+    )
+    def test_raw_text_checks_fold_per_assertion_owner(self, assertions, counts):
+        self.put(
+            "tests/test_source.py",
+            "def test_source(self):\n"
+            "    src = open('a.py').read()\n"
+            + textwrap.indent(assertions, "    ")
+            + "\n",
+        )
+        candidates = self.scan("--paths", "tests/test_source.py")["candidates"]
+        assert len(candidates) == len(counts)
+        raw_evidence = (
+            "Assertion checks raw source/documentation text from a .py/.md path"
+        )
+        for candidate, count in zip(candidates, counts, strict=True):
+            assert candidate["rule"] == "PY10b_test_smell"
+            assert candidate["symbol"] == "test_source"
+            assert candidate["evidence"] == (
+                f"{count} raw-text checks in one assertion: {raw_evidence}"
+                if count > 1
+                else raw_evidence
+            )
+            assert candidate["code"].count("src = open('a.py').read()") == 1
+            assert "tests.md §6" in candidate["verify"]
+            if count > 1:
+                assert candidate["code"].startswith(assertions + "; ")
+                assert candidate["span"] == [2, 3]
+
+    @pytest.mark.parametrize(
+        ("assertion", "checks"),
+        [
+            (
+                'assert self.assertTrue("a" in src) is None',
+                [(1, '"a" in src')],
+            ),
+            (
+                'assert self.assertTrue("a" in src or "b" in src) is None',
+                [(2, 'self.assertTrue("a" in src or "b" in src)')],
+            ),
+            (
+                'self.assertTrue(self.assertFalse("a" in src))',
+                [(1, '"a" in src')],
+            ),
+            (
+                'self.assertTrue(self.assertTrue("a" in src) or "b" in src)',
+                [(1, '"a" in src'), (1, '"b" in src')],
+            ),
+            (
+                'assert self.assertTrue("a" in src) is None and "b" in src',
+                [(1, '"a" in src'), (1, '"b" in src')],
+            ),
+            (
+                'assert self.assertTrue(src.startswith("a")) is None',
+                [(1, 'src.startswith("a")')],
+            ),
+            (
+                'assert self.assertTrue(src.find("a") >= 0) is None',
+                [(1, 'src.find("a")')],
+            ),
+            (
+                'assert self.assertTrue("a" in src not in src) is None',
+                [(2, 'self.assertTrue("a" in src not in src)')],
+            ),
+            (
+                'assert "a" in src not in src',
+                [(2, 'assert "a" in src not in src')],
+            ),
+        ],
+    )
+    def test_raw_text_nested_assertions_count_each_predicate_once(
+        self, assertion, checks
+    ):
+        self.put(
+            "tests/test_source.py",
+            f"def test_source(self):\n    src = open('a.py').read()\n    {assertion}\n",
+        )
+        candidates = self.scan("--paths", "tests/test_source.py")["candidates"]
+        raw_evidence = (
+            "Assertion checks raw source/documentation text from a .py/.md path"
+        )
+        assert sorted(
+            (candidate["evidence"], candidate["code"].split("; ", 1)[0])
+            for candidate in candidates
+        ) == sorted(
+            (
+                f"{count} raw-text checks in one assertion: {raw_evidence}"
+                if count > 1
+                else raw_evidence,
+                code,
+            )
+            for count, code in checks
+        )
+        assert all(candidate["rule"] == "PY10b_test_smell" for candidate in candidates)
+
+    def test_raw_text_bundle_preserves_distinct_origins_and_function_owners(self):
+        self.put(
+            "tests/test_source.py",
+            "s = open('a.py').read()\n"
+            "t = open('b.md').read()\n"
+            "def test_first():\n"
+            "    assert 'a' in s or 'b' in t\n"
+            "def test_second():\n"
+            "    assert 'c' in s\n",
+        )
+        candidates = self.scan("--paths", "tests/test_source.py")["candidates"]
+        assert [(c["symbol"], c["span"]) for c in candidates] == [
+            ("test_first", [1, 4]),
+            ("test_second", [1, 6]),
+        ]
+        bundle, singleton = candidates
+        assert bundle["code"].startswith("assert 'a' in s or 'b' in t; ")
+        assert bundle["code"].count("s = open('a.py').read()") == 1
+        assert bundle["code"].count("t = open('b.md').read()") == 1
+        assert bundle["evidence"].startswith("2 raw-text checks in one assertion: ")
+        assert singleton["evidence"].startswith("Assertion checks raw source/")
+        assert bundle["verify"] == singleton["verify"]
+
+    @pytest.mark.parametrize(
+        ("before", "after", "expected"),
+        [
+            ("a.py", "b.md", True),
+            ("'b' in src", "'c' in src", True),
+            ("    )", "    )  # assertion end", True),
+            ("unrelated = 1", "unrelated = 2", False),
+        ],
+    )
+    def test_raw_text_bundle_diff_scope_covers_owner_and_origins(
+        self, before, after, expected
+    ):
+        source = (
+            "def test_source():\n"
+            "    src = open('a.py').read()\n"
+            "    unrelated = 1\n"
+            "    assert (\n"
+            "        'a' in src or\n"
+            "        'b' in src\n"
+            "    )\n"
+        )
+        self.init_repo()
+        self.put("tests/test_source.py", source)
+        base = self.commit()
+        self.put("tests/test_source.py", source.replace(before, after))
+        candidates = self.scan("--base", base)["candidates"]
+        assert len(candidates) == int(expected)
+        if expected:
+            assert candidates[0]["span"] == [2, 7]
+            assert candidates[0]["change_tag"] == "changed"
+            assert candidates[0]["evidence"].startswith("2 raw-text checks")
+
+    @pytest.mark.parametrize(
+        ("imports", "body", "expected"),
+        [
+            (
+                "",
+                'with patch.object(main_mcp, "run_async"):\n    main_mcp.run_async()',
+                True,
+            ),
+            ("", 'monkeypatch.setattr(obj, "run", replacement)\nobj.run()', True),
+            ("", 'with patch.object(self.client, "run"):\n    self.client.run()', True),
+            ("", 'with patch.object(obj, "run"):\n    other.run()', False),
+            ("", 'with patch.object(obj, "run"):\n    run()', False),
+            (
+                "",
+                'with patch.object(make_client().transport, "send"):\n'
+                "    make_client().transport.send()",
+                False,
+            ),
+            (
+                "",
+                'with patch.object(clients[0], "send"):\n    clients[0].send()',
+                False,
+            ),
+            (
+                "",
+                'with patch.object(obj, "run"):\n    obj = other\n    obj.run()',
+                False,
+            ),
+            (
+                "",
+                'with patch.object(obj, "run"):\n'
+                "    obj: Client = other\n"
+                "    obj.run()",
+                False,
+            ),
+            (
+                "",
+                'with patch.object(obj, "run"):\n    obj, other = pair\n    obj.run()',
+                False,
+            ),
+            (
+                "",
+                'with patch.object(obj, "run"):\n    (obj := other)\n    obj.run()',
+                False,
+            ),
+            (
+                "",
+                'monkeypatch.setattr(obj, "run", replacement); obj = other; obj.run()',
+                False,
+            ),
+            (
+                "",
+                'monkeypatch.setattr(obj, "run", replacement); obj.run(); obj = other',
+                True,
+            ),
+            (
+                "",
+                'with patch.object(obj.client, "run"):\n'
+                "    obj = other\n"
+                "    obj.client.run()",
+                False,
+            ),
+            (
+                "",
+                'with patch.object(obj.client, "run"):\n'
+                "    obj.client = other\n"
+                "    obj.client.run()",
+                False,
+            ),
+            (
+                "",
+                'with patch.object(obj.client, "run"):\n'
+                "    obj.other = other\n"
+                "    obj.client.run()",
+                True,
+            ),
+            (
+                "",
+                "obj = other\n"
+                'with patch.object(obj, "run"):\n'
+                "    obj.run()\n"
+                "obj = another",
+                True,
+            ),
+            (
+                "",
+                'with patch.object(obj, "run"):\n'
+                "    def nested():\n"
+                "        obj = other\n"
+                "    obj.run()",
+                True,
+            ),
+            (
+                "from pkg import mod\n",
+                'with patch("pkg.mod.helper"):\n    mod.helper()',
+                True,
+            ),
+            (
+                "import pkg.mod as m\n",
+                'with patch("pkg.mod.helper"):\n    m.helper()',
+                True,
+            ),
+            (
+                "import pkg.mod\n",
+                'with patch("pkg.mod.helper"):\n    pkg.mod.helper()',
+                True,
+            ),
+            (
+                "",
+                'from pkg import mod\nwith patch("pkg.mod.helper"):\n    mod.helper()',
+                True,
+            ),
+            (
+                "",
+                'with patch("pkg.mod.helper"):\n'
+                "    import pkg.mod as m\n"
+                "    m.helper()",
+                True,
+            ),
+            (
+                "from pkg import mod\n",
+                'monkeypatch.setattr("pkg.mod.helper", replacement)\nmod.helper()',
+                True,
+            ),
+            (
+                "from datetime import datetime\n",
+                'with patch("app.utils.timezone.datetime"):\n    datetime(2020, 1, 1)',
+                False,
+            ),
+            (
+                "from pkg.mod import helper\n",
+                'with patch("pkg.mod.helper"):\n    helper()',
+                False,
+            ),
+            ("", 'with patch("pkg.Base.send"):\n    sub_adapter.send()', False),
+            ("", 'with patch("builtins.hasattr"):\n    hasattr(obj, "name")', True),
+            (
+                "from helpers import hasattr\n",
+                'with patch("builtins.hasattr"):\n    hasattr(obj, "name")',
+                False,
+            ),
+            (
+                "from builtins import hasattr\n",
+                'with patch("builtins.hasattr"):\n    hasattr(obj, "name")',
+                False,
+            ),
+            (
+                "from .helpers import hasattr\n",
+                'with patch("builtins.hasattr"):\n    hasattr(obj, "name")',
+                False,
+            ),
+            (
+                "import builtins as b\n",
+                'with patch("builtins.hasattr"):\n    b.hasattr(obj, "name")',
+                True,
+            ),
+            (
+                "",
+                "hasattr = helper\n"
+                'with patch("builtins.hasattr"):\n'
+                '    hasattr(obj, "name")',
+                False,
+            ),
+            (
+                "",
+                'with patch("builtins.hasattr"):\n'
+                "    def nested():\n"
+                "        hasattr = helper\n"
+                '    hasattr(obj, "name")',
+                True,
+            ),
+            (
+                "",
+                'with patch("pkg.mod.helper"):\n    mod.helper()\nfrom pkg import mod',
+                False,
+            ),
+            (
+                "from pkg import mod\n",
+                'with patch("pkg.mod.helper"):\n    mod.helper()\nmod = other',
+                True,
+            ),
+            (
+                "from pkg import mod\n",
+                'with patch("pkg.mod.helper"):\n'
+                "    def nested():\n"
+                "        mod = other\n"
+                "    mod.helper()",
+                True,
+            ),
+            (
+                "from pkg import mod\n",
+                'with patch("pkg.mod.helper"):\n'
+                "    try:\n"
+                "        mod.helper()\n"
+                "    except Error as mod:\n"
+                "        pass",
+                True,
+            ),
+        ],
+    )
+    def test_self_patch_requires_the_same_object_or_imported_slot(
+        self, imports, body, expected
+    ):
+        self.put(
+            "tests/test_patch.py",
+            imports
+            + "async def test_patch(self, obj, monkeypatch):\n"
+            + textwrap.indent(body, "    ")
+            + "\n",
+        )
+        candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
+        assert len(candidates) == int(expected)
+        if expected:
+            assert candidates[0]["rule"] == "PY10b_test_smell"
+            assert candidates[0]["evidence"].startswith(
+                "Patch targets directly invoked SUT"
+            )
+            assert "tests.md §5" in candidates[0]["verify"]
+
+    @pytest.mark.parametrize("receiver", ["obj", "obj.client"])
+    @pytest.mark.parametrize(
+        "body",
+        [
+            "for obj in others:\n    CALL",
+            "async for obj in others:\n    CALL",
+            "for obj, other in pairs:\n    CALL",
+            "with context() as obj:\n    CALL",
+            "async with context() as obj:\n    CALL",
+            "with context() as (obj, other):\n    CALL",
+            "import obj\nCALL",
+            "import obj.transport\nCALL",
+            "import clients as obj\nCALL",
+            "from clients import obj\nCALL",
+            "from clients import client as obj\nCALL",
+            "from .clients import obj\nCALL",
+            "try:\n    work()\nexcept Error as obj:\n    CALL",
+            "try:\n    work()\nexcept* Error as obj:\n    CALL",
+            "def obj():\n    pass\nCALL",
+            "async def obj():\n    pass\nCALL",
+            "class obj:\n    pass\nCALL",
+            "del obj\nCALL",
+        ],
+    )
+    def test_self_patch_object_rejects_receiver_and_prefix_bindings(
+        self, receiver, body
+    ):
+        self.put(
+            "tests/test_patch.py",
+            "async def test_patch(obj, others):\n"
+            f'    with patch.object({receiver}, "run"):\n'
+            + textwrap.indent(body.replace("CALL", f"{receiver}.run()"), "        ")
+            + "\n",
+        )
+        assert self.scan("--paths", "tests/test_patch.py")["candidates"] == []
+
+    @pytest.mark.parametrize(
+        ("body", "expected"),
+        [
+            ("for obj.client in others:\n    obj.client.run()", False),
+            ("with context() as obj.client:\n    obj.client.run()", False),
+            ("del obj.client\nobj.client.run()", False),
+            ("for obj.clients in others:\n    obj.client.run()", True),
+            ("with context() as obj.other:\n    obj.client.run()", True),
+            ("def nested():\n    import clients as obj\nobj.client.run()", True),
+            ("class Nested:\n    obj = other\nobj.client.run()", True),
+            ("try:\n    obj.client.run()\nexcept Error as obj:\n    pass", True),
+            ("obj.client.run()\nimport clients as obj", True),
+        ],
+    )
+    def test_self_patch_object_bindings_respect_paths_scopes_and_order(
+        self, body, expected
+    ):
+        self.put(
+            "tests/test_patch.py",
+            "def test_patch(obj, others):\n"
+            '    with patch.object(obj.client, "run"):\n'
+            + textwrap.indent(body, "        ")
+            + "\n",
+        )
+        candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
+        assert len(candidates) == int(expected)
+        if expected:
+            assert (
+                candidates[0]["evidence"]
+                == "Patch targets directly invoked SUT symbol 'run'"
+            )
+
+    @pytest.mark.parametrize(
+        ("receiver", "target"),
+        [
+            ("obj", "obj"),
+            ("obj.client", "obj"),
+            ("obj.client", "obj.client"),
+            ("obj.client.transport", "obj.client"),
+        ],
+    )
+    @pytest.mark.parametrize("value", ["", " = other"])
+    def test_self_patch_object_annotations_require_a_value_to_rebind(
+        self, receiver, target, value
+    ):
+        self.put(
+            "tests/test_patch.py",
+            "def test_patch(obj):\n"
+            f'    with patch.object({receiver}, "run"):\n'
+            f"        {target}: Client{value}\n"
+            f"        {receiver}.run()\n",
+        )
+        candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
+        assert len(candidates) == int(not value)
+        if not value:
+            assert (
+                candidates[0]["evidence"]
+                == "Patch targets directly invoked SUT symbol 'run'"
+            )
+
+    @pytest.mark.parametrize("receiver", ["obj", "obj.client"])
+    @pytest.mark.parametrize(
+        ("statement", "expected"),
+        [
+            ("values = [obj for obj in others]", True),
+            ("values = {obj for obj in others}", True),
+            ("values = {obj: obj for obj in others}", True),
+            ("values = tuple(obj for obj in others)", True),
+            ("values = [obj async for obj in others]", True),
+            ("values = [(obj := item) for item in others]", False),
+            ("values = [item for item in others if (obj := item)]", False),
+            ("obj = [obj for obj in others]", False),
+            ("obj: Client = [obj for obj in others]", False),
+        ],
+    )
+    def test_self_patch_object_comprehension_locals_do_not_rebind_outer_receiver(
+        self, receiver, statement, expected
+    ):
+        self.put(
+            "tests/test_patch.py",
+            "async def test_patch(obj, others):\n"
+            f'    with patch.object({receiver}, "run"):\n'
+            f"        {statement}\n"
+            f"        {receiver}.run()\n",
+        )
+        candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
+        assert len(candidates) == int(expected)
+        if expected:
+            assert (
+                candidates[0]["evidence"]
+                == "Patch targets directly invoked SUT symbol 'run'"
+            )
+
+    def test_self_patch_object_bindings_before_patch_keep_the_receiver(self):
+        self.put(
+            "tests/test_patch.py",
+            "def test_patch(others):\n"
+            "    for obj in others:\n"
+            '        with patch.object(obj.client, "run"):\n'
+            "            obj.client.run()\n",
+        )
+        candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
+        assert len(candidates) == 1
+        assert (
+            candidates[0]["evidence"]
+            == "Patch targets directly invoked SUT symbol 'run'"
+        )
+
+    @pytest.mark.parametrize(
+        "binding",
+        [
+            "mod = other",
+            "mod: Client = other",
+            "mod += other",
+            "(mod := other)",
+            "mod, other = pair",
+            "for mod in objects:\n    pass",
+            "async for mod in objects:\n    pass",
+            "with context() as mod:\n    pass",
+            "async with context() as mod:\n    pass",
+            "try:\n    work()\nexcept Error as mod:\n    pass",
+            "def mod():\n    pass",
+            "async def mod():\n    pass",
+            "class mod:\n    pass",
+            "del mod",
+            "mod = other\nfrom pkg import mod",
+        ],
+    )
+    def test_self_patch_import_bindings_are_blocked_by_local_writes(self, binding):
+        self.put(
+            "tests/test_patch.py",
+            "from pkg import mod\n"
+            "async def test_patch():\n"
+            + textwrap.indent(binding, "    ")
+            + '\n    with patch("pkg.mod.helper"):\n        mod.helper()\n',
+        )
+        assert self.scan("--paths", "tests/test_patch.py")["candidates"] == []
+
+    @pytest.mark.parametrize(
+        "parameters", ["hasattr", "*, hasattr", "*hasattr", "**hasattr"]
+    )
+    def test_self_patch_builtin_names_must_not_be_parameters(self, parameters):
+        self.put(
+            "tests/test_patch.py",
+            f"def test_patch({parameters}):\n"
+            '    with patch("builtins.hasattr"):\n        hasattr(obj, "name")\n',
+        )
+        assert self.scan("--paths", "tests/test_patch.py")["candidates"] == []
+
+    @pytest.mark.parametrize(
+        ("prefix", "parameters", "suffix"),
+        [
+            ("from pkg import mod\n", "mod", ""),
+            ("from pkg import mod\n", "*mod", ""),
+            ("from pkg import mod\n", "**mod", ""),
+            ("from pkg import mod\nmod = other\n", "", ""),
+            ("mod = other\nfrom pkg import mod\n", "", ""),
+            ("from pkg import mod\nif ready:\n    mod = other\n", "", ""),
+            ("", "", "from pkg import mod\n"),
+            ("from .pkg import mod\n", "", ""),
+        ],
+    )
+    def test_self_patch_import_resolution_obeys_parameters_and_module_order(
+        self, prefix, parameters, suffix
+    ):
+        self.put(
+            "tests/test_patch.py",
+            prefix
+            + f"def test_patch({parameters}):\n"
+            + '    with patch("pkg.mod.helper"):\n        mod.helper()\n'
+            + suffix,
+        )
+        assert self.scan("--paths", "tests/test_patch.py")["candidates"] == []
 
     def test_getter_recall_is_checked_before_rebinding_its_result(self):
         for replacement, expected in [
@@ -545,17 +1149,17 @@ class Py10DiffReachTests(ExtractorTestCase):
             (
                 "def test_patch(monkeypatch):\n"
                 '    with patch("app.execute"):\n'
-                '        monkeypatch.setattr("app.other", execute())\n',
-                [2, 3],
+                '        monkeypatch.setattr("app.other", app.execute())\n',
+                [3, 4],
             ),
             (
                 '@patch("app.execute")\n'
                 "def test_patch():\n"
-                '    patch("app.other", execute()).start()\n',
-                [1, 3],
+                '    patch("app.other", app.execute()).start()\n',
+                [2, 4],
             ),
         ]:
-            self.put("tests/test_patch.py", source)
+            self.put("tests/test_patch.py", "import app\n" + source)
             candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
             assert [(c["rule"], c["symbol"], c["span"]) for c in candidates] == [
                 ("PY10b_test_smell", "test_patch", span)
@@ -563,37 +1167,49 @@ class Py10DiffReachTests(ExtractorTestCase):
 
     def test_self_patch_calls_require_an_active_window(self):
         for body, span in [
-            ('execute()\nmonkeypatch.setattr("app.execute", replacement)', None),
-            ('patch("app.execute").start()\nexecute()', [2, 3]),
-            ('execute()\npatch("app.execute").start()', None),
-            ('patch("app.execute").start()\npatch.stopall()\nexecute()', None),
-            ('patch("app.execute").start()\ncheck(patch.stopall())\nexecute()', None),
-            ('patch("app.execute").start(); execute(); patch.stopall()', [2, 2]),
-            ('patch("app.execute").start(); patch.stopall(); execute()', None),
+            ('app.execute()\nmonkeypatch.setattr("app.execute", replacement)', None),
+            ('patch("app.execute").start()\napp.execute()', [3, 4]),
+            ('app.execute()\npatch("app.execute").start()', None),
+            ('patch("app.execute").start()\npatch.stopall()\napp.execute()', None),
             (
-                'monkeypatch.setattr("app.execute", replacement)\nmonkeypatch.undo()\nexecute()',
+                'patch("app.execute").start()\ncheck(patch.stopall())\napp.execute()',
+                None,
+            ),
+            ('patch("app.execute").start(); app.execute(); patch.stopall()', [3, 3]),
+            ('patch("app.execute").start(); patch.stopall(); app.execute()', None),
+            (
+                'monkeypatch.setattr("app.execute", replacement)\n'
+                "monkeypatch.undo()\n"
+                "app.execute()",
                 None,
             ),
             (
-                'monkeypatch.setattr("app.execute", replacement)\ncheck(monkeypatch.undo())\nexecute()',
+                'monkeypatch.setattr("app.execute", replacement)\n'
+                "check(monkeypatch.undo())\n"
+                "app.execute()",
                 None,
             ),
             (
-                'monkeypatch.setattr("app.execute", reset(monkeypatch.undo()))\nexecute()',
-                [2, 3],
-            ),
-            ('execute()\nwith patch("app.execute"):\n    pass', None),
-            ('patch("app.execute")\nexecute()', None),
-            ('monkeypatch.setattr("app.execute", execute())', None),
-            ('patch("app.execute", execute()).start()', None),
-            (
-                'if enabled:\n    monkeypatch.setattr("app.execute", replacement)\nexecute()',
+                'monkeypatch.setattr("app.execute", reset(monkeypatch.undo()))\n'
+                "app.execute()",
                 [3, 4],
+            ),
+            ('app.execute()\nwith patch("app.execute"):\n    pass', None),
+            ('patch("app.execute")\napp.execute()', None),
+            ('monkeypatch.setattr("app.execute", app.execute())', None),
+            ('patch("app.execute", app.execute()).start()', None),
+            (
+                "if enabled:\n"
+                '    monkeypatch.setattr("app.execute", replacement)\n'
+                "app.execute()",
+                [4, 5],
             ),
         ]:
             self.put(
                 "tests/test_patch.py",
-                "def test_patch(monkeypatch):\n" + textwrap.indent(body, "    ") + "\n",
+                "import app\ndef test_patch(monkeypatch):\n"
+                + textwrap.indent(body, "    ")
+                + "\n",
             )
             candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
             assert [(c["rule"], c["symbol"], c["span"]) for c in candidates] == (
@@ -602,49 +1218,89 @@ class Py10DiffReachTests(ExtractorTestCase):
 
     def test_self_patch_tracks_bound_patchers_until_their_stop(self):
         for body, span in [
-            ('p = patch("app.execute")\np.start()\nexecute()\np.stop()', [2, 4]),
-            ('p: Patcher = patch.object(app, "execute")\np.start()\nexecute()', [2, 4]),
-            ('p = patch("app.execute")\nexecute()\np.start()', None),
-            ('p = patch("app.execute")\np.start()\np.stop()\nexecute()', None),
+            ('p = patch("app.execute")\np.start()\napp.execute()\np.stop()', [3, 5]),
             (
-                'p = patch("app.execute")\np.start()\nassert p.stop() is None\nexecute()',
-                None,
+                'p: Patcher = patch.object(app, "execute")\np.start()\napp.execute()',
+                [3, 5],
             ),
-            ('p = patch("app.execute")\np.start()\npatch.stopall()\nexecute()', None),
+            ('p = patch("app.execute")\napp.execute()\np.start()', None),
+            ('p = patch("app.execute")\np.start()\np.stop()\napp.execute()', None),
             (
-                'p = patch("app.execute")\np.start()\nmonkeypatch.undo()\nexecute()',
-                [2, 5],
-            ),
-            (
-                'monkeypatch.setattr("app.execute", replacement)\npatch.stopall()\nexecute()',
-                [2, 4],
-            ),
-            (
-                'p = patch("app.execute")\nother = patch("app.other")\np.start()\nother.stop()\nexecute()',
-                [2, 6],
-            ),
-            (
-                'p = patch("app.execute")\np.start()\np = patch("app.other")\np.stop()\nexecute()',
-                [2, 6],
-            ),
-            ('p = patch("app.execute")\np = replacement\np.start()\nexecute()', None),
-            (
-                'p = patch("app.execute")\n(p := replacement)\np.start()\nexecute()',
+                'p = patch("app.execute")\n'
+                "p.start()\n"
+                "assert p.stop() is None\n"
+                "app.execute()",
                 None,
             ),
             (
-                'p = patch("app.execute")\np, other = replacements\np.start()\nexecute()',
+                'p = patch("app.execute")\np.start()\npatch.stopall()\napp.execute()',
                 None,
             ),
-            ('mocked = patch("app.execute").start()\nmocked.stop()\nexecute()', [2, 4]),
             (
-                'p = patch("app.execute")\np.start()\np.stop()\np.start()\nexecute()',
-                [2, 6],
+                'p = patch("app.execute")\n'
+                "p.start()\n"
+                "monkeypatch.undo()\n"
+                "app.execute()",
+                [3, 6],
+            ),
+            (
+                'monkeypatch.setattr("app.execute", replacement)\n'
+                "patch.stopall()\n"
+                "app.execute()",
+                [3, 5],
+            ),
+            (
+                'p = patch("app.execute")\n'
+                'other = patch("app.other")\n'
+                "p.start()\n"
+                "other.stop()\n"
+                "app.execute()",
+                [3, 7],
+            ),
+            (
+                'p = patch("app.execute")\n'
+                "p.start()\n"
+                'p = patch("app.other")\n'
+                "p.stop()\n"
+                "app.execute()",
+                [3, 7],
+            ),
+            (
+                'p = patch("app.execute")\np = replacement\np.start()\napp.execute()',
+                None,
+            ),
+            (
+                'p = patch("app.execute")\n'
+                "(p := replacement)\n"
+                "p.start()\n"
+                "app.execute()",
+                None,
+            ),
+            (
+                'p = patch("app.execute")\n'
+                "p, other = replacements\n"
+                "p.start()\n"
+                "app.execute()",
+                None,
+            ),
+            (
+                'mocked = patch("app.execute").start()\nmocked.stop()\napp.execute()',
+                [3, 5],
+            ),
+            (
+                'p = patch("app.execute")\n'
+                "p.start()\n"
+                "p.stop()\n"
+                "p.start()\n"
+                "app.execute()",
+                [3, 7],
             ),
         ]:
             self.put(
                 "tests/test_patch.py",
-                "def test_patch(monkeypatch):\n" + textwrap.indent(body, "    ") + "\n",
+                "import app\ndef test_patch(monkeypatch):\n"
+                + textwrap.indent(body, "    ")
+                + "\n",
             )
             candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
             assert [(c["rule"], c["symbol"], c["span"]) for c in candidates] == (
@@ -653,7 +1309,7 @@ class Py10DiffReachTests(ExtractorTestCase):
 
     def test_self_patch_scoped_windows_recognize_the_patch_family(self):
         cases = [
-            (f"@{patch_call}\ndef test_patch():\n    execute()\n", [1, 3])
+            (f"@{patch_call}\ndef test_patch():\n    app.execute()\n", [2, 4])
             for patch_call in [
                 'patch("app.execute")',
                 'mock.patch("app.execute")',
@@ -665,28 +1321,40 @@ class Py10DiffReachTests(ExtractorTestCase):
         ]
         cases += [
             (
-                '@decorate(patch("app.execute"))\ndef test_patch():\n    execute()\n',
+                '@decorate(patch("app.execute"))\n'
+                "def test_patch():\n"
+                "    app.execute()\n",
                 None,
             ),
             (
-                '@patch("app.execute")\ndef test_patch():\n    def helper():\n        execute()\n',
+                '@patch("app.execute")\n'
+                "def test_patch():\n"
+                "    def helper():\n"
+                "        app.execute()\n",
                 None,
             ),
             (
-                'def test_patch():\n    with patch("app.execute"):\n        execute()\n',
-                [2, 3],
+                "def test_patch():\n"
+                '    with patch("app.execute"):\n'
+                "        app.execute()\n",
+                [3, 4],
             ),
             (
-                'def test_patch():\n    with patch("app.execute"):\n        pass\n    execute()\n',
+                "def test_patch():\n"
+                '    with patch("app.execute"):\n'
+                "        pass\n"
+                "    app.execute()\n",
                 None,
             ),
             (
-                'def test_patch():\n    with patch("app.execute"), other(execute()):\n        pass\n',
+                "def test_patch():\n"
+                '    with patch("app.execute"), other(app.execute()):\n'
+                "        pass\n",
                 None,
             ),
         ]
         for source, span in cases:
-            self.put("tests/test_patch.py", source)
+            self.put("tests/test_patch.py", "import app\n" + source)
             candidates = self.scan("--paths", "tests/test_patch.py")["candidates"]
             assert [(c["rule"], c["symbol"], c["span"]) for c in candidates] == (
                 [("PY10b_test_smell", "test_patch", span)] if span else []
@@ -695,13 +1363,18 @@ class Py10DiffReachTests(ExtractorTestCase):
     def test_starting_a_bound_patcher_makes_the_sut_call_diff_eligible(self):
         self.init_repo()
         for previous, spans in [
-            ("", [[2, 4]]),
-            ("    p.start()\n    execute()\n    p.stop()\n", [[2, 4], [2, 7]]),
+            ("", [[3, 5]]),
+            ("    p.start()\n    app.execute()\n    p.stop()\n", [[3, 5], [3, 8]]),
         ]:
-            prefix = 'def test_patch():\n    p = patch("app.execute")\n' + previous
-            self.put("tests/test_patch.py", prefix + "    execute()\n")
+            prefix = (
+                'import app\ndef test_patch():\n    p = patch("app.execute")\n'
+                + previous
+            )
+            self.put("tests/test_patch.py", prefix + "    app.execute()\n")
             base = self.commit()
-            self.put("tests/test_patch.py", prefix + "    p.start()\n    execute()\n")
+            self.put(
+                "tests/test_patch.py", prefix + "    p.start()\n    app.execute()\n"
+            )
             candidates = self.scan("--base", base)["candidates"]
             assert [
                 (c["rule"], c["symbol"], c["span"], c["change_tag"]) for c in candidates
@@ -735,8 +1408,8 @@ class Py10DiffReachTests(ExtractorTestCase):
     def test_test_smells_scope_decorators_module_reads_and_diff_spans(self):
         self.init_repo()
         original = (
-            'TEXT = Path("app.py").read_text()\n'
-            '@patch("app.execute")\ndef test_patched():\n    execute()\n'
+            'import app\nTEXT = Path("app.py").read_text()\n'
+            '@patch("app.execute")\ndef test_patched():\n    app.execute()\n'
             'def test_read():\n    assert "class" not in TEXT\n'
             'def test_unrelated():\n    with patch("app.other"):\n        pass\n'
             "def test_other():\n    other()\n"

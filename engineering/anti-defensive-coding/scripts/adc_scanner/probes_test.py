@@ -4,12 +4,15 @@ import ast
 from dataclasses import dataclass, field
 
 from .ast_helpers import (
+    SCOPE_TYPES,
     CandidateRecords,
+    binding_names,
     bound_targets,
     lexical_nodes,
     local_walk,
     name_path,
     parameters,
+    scope_index,
     simple_assignment,
     terminal_name,
     write_targets,
@@ -49,6 +52,26 @@ def raw_text_origin(node, bindings):
     return None
 
 
+def is_self_assertion(node):
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+        and node.func.attr.startswith("assert")
+    )
+
+
+def assertion_walk(expression):
+    pending = [expression]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, SCOPE_TYPES) or is_self_assertion(node):
+            continue
+        yield node
+        pending.extend(reversed(list(ast.iter_child_nodes(node))))
+
+
 def patch_symbol(node):
     path = name_path(node.func)
     index = None
@@ -63,6 +86,129 @@ def patch_symbol(node):
         if isinstance(target, ast.Constant) and isinstance(target.value, str):
             return target.value.rsplit(".", 1)[-1]
     return None
+
+
+def import_env(tree, function, call):
+    scope = scope_index(function)
+    env = {}
+    blocked = set(scope.parameters)
+    position = (call.lineno, call.col_offset)
+    statements = [
+        (statement, True)
+        for statement in tree.body
+        if statement.lineno < function.lineno
+    ]
+    statements.extend(
+        (statement, False)
+        for statement in scope.lexical
+        if (statement.lineno, statement.col_offset) < position
+    )
+    for statement, module_scope in statements:
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                local = alias.asname or alias.name.split(".")[0]
+                if local not in blocked:
+                    env[local] = alias.name if alias.asname else local
+            continue
+        if isinstance(statement, ast.ImportFrom):
+            for alias in statement.names:
+                if alias.name == "*":
+                    continue
+                local = alias.asname or alias.name
+                if statement.level == 0 and statement.module:
+                    if local not in blocked:
+                        env[local] = f"{statement.module}.{alias.name}"
+                else:
+                    blocked.add(local)
+                    env.pop(local, None)
+            continue
+        if module_scope:
+            names = {
+                name for child in local_walk(statement) for name in binding_names(child)
+            }
+        else:
+            names = set(binding_names(statement))
+            if isinstance(statement, (ast.Try, ast.TryStar)):
+                names.update(
+                    handler.name
+                    for handler in statement.handlers
+                    if handler.name and (handler.lineno, handler.col_offset) < position
+                )
+        for name in names:
+            blocked.add(name)
+            env.pop(name, None)
+    return env, blocked
+
+
+def receiver_writes(node):
+    targets = write_targets(node)
+    if isinstance(node, (ast.For, ast.AsyncFor)):
+        targets = [node.target]
+    elif isinstance(node, (ast.With, ast.AsyncWith)):
+        targets = [
+            item.optional_vars for item in node.items if item.optional_vars is not None
+        ]
+    elif isinstance(node, ast.Delete):
+        targets = node.targets
+    for target in targets:
+        for bound in bound_targets(target):
+            yield name_path(bound)
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        for alias in node.names:
+            yield from binding_names(alias)
+    elif isinstance(
+        node, (ast.ExceptHandler, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    ):
+        yield from binding_names(node)
+
+
+def same_patched_slot(patch, call, tree, function):
+    target_path = name_path(patch.func)
+    if target_path in PY10B_PATCH_METHODS["object"] or (
+        target_path.endswith("monkeypatch.setattr") and len(patch.args) >= 3
+    ):
+        if not (
+            len(patch.args) >= 2
+            and isinstance(patch.args[1], ast.Constant)
+            and isinstance(patch.args[1].value, str)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == patch.args[1].value
+        ):
+            return False
+        receiver = name_path(patch.args[0])
+        if (
+            not receiver
+            or receiver.startswith(".")
+            or receiver != name_path(call.func.value)
+        ):
+            return False
+        for binding in scope_index(function).nodes:
+            for written in receiver_writes(binding):
+                if (patch.lineno, patch.col_offset) < (
+                    binding.lineno,
+                    binding.col_offset,
+                ) < (call.lineno, call.col_offset) and (
+                    written == receiver or receiver.startswith(written + ".")
+                ):
+                    return False
+        return True
+    if (
+        patch.args
+        and isinstance(patch.args[0], ast.Constant)
+        and isinstance(patch.args[0].value, str)
+    ):
+        target = patch.args[0].value
+        env, blocked = import_env(tree, function, call)
+        if isinstance(call.func, ast.Name):
+            return (
+                call.func.id not in blocked
+                and call.func.id not in env
+                and target == f"builtins.{call.func.id}"
+            )
+        if isinstance(call.func, ast.Attribute):
+            root, dot, tail = name_path(call.func).partition(".")
+            return bool(dot and root in env and f"{env[root]}.{tail}" == target)
+    return False
 
 
 def is_patch_constructor(node):
@@ -168,6 +314,13 @@ class GetterReturn:
 class TestProbes(CandidateRecords):
     def __init__(self, source, tree):
         super().__init__(source)
+        self.tree = tree
+        self.parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        self.raw_groups = {}
         self.module_bindings = {}
         for statement in lexical_nodes(tree.body):
             self.bind_raw_text(statement, self.module_bindings)
@@ -224,9 +377,7 @@ class TestProbes(CandidateRecords):
             expressions = []
             if isinstance(child, ast.Assert):
                 expressions = [child.test]
-            elif isinstance(child, ast.Call) and name_path(child.func).startswith(
-                "self.assert"
-            ):
+            elif is_self_assertion(child):
                 expressions = child.args
                 if (
                     terminal_name(child.func) in {"assertIn", "assertNotIn"}
@@ -234,7 +385,7 @@ class TestProbes(CandidateRecords):
                 ):
                     self.raw_assertion(child, child.args[1], bindings)
             for expression in expressions:
-                for check in local_walk(expression):
+                for check in assertion_walk(expression):
                     if isinstance(check, ast.Compare):
                         for op, right in zip(check.ops, check.comparators, strict=True):
                             if isinstance(op, (ast.In, ast.NotIn)):
@@ -256,6 +407,7 @@ class TestProbes(CandidateRecords):
                     for call in calls
                     if terminal_name(call.func) == symbol
                     and window.start <= (call.lineno, call.col_offset) < window.end
+                    and same_patched_slot(window.patch, call, self.tree, node)
                 ),
                 None,
             )
@@ -277,13 +429,37 @@ class TestProbes(CandidateRecords):
 
     def raw_assertion(self, node, operand, bindings):
         origin = raw_text_origin(operand, bindings)
-        if origin and origin[0] == "text":
+        if not origin or origin[0] != "text":
+            return
+        origins = tuple(dict.fromkeys(origin[1]))
+        owner = node
+        while not (isinstance(owner, ast.Assert) or is_self_assertion(owner)):
+            owner = self.parents[owner]
+        if owner not in self.raw_groups:
             self.smell(
                 node,
                 evidence_text("PY10b_raw_text"),
-                tuple(dict.fromkeys(origin[1])),
+                origins,
                 variant_key="PY10b:raw-text",
             )
+            self.raw_groups[owner] = (self.candidates[-1], [node], list(origins))
+            return
+        record, checks, group_origins = self.raw_groups[owner]
+        checks.append(node)
+        for item in origins:
+            if not any(item is existing for existing in group_origins):
+                group_origins.append(item)
+        nodes = (owner, *group_origins)
+        spans = [(item.lineno, item.end_lineno) for item in nodes]
+        record["span"] = [
+            min(start for start, _ in spans),
+            max(end for _, end in spans),
+        ]
+        record["code"] = " ".join(
+            "; ".join(self.source_segment(item) for item in nodes).split()
+        )
+        record["evidence"] = evidence_text("PY10b_raw_text_bundle", count=len(checks))
+        record["_scope"] = spans
 
     def getter_mutations(self, nodes):
         getters = {}

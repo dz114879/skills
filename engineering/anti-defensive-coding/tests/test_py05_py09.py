@@ -1,6 +1,7 @@
 import textwrap
 
 from helpers import ExtractorTestCase
+import pytest
 
 
 class Py05Py09Tests(ExtractorTestCase):
@@ -443,6 +444,38 @@ class Py05Py09Tests(ExtractorTestCase):
         self.put("state.py", 'data = {"session": dep}\n')
         assert self.scan("--paths", "state.py")["candidates"] == []
 
+    @pytest.mark.parametrize(
+        ("key", "value", "expected"),
+        [
+            ("repository", "repo_name", False),
+            ("repository", "self.repo_name", False),
+            ("client", "serviceName", False),
+            ("service", "serviceName", False),
+            ("db_session", "sessionNAME", False),
+            ("repository", "self.repository.name", False),
+            ("repository", "NAME", False),
+            ("repository", "repo", True),
+            ("db_session", "session", True),
+            ("repository", "self.repo", True),
+            ("service", "name_service", True),
+            ("repository", "username", True),
+        ],
+    )
+    @pytest.mark.parametrize("assignment", [False, True])
+    def test_dict_dependency_skips_terminal_name_values(
+        self, key, value, expected, assignment
+    ):
+        expression = (
+            f"data[{key!r}] = {value}" if assignment else f"return {{{key!r}: {value}}}"
+        )
+        self.put("state.py", "def pack(self, data):\n    " + expression + "\n")
+        candidates = self.scan("--paths", "state.py")["candidates"]
+        assert len(candidates) == int(expected)
+        if expected:
+            assert candidates[0]["rule"] == "PY07_state_smuggling"
+            assert value in candidates[0]["evidence"]
+            assert "immediate dictionary consumer" in candidates[0]["verify"]
+
     def test_roundtrip_conversions_require_the_complete_nested_chain(self):
         for expression, expected in [
             ("json.loads(json.dumps(value))", True),
@@ -578,6 +611,38 @@ class Py05Py09Tests(ExtractorTestCase):
                 assert candidate["rule"] == "PY08_roundtrip_and_copy"
                 assert "iteration" in candidate["evidence"]
                 assert "Counterweight" in candidate["verify"]
+
+    @pytest.mark.parametrize(
+        ("call", "expected"),
+        [
+            ("asdict(item)", True),
+            ("asdict(item, dict_factory=dict)", True),
+            ("dataclasses.asdict(item)", True),
+            ("dataclasses.asdict(item, dict_factory=dict)", True),
+            ("asdict(flds, item)", False),
+            ("asdict(flds, item, defaults)", False),
+            ("dataclasses.asdict(flds, item)", False),
+            ("asdict()", False),
+            ("asdict(obj=item)", False),
+            ("deepcopy(item, memo)", True),
+            ("copy.deepcopy(item, memo)", True),
+        ],
+    )
+    @pytest.mark.parametrize("comprehension", [False, True])
+    def test_copy_churn_requires_one_asdict_positional_argument(
+        self, call, expected, comprehension
+    ):
+        body = (
+            f"return [{call} for item in items]"
+            if comprehension
+            else f"for item in items:\n    consume({call})"
+        )
+        self.put("churn.py", "def run(items):\n" + textwrap.indent(body, "    ") + "\n")
+        candidates = self.scan("--paths", "churn.py")["candidates"]
+        assert len(candidates) == int(expected)
+        if expected:
+            assert candidates[0]["rule"] == "PY08_roundtrip_and_copy"
+            assert "iteration" in candidates[0]["evidence"]
 
     def test_lock_io_and_hashing_use_context_tokens_and_stop_at_nested_scopes(self):
         prompts = {True: set(), False: set()}

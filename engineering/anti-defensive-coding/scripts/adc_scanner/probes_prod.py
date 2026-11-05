@@ -358,6 +358,8 @@ class CandidateProbes(CandidateRecords):
             and isinstance(value, (ast.Name, ast.Attribute))
         ):
             return
+        if identifier_tokens(terminal_name(value))[-1:] == ["name"]:
+            return
         tokens = identifier_tokens(key.value)
         if not tokens or tokens[-1] not in PY07_DEPENDENCY_SUFFIXES:
             return
@@ -717,6 +719,7 @@ class CandidateProbes(CandidateRecords):
         contexts = (
             self.iteration_contexts(node)
             if name_path(node.func) in PY08_COPY_CALLS
+            and (terminal_name(node.func) != "asdict" or len(node.args) == 1)
             else ()
         )
         if contexts:

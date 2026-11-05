@@ -94,7 +94,7 @@
         "tests.md §5",
         "tests.md §6"
       ],
-      "bundling_policy": "singleton",
+      "bundling_policy": "raw_text_per_assertion",
       "diff_scope_mode": "candidate_and_related"
     },
     "PY10c_cross_test_reachability": {
@@ -178,6 +178,7 @@
     "PY10b_legacy": "Test accesses private compatibility attribute '{attribute}'",
     "PY10b_self_patch": "Patch targets directly invoked SUT symbol '{symbol}'",
     "PY10b_raw_text": "Assertion checks raw source/documentation text from a .py/.md path",
+    "PY10b_raw_text_bundle": "{count} raw-text checks in one assertion: Assertion checks raw source/documentation text from a .py/.md path",
     "PY10b_getter_mutation": "Getter '{method}' return '{name}' is mutated before re-call",
     "PY10a_origin": "base {path}:{line} ({symbol})",
     "PY10c_lost_call_site": "base {path}:{line} ({role})",
