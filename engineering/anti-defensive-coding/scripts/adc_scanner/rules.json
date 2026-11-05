@@ -135,6 +135,7 @@
     "PY10b:patch": "Does the immediate production contract require this test mechanism, or can the test exercise observable behavior; is a documented aliasing or compatibility contract a Counterweight? See tests.md §5.",
     "PY10c:default": "Does every immediate production binding, recursion included, fix this value, so the override is dead while the default's policy stays? Is it an export or extension contract (Counterweight)? See tests.md §4.",
     "PY10c:bundle": "Does every immediate production binding, recursion included, fix each value, so the override is dead while the default's policy stays? Is it an export or extension contract (Counterweight)? See tests.md §4.",
+    "PY10c:stub": "Does this live function return only a constant or empty literal, making its call sites or caller branches Dead Plumbing, or is it a documented no-op hook, dialect default, or sentinel (Counterweight)? See tests.md §4.",
     "PY10c:reach": "Counts are terminal-name aggregates across repo definitions (test references are not attributed to a specific definition). Does a registration API, by-name loader, inherited external-base hook or export reach this definition, with dispatch checked both ways? See tests.md §4."
   },
   "evidence_templates": {
@@ -186,6 +187,7 @@
     "PY10c_constant_default_single": "Param '{name}'={default}: {calls} prod calls; uniform: {value}{clauses}",
     "PY10c_constant_parameter": "'{name}'={default} (uniform: {value})",
     "PY10c_constant_default_bundle": "Params {parameters}: {calls} prod calls{clauses}",
+    "PY10c_constant_stub": "Constant-return stub ({value}): {calls} prod calls{clauses}",
     "PY10c_external_base": "; enclosing class bases: {bases} (not defined in repo)",
     "PY10c_references": "defs={definitions}, prod_calls={prod_calls}, prod_refs={prod_refs}, test_calls={test_calls}, test_refs={test_refs}",
     "PY10c_ambiguous_definitions": "; ambiguous_defs: {definitions}",
@@ -274,12 +276,14 @@
       "get",
       "hook",
       "overload",
+      "override",
       "patch",
       "post",
       "property",
       "put",
       "register",
-      "route"
+      "route",
+      "tool"
     ],
     "py09_tx_tokens": {
       "entry": [

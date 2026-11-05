@@ -44,9 +44,10 @@ def test_verify_templates_form_a_static_short_key_bijection():
         "PY10c:default",
         "PY10c:bundle",
         "PY10c:reach",
+        "PY10c:stub",
     }
     assert set(VERIFY_TEMPLATES) == expected_keys
-    assert len(VERIFY_KEYS) == len(VERIFY_TEMPLATES) == 29
+    assert len(VERIFY_KEYS) == len(VERIFY_TEMPLATES) == 30
     for key, text in VERIFY_TEMPLATES.items():
         assert verify_text(key) == text
         assert VERIFY_KEYS[text] == key
@@ -671,9 +672,10 @@ class ScopeTests(ExtractorTestCase):
             'def reflected(item):\n    return getattr(item, "value", None)\n'
             'def union(item: Foo | None):\n    return hasattr(item, "value")\n'
             "def reflected_bundle(item):\n"
-            '    return getattr(item, "first", None), hasattr(item, "second")\n',
+            '    return getattr(item, "first", None), hasattr(item, "second")\n'
+            "def stub():\n    return False\n",
         )
-        self.put("caller.py", "configure(True)\noptions(False, None)\n")
+        self.put("caller.py", "configure(True)\noptions(False, None)\nstub()\n")
         self.put("tests/test_app.py", "helper()\n")
         compact = self.cli("--paths", "app.py")
         assert "[path-audit]" not in compact
@@ -689,6 +691,7 @@ class ScopeTests(ExtractorTestCase):
             '  Code: hasattr(item, "second")',
             '  Code: getattr(item, "value", None)',
             '  Code: hasattr(item, "value")',
+            "  Code: return False",
         ]
         assert "  Evidence: Param 'flag'=False: 1 prod calls; uniform: True" in compact
         assert (
@@ -700,6 +703,9 @@ class ScopeTests(ExtractorTestCase):
         assert "(reflected) PY01\n  Code:" in compact
         assert "(union) PY01\n  Code:" in compact
         assert "parameter item: Foo | None" in compact
+        assert "(stub) PY10c:stub\n  Code: return False\n" in compact
+        assert compact.count("[PY10c:stub]") == 1
+        assert "  Evidence: Constant-return stub (False): 1 prod calls" in compact
         assert "  Verify:" not in compact
 
     def test_compact_diff_filters_changed_tag_but_keeps_nondefault_tags(self):

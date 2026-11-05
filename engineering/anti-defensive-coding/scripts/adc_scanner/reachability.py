@@ -364,6 +364,73 @@ def effective_arguments(node, call, forwarded):
     }
 
 
+def stub_return_value(node):
+    body = list(node.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    if len(body) != 1 or not isinstance(body[0], ast.Return):
+        return None
+    statement = body[0]
+    value = statement.value
+    if value is None:
+        return "None", statement
+    if isinstance(value, ast.Constant):
+        if (
+            value.value is None
+            or isinstance(value.value, (bool, int, float))
+            or (isinstance(value.value, (str, bytes)) and len(value.value) == 0)
+        ):
+            return repr(value.value), statement
+        return None
+    if (
+        isinstance(value, ast.UnaryOp)
+        and isinstance(value.op, (ast.USub, ast.UAdd))
+        and isinstance(value.operand, ast.Constant)
+        and isinstance(value.operand.value, (int, float))
+    ):
+        return unparse(value), statement
+    if isinstance(value, ast.Dict) and not value.keys:
+        return "{}", statement
+    if isinstance(value, ast.List) and not value.elts:
+        return "[]", statement
+    if isinstance(value, ast.Tuple) and not value.elts:
+        return "()", statement
+    return None
+
+
+def constant_return_stub(definition, calls, change_tag, clauses):
+    path, source, node, symbol, recursive = definition
+    if recursive or framework_hook(node):
+        return []
+    stub = stub_return_value(node)
+    if stub is None:
+        return []
+    value, return_stmt = stub
+    span = [node.lineno, return_stmt.end_lineno]
+    return [
+        {
+            "path": path,
+            "span": span,
+            "symbol": symbol,
+            "rule": "PY10c_cross_test_reachability",
+            "change_tag": change_tag,
+            "code": " ".join(
+                CandidateRecords(source).source_segment(return_stmt).split()
+            ),
+            "evidence": evidence_text(
+                "PY10c_constant_stub", value=value, calls=len(calls), clauses=clauses
+            ),
+            "verify": verify_text("PY10c:stub"),
+            "_scope": [span],
+        }
+    ]
+
+
 def constant_defaults(definition, calls, change_tag, clauses):
     path, source, node, symbol, recursive_calls = definition
     if not node.args.defaults and not any(node.args.kw_defaults):
@@ -492,6 +559,12 @@ def public_contracts(scopes, paths):
     return public
 
 
+def protocol_method(enclosing_class):
+    return enclosing_class is not None and any(
+        terminal_name(base) == "Protocol" for base in enclosing_class.bases
+    )
+
+
 def external_base_clause(enclosing_class, classes):
     """Evidence clause listing enclosing-class bases the snapshot never defines."""
     if enclosing_class is None:
@@ -591,9 +664,18 @@ def cross_reachability(root, tip, args, selected, lost, active_trees, errors):
             and not prod.non_calls
             and bindings
             and emitted(defs[0][0], defs[0][2])
+            and not protocol_method(method_classes.get(defs[0][2]))
         ):
             candidates.extend(
                 constant_defaults(
+                    defs[0],
+                    bindings,
+                    "changed" if args.base else "path-audit",
+                    clauses(defs[0][0], defs[0][2]),
+                )
+            )
+            candidates.extend(
+                constant_return_stub(
                     defs[0],
                     bindings,
                     "changed" if args.base else "path-audit",
@@ -624,7 +706,12 @@ def cross_reachability(root, tip, args, selected, lost, active_trees, errors):
                 "PY10c_ambiguous_definitions", definitions=len(defs)
             )
         for path, source, node, symbol, _ in defs:
-            if framework_hook(node) or node in public or not emitted(path, node):
+            if (
+                framework_hook(node)
+                or node in public
+                or not emitted(path, node)
+                or protocol_method(method_classes.get(node))
+            ):
                 continue
             record = CandidateRecords(source)
             record.symbols = symbol.split(".")

@@ -1488,6 +1488,236 @@ class Py10DiffReachTests(ExtractorTestCase):
                 if c["rule"] == "PY10c_cross_test_reachability"
             ]
 
+    @pytest.mark.parametrize(
+        ("statement", "value"),
+        [
+            ("return False", "False"),
+            ("return True", "True"),
+            ("return None", "None"),
+            ("return", "None"),
+            ("return 0", "0"),
+            ("return 1", "1"),
+            ("return -1", "-1"),
+            ("return +2", "+2"),
+            ("return 0.0", "0.0"),
+            ("return -1.5", "-1.5"),
+            ("return +2.5", "+2.5"),
+            ('return ""', "''"),
+            ('return b""', "b''"),
+            ("return {}", "{}"),
+            ("return []", "[]"),
+            ("return ()", "()"),
+        ],
+    )
+    @pytest.mark.parametrize("documented", [False, True])
+    def test_cross_live_constant_stubs_report_value_calls_and_function_span(
+        self, statement, value, documented
+    ):
+        self.init_repo()
+        docstring = '    """Reserved work."""\n' if documented else ""
+        self.put("app.py", f"def helper():\n{docstring}    {statement}\n")
+        self.put("caller.py", "helper()\nhelper()\n")
+        candidates = self.scan("--paths", "app.py")["candidates"]
+        assert candidates == [
+            {
+                "id": "C01",
+                "path": "app.py",
+                "rule": "PY10c_cross_test_reachability",
+                "symbol": "helper",
+                "span": [1, 3 if documented else 2],
+                "change_tag": "path-audit",
+                "code": statement,
+                "evidence": f"Constant-return stub ({value}): 2 prod calls",
+                "verify": (
+                    "Does this live function return only a constant or empty literal, "
+                    "making its call sites or caller branches Dead Plumbing, or is it "
+                    "a documented no-op hook, dialect default, or sentinel "
+                    "(Counterweight)? See tests.md §4."
+                ),
+            }
+        ]
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            'return "SELECT 1"',
+            'return b"payload"',
+            "return [1]",
+            'return {"key": 1}',
+            "return (1,)",
+            "return {1}",
+            "return 1j",
+            "return ...",
+            "return list()",
+            "return 1 + 2",
+            "pass",
+            "if ready:\n        return False\n    return True",
+            "notify()\n    return None",
+            '"""Docs."""\n    "extra statement"\n    return None',
+            "return helper()",
+        ],
+    )
+    def test_cross_constant_stubs_require_a_single_supported_literal_return(self, body):
+        self.init_repo()
+        self.put("app.py", f"def helper():\n    {body}\n")
+        self.put("caller.py", "helper()\n")
+        assert self.scan("--paths", "app.py")["candidates"] == []
+
+    @pytest.mark.parametrize(
+        ("definition", "production", "other"),
+        [
+            ('__all__ = ["helper"]\ndef helper():\n    return False', "helper()", ""),
+            (
+                '__all__ = ["Runner"]\nclass Runner:\n'
+                "    def helper(self):\n        return False",
+                "Runner().helper()",
+                "",
+            ),
+            ("@mcp.tool()\ndef helper():\n    return False", "helper()", ""),
+            ("@override\ndef helper():\n    return False", "helper()", ""),
+            (
+                "class Runner(Base):\n    @typing.override\n"
+                "    def helper(self):\n        return False",
+                "Runner().helper()",
+                "",
+            ),
+            ("def helper():\n    return False", "", ""),
+            ("def helper():\n    return False", "helper()\ncallback = helper", ""),
+            (
+                "def helper():\n    return False",
+                "helper()",
+                "def helper():\n    return None",
+            ),
+            (
+                "def helper():\n    helper()\n    return False",
+                "helper()",
+                "",
+            ),
+        ],
+    )
+    def test_cross_constant_stubs_respect_exports_hooks_liveness_and_unique_bindings(
+        self, definition, production, other
+    ):
+        self.init_repo()
+        self.put("app.py", definition + "\n")
+        self.put("caller.py", production + "\n")
+        self.put("other.py", other + "\n")
+        self.put("tests/test_app.py", "helper()\n")
+        candidates = self.scan("--paths", "app.py")["candidates"]
+        assert all("Constant-return stub" not in c["evidence"] for c in candidates)
+
+    @pytest.mark.parametrize("base", ["Protocol", "typing.Protocol"])
+    def test_cross_constant_stubs_skip_protocol_but_keep_concrete_subclasses(
+        self, base
+    ):
+        self.init_repo()
+        self.put(
+            "app.py",
+            f"from typing import Protocol\nimport typing\n"
+            f"class MyProtocol({base}):\n"
+            "    def declared(self):\n        return False\n"
+            "class Concrete(MyProtocol):\n"
+            "    def implemented(self):\n        return []\n",
+        )
+        self.put("caller.py", "MyProtocol().declared()\nConcrete().implemented()\n")
+        candidates = self.scan("--paths", "app.py")["candidates"]
+        assert [(c["symbol"], c["evidence"]) for c in candidates] == [
+            ("Concrete.implemented", "Constant-return stub ([]): 1 prod calls")
+        ]
+
+    @pytest.mark.parametrize(
+        ("before", "after", "code"),
+        [
+            ("value", "renamed", "return ( False )"),
+            ("Old docs", "New docs", "return ( False )"),
+            ("False", "None", "return ( None )"),
+        ],
+    )
+    def test_cross_constant_stub_diff_scope_includes_header_docstring_and_return(
+        self, before, after, code
+    ):
+        self.init_repo()
+        source = (
+            "async def helper(\n    value,\n):\n"
+            '    """Old docs."""\n'
+            "    return (\n        False\n    )\n"
+        )
+        self.put("app.py", source)
+        self.put("caller.py", "helper(1)\n")
+        base = self.commit()
+        self.put("caller.py", "helper(1)\nother_value = 2\n")
+        assert self.scan("--base", base)["candidates"] == []
+        self.put("app.py", source.replace(before, after))
+        candidates = self.scan("--base", base)["candidates"]
+        assert [
+            (c["symbol"], c["span"], c["change_tag"], c["code"]) for c in candidates
+        ] == [("helper", [1, 7], "changed", code)]
+
+    def test_cross_constant_stub_keeps_lost_call_and_external_base_clauses(self):
+        self.init_repo()
+        self.put(
+            "app.py",
+            "class Runner(External):\n"
+            "    async def helper(self):\n"
+            '        """Reserved work."""\n'
+            "        return []\n",
+        )
+        self.put("caller.py", "Runner().helper()\nRunner().helper()\n")
+        base = self.commit()
+        self.put("caller.py", "Runner().helper()\n")
+        candidates = self.scan("--base", base)["candidates"]
+        assert len(candidates) == 1
+        candidate = candidates[0]
+        assert candidate["symbol"] == "Runner.helper"
+        assert candidate["span"] == [2, 4]
+        assert candidate["change_tag"] == "changed"
+        assert candidate["code"] == "return []"
+        assert candidate["evidence"] == (
+            "Constant-return stub ([]): 1 prod calls"
+            "; lost call(s): base caller.py:2 (prod)"
+            "; definition unchanged; triggered by deleted call"
+            "; enclosing class bases: External (not defined in repo)"
+        )
+
+    def test_cross_constant_stub_and_uniform_default_are_independent_candidates(self):
+        self.init_repo()
+        self.put("app.py", "def helper(flag=False):\n    return None\n")
+        self.put("caller.py", "helper()\n")
+        candidates = self.scan("--paths", "app.py")["candidates"]
+        assert {c["code"]: (c["span"], c["evidence"]) for c in candidates} == {
+            "return None": ([1, 2], "Constant-return stub (None): 1 prod calls"),
+            "False": ([1, 1], "Param 'flag'=False: 1 prod calls; uniform: <DEFAULT>"),
+        }
+
+    @pytest.mark.parametrize("base", ["Protocol", "typing.Protocol"])
+    @pytest.mark.parametrize("live", [False, True])
+    def test_cross_protocol_methods_skip_reach_and_defaults_but_concrete_methods_fire(
+        self, base, live
+    ):
+        self.init_repo()
+        self.put(
+            "app.py",
+            f"import typing\nfrom typing import Protocol\n"
+            f"class MyProtocol({base}):\n"
+            "    def declared(self, flag=False):\n"
+            "        return flag\n"
+            "class Concrete(MyProtocol):\n"
+            "    def implemented(self, flag=False):\n"
+            "        return flag\n",
+        )
+        self.put(
+            "caller.py" if live else "tests/test_app.py",
+            "MyProtocol().declared()\nConcrete().implemented()\n",
+        )
+        candidates = self.scan("--paths", "app.py")["candidates"]
+        assert [(c["symbol"], c["change_tag"], c["code"]) for c in candidates] == [
+            (
+                "Concrete.implemented",
+                "path-audit" if live else "cross-test",
+                "False" if live else "def implemented(self, flag=False):",
+            )
+        ]
+
     def test_cross_own_body_suppresses_only_self_recursion(self):
         self.init_repo()
         self.put("tests/test_app.py", "Runner().execute(None)\n")
@@ -2173,11 +2403,11 @@ class Py10DiffReachTests(ExtractorTestCase):
 
     def test_cross_snapshot_isolation_exact_tip_and_default_merge_base(self):
         self.init_repo()
-        self.put("app.py", "def reachable():\n    return 1\n")
+        self.put("app.py", 'def reachable():\n    return "before"\n')
         self.put("caller.py", "value = 0\n")
         self.put("tests/test_app.py", "reachable()\n")
         base = self.commit()
-        self.put("app.py", "def reachable():\n    return 2\n")
+        self.put("app.py", 'def reachable():\n    return "after"\n')
         tip = self.commit()
         for flags in [("--tip", tip), ("--merge-base",)]:
             self.put("caller.py", "value = 0\n")
@@ -2247,6 +2477,11 @@ class Py10DiffReachTests(ExtractorTestCase):
             "registry.register",
             "onHook",
             "contextmanager",
+            "mcp.tool()",
+            'jira_mcp.tool(name="search")',
+            "confluence_mcp.tool()",
+            "override",
+            "typing.override",
         ):
             source += f"@{decorator}\ndef routed_{len(source)}():\n    return 1\n"
         source += "def run():\n    return 1\ndef __magic__():\n    return 1\n"
@@ -2275,7 +2510,7 @@ class Py10DiffReachTests(ExtractorTestCase):
 
     def test_cross_universe_exclusions_and_test_roles(self):
         self.init_repo()
-        self.put("app.py", "def reachable():\n    return 1\n")
+        self.put("app.py", 'def reachable():\n    return "result"\n')
         self.put(".gitignore", "ignored/\n")
         for name in ("ignored/caller.py", "build/caller.py", "omit/caller.py"):
             self.put(name, "reachable()\n")
