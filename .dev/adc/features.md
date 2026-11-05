@@ -16,7 +16,7 @@ P1.1 Goldfish Reviewer validation is complete: `16` `v0.4.4` compact bundles (`6
 | **Path Audit (`--paths <p1> ... [--repo <root>]`)** | Scans explicit files/directories on disk; infers single Git worktree root when all paths share one repo, or falls back to `os.path.commonpath`. |
 | **Default Exclusions (`SKIP_SEGMENTS`)** | `.git`, `.hg`, `.svn`, `.venv`, `venv`, `node_modules`, `__pycache__`, `build`, `dist`, `.scratch`, `.tox`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`, plus `--exclude <GLOB>`. |
 | **Test vs. Production Role (`role`)** | Any path with `test` or `tests` directory segments, or matching `test_*.py`, `*_test.py`, `conftest.py`, `*_test_support.py`, or `--test-glob <GLOB>` is `"test"`; all others are `"prod"`. |
-| **Worker Concurrency (`--jobs <N\|auto>` / `-j <N\|auto>`)** | Defaults to `auto` (`min(os.process_cpu_count() or 1, 8)`); parallelizes per-file Git diff/blob reads and AST indexing across Stages 1–3 via `parallel_map` with deterministic input-order preservation and runtime-aware GC (`_FREE_THREADED_GC`). |
+| **Worker Concurrency (`--jobs <N\|auto>` / `-j <N\|auto>`)** | Defaults to `auto` (`resolve_jobs("auto")`: `1` when the GIL is enabled, `os.process_cpu_count() or 1` when the GIL is disabled); parallelizes per-file Git diff/blob reads and AST indexing across Stages 1–3 via `parallel_map` with deterministic input-order preservation and runtime-aware GC (`_FREE_THREADED_GC`). |
 
 ---
 
