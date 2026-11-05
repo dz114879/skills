@@ -150,7 +150,7 @@ class InvoiceStore(RowStore):
         return rows
 ```
 
-**Counterweight (When to Keep):** Keep `[dict(row) for row in cursor.fetchall()]` at the single raw cursor boundary where driver row objects (`sqlite3.Row`, `aiosqlite.Row`, or another driver's immutable row mapping) are first materialized into owned `dict` instances (`RowStore.fetchall` above; positional tuple rows need a `row_factory` or pairing with `cursor.description` instead), or when caching a baseline list that callers will mutate in place across multiple passes.
+**Counterweight (When to Keep):** Keep `[dict(row) for row in cursor.fetchall()]` at the single raw cursor boundary where driver row objects (`sqlite3.Row`, `aiosqlite.Row`, or another driver's immutable row mapping) are first materialized into owned `dict` instances (`RowStore.fetchall` above, or query methods backed by a thread-local SQLite connection helper such as `beets/dbcore/db.py` that sets `conn.row_factory = sqlite3.Row` in the connection wrapper; positional tuple rows need a `row_factory` or pairing with `cursor.description` instead), or when caching a baseline list that callers will mutate in place across multiple passes.
 
 ## 4. Snapshot Consistency, Metadata Queries & Relational Closure
 
