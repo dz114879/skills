@@ -15,6 +15,7 @@ from .ast_helpers import (
     ReferenceCounts,
     allocation_batch,
     context_tokens,
+    parallel_map,
     parameter_defaults,
     parameters,
     parse_source,
@@ -613,29 +614,43 @@ def cross_reachability(root, tip, args, selected, lost, active_trees, errors):
     paths, classes = set(), set()
     scopes, method_classes = {}, {}
     delegations = set()
-    for path, raw in snapshot_sources(root, tip, args.exclude):
-        paths.add(path)
+
+    def extract_file(entry):
+        path, raw = entry
+        file_errors = set()
         # Raw text avoids a parse per file; a `class X` inside a string only
         # hides an external-base clue.
-        classes.update(name.decode() for name in CLASS_DEFINITION.findall(raw))
+        file_classes = [name.decode() for name in CLASS_DEFINITION.findall(raw)]
         if path in active_trees:
             parsed = active_trees[path]
             if parsed and not pattern.search(parsed[0]):
-                continue
+                parsed = None
         else:
-            parsed = parse_source(raw, path, errors, pattern=pattern)
+            parsed = parse_source(raw, path, file_errors, pattern=pattern)
         if not parsed:
-            continue
+            return path, file_classes, file_errors, None
         source, tree = parsed
         file_role = role(Path(path), args.test_glob)
         refs = CrossReferences(tree, targets)
+        scope = module_scope(tree) if file_role == "prod" else None
+        return path, file_classes, file_errors, (source, file_role, refs, scope)
+
+    for path, file_classes, file_errors, facts in parallel_map(
+        extract_file, list(snapshot_sources(root, tip, args.exclude)), args.jobs
+    ):
+        paths.add(path)
+        classes.update(file_classes)
+        errors.update(file_errors)
+        if facts is None:
+            continue
+        source, file_role, refs, scope = facts
         for name, references in refs.references.items():
             total = counts[name][file_role]
             total.calls.extend(references.calls)
             total.non_calls += references.non_calls
         delegations.update(refs.delegations)
         if file_role == "prod":
-            scopes[path] = module_scope(tree)
+            scopes[path] = scope
             method_classes.update(refs.methods)
             for node, symbol in refs.definitions:
                 definitions[node.name].append(

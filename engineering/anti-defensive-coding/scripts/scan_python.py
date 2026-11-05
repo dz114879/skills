@@ -20,6 +20,13 @@ def main(argv=None):
     scope = parser.add_mutually_exclusive_group(required=True)
     scope.add_argument("--paths", nargs="+", help="Audit files or directories on disk")
     scope.add_argument("--base", help="Base commit for a diff")
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=1,
+        help="Number of worker threads for per-file git diff and AST stages",
+    )
     parser.add_argument("--tip", help="Tip commit; omit for working tree")
     parser.add_argument(
         "--merge-base",
@@ -43,6 +50,8 @@ def main(argv=None):
     )
     parser.add_argument("--format", choices=("compact", "json"), default="compact")
     args = parser.parse_args(argv)
+    if args.jobs < 1:
+        parser.error("--jobs must be >= 1")
     if args.base == "" or args.tip == "":
         parser.error("Git references must not be empty")
     if not args.base and (args.tip or args.merge_base):

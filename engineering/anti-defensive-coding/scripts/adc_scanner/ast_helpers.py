@@ -3,6 +3,7 @@
 import ast
 import builtins
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
@@ -10,6 +11,7 @@ import gc
 import io
 from itertools import pairwise
 import re
+import threading
 import tokenize
 import weakref
 
@@ -68,12 +70,17 @@ PROBE_TYPES = frozenset(
     }
 )
 STATE_TYPES = frozenset({ast.Assign, ast.AnnAssign, ast.Dict, ast.Try, ast.TryStar})
+_PARALLEL_ACTIVE = 0
 
 
 @contextmanager
 def allocation_batch():
     """Retained ASTs are acyclic; collect young temporaries once per scan batch."""
-    enabled = gc.isenabled()
+    enabled = (
+        threading.current_thread() is threading.main_thread()
+        and _PARALLEL_ACTIVE == 0
+        and gc.isenabled()
+    )
     if enabled:
         gc.disable()
     try:
@@ -82,6 +89,25 @@ def allocation_batch():
         if enabled:
             gc.collect(0)
             gc.enable()
+
+
+def parallel_map(fn, items, jobs):
+    """Map in input order; only the orchestration thread owns pool/GC state."""
+    # GC is process-global; the strict lint profile runs without PLW enabled.
+    global _PARALLEL_ACTIVE  # noqa: PLW0603, RUF100
+    if jobs <= 1 or len(items) <= 1:
+        return [fn(item) for item in items]
+    enabled = gc.isenabled()
+    _PARALLEL_ACTIVE += 1
+    if not enabled:
+        gc.enable()
+    try:
+        with ThreadPoolExecutor(max_workers=min(jobs, len(items))) as executor:
+            return list(executor.map(fn, items))
+    finally:
+        _PARALLEL_ACTIVE -= 1
+        if not enabled:
+            gc.disable()
 
 
 def ast_field_parts():

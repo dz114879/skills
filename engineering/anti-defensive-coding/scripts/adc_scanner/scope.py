@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import subprocess
 
+from .ast_helpers import parallel_map
 from .registry import DIFF_FLAGS, SKIP_SEGMENTS, TEST_GLOBS
 
 
@@ -78,7 +79,7 @@ def diff_scope(args):
             b"\0"
         )[:-1]
     )
-    changes = []
+    entries = []
     for status_bytes in names:
         status = status_bytes.decode()[0]
         old_path = os.fsdecode(next(names))
@@ -95,6 +96,10 @@ def diff_scope(args):
         )
         if not pre_python and not post_python:
             continue
+        entries.append((status, old_path, path, pre_python, post_python))
+
+    def extract_hunks(entry):
+        _status, old_path, path, pre_python, post_python = entry
         patch = git(
             root,
             "diff",
@@ -108,7 +113,7 @@ def diff_scope(args):
             *dict.fromkeys((old_path, path)),
         )
         if any(line.startswith(b"Binary files ") for line in patch.splitlines()):
-            continue
+            return None
         added = set()
         deleted = set()
         for match in re.finditer(
@@ -121,11 +126,15 @@ def diff_scope(args):
                 start = int(raw_start)
                 count = int(raw_count) if raw_count is not None else 1
                 lines.update(range(start, start + count))
-        changes.append(
-            FileChange(
-                path, added, old_path if pre_python else None, deleted, not post_python
-            )
+        return FileChange(
+            path, added, old_path if pre_python else None, deleted, not post_python
         )
+
+    changes = [
+        change
+        for change in parallel_map(extract_hunks, entries, args.jobs)
+        if change is not None
+    ]
     if tip is None:
         for name in git(root, "ls-files", "--others", "--exclude-standard", "-z").split(
             b"\0"

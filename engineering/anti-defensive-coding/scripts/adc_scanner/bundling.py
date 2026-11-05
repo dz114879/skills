@@ -1,13 +1,15 @@
 """Scan orchestration, lossless bundling, and output rendering."""
 
 import ast
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 
-from .ast_helpers import parse_source
+from .ast_helpers import parallel_map, parse_source
 from .probes_prod import CandidateProbes
 from .probes_test import TestProbes
 from .reachability import (
+    CallSite,
     call_sites,
     cross_reachability,
     framework_hook,
@@ -184,6 +186,21 @@ def bundle_coalesces(candidates):
     return bundled
 
 
+@dataclass
+class FileScanResult:
+    """Worker-owned extraction retaining probe/candidate identity for promotion."""
+
+    scanned: set[str] = field(default_factory=set)
+    errors: set[tuple[str, str]] = field(default_factory=set)
+    deleted_calls: list[CallSite] = field(default_factory=list)
+    before: dict[str, CandidateProbes] = field(default_factory=dict)
+    active_trees: dict[str, tuple[str, ast.Module] | None] = field(default_factory=dict)
+    added_calls: list[CallSite] = field(default_factory=list)
+    after: dict[str, CandidateProbes] = field(default_factory=dict)
+    selected: dict[tuple[str, int], str] = field(default_factory=dict)
+    candidates: list[dict] = field(default_factory=list)
+
+
 def scan(root, files, base, tip, args):
     candidates = []
     parse_errors = set()
@@ -191,16 +208,18 @@ def scan(root, files, base, tip, args):
     before, after = {}, {}
     active_trees = {}
     selected, deleted_calls, added_calls = {}, [], []
-    for change in sorted(files, key=lambda item: item.path):
+
+    def scan_file(change):
+        result = FileScanResult()
         relative = change.path
         if change.old_path is not None:
             raw = git(root, "show", f"{base}:{change.old_path}")
             if b"\x00" not in raw:
-                scanned.add(relative)
-                parsed = parse_source(raw, change.old_path, parse_errors, base=True)
+                result.scanned.add(relative)
+                parsed = parse_source(raw, change.old_path, result.errors, base=True)
                 if parsed:
                     base_role = role(Path(change.old_path), args.test_glob)
-                    deleted_calls.extend(
+                    result.deleted_calls.extend(
                         call_sites(
                             parsed[1], change.deleted_lines, change.old_path, base_role
                         )
@@ -208,28 +227,28 @@ def scan(root, files, base, tip, args):
                     if base_role == "prod":
                         probes = CandidateProbes(*parsed)
                         probes.visit(parsed[1])
-                        before[relative] = probes
+                        result.before[relative] = probes
         path = root / relative
         if change.deleted or (tip is None and path.is_symlink()):
-            continue
+            return result
         raw = git(root, "show", f"{tip}:{relative}") if tip else path.read_bytes()
         if b"\x00" in raw:
-            continue
-        scanned.add(relative)
-        parsed = parse_source(raw, relative, parse_errors)
-        active_trees[relative] = parsed
+            return result
+        result.scanned.add(relative)
+        parsed = parse_source(raw, relative, result.errors)
+        result.active_trees[relative] = parsed
         if not parsed:
-            continue
+            return result
         file_role = role(Path(relative), args.test_glob)
         if args.base:
-            added_calls.extend(
+            result.added_calls.extend(
                 call_sites(parsed[1], change.added_lines, relative, file_role)
             )
         probes = (TestProbes if file_role == "test" else CandidateProbes)(*parsed)
         probes.visit(parsed[1])
         if file_role == "prod":
-            after[relative] = probes
-            selected.update(
+            result.after[relative] = probes
+            result.selected.update(
                 ((relative, node.lineno), node.name)
                 for node in ast.walk(parsed[1])
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -242,7 +261,21 @@ def scan(root, files, base, tip, args):
                 continue
             candidate["path"] = relative
             candidate["change_tag"] = "changed" if args.base else "path-audit"
-            candidates.append(candidate)
+            result.candidates.append(candidate)
+        return result
+
+    for result in parallel_map(
+        scan_file, sorted(files, key=lambda item: item.path), args.jobs
+    ):
+        scanned.update(result.scanned)
+        parse_errors.update(result.errors)
+        deleted_calls.extend(result.deleted_calls)
+        before.update(result.before)
+        active_trees.update(result.active_trees)
+        added_calls.extend(result.added_calls)
+        after.update(result.after)
+        selected.update(result.selected)
+        candidates.extend(result.candidates)
     moved_defenses(before, after, {change.path: change for change in files})
     cross, checked = cross_reachability(
         root,

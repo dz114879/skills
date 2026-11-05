@@ -72,6 +72,139 @@ def test_py02_evidence_templates_cover_the_four_nonraising_exit_strata():
 
 
 class ScopeTests(ExtractorTestCase):
+    @pytest.mark.parametrize("jobs", [0, -1])
+    def test_jobs_rejects_nonpositive_worker_counts(self, jobs, capsys):
+        from scan_python import main
+
+        with pytest.raises(SystemExit) as error:
+            main(["--paths", str(self.root), "--jobs", str(jobs)])
+        assert error.value.code == 2
+        assert "--jobs must be >= 1" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("mode", ["paths", "worktree", "commit"])
+    def test_jobs_preserves_exact_output_across_multifile_pipeline(self, mode):
+        base, tip = self.use_git_fixture(
+            "parallel_pipeline",
+            {
+                "origin.py": """
+                    def origin(obj):
+                        return getattr(obj, "value", None)
+                """,
+                "destination.py": """
+                    def destination(obj):
+                        return obj.value
+                """,
+                "base_error.py": "def broken(:\n",
+                "snapshot_error.py": "def uniform(:\n",
+                "deleted.py": "def deleted():\n    return 1\n",
+            },
+            {
+                "origin.py": """
+                    from destination import destination
+                    def origin(obj):
+                        return destination(obj)
+                """,
+                "destination.py": """
+                    def destination(obj):
+                        return getattr(obj, "value", None)
+                """,
+                "base_error.py": "def fixed():\n    return 1\n",
+                "deleted.py": None,
+                "z_error.py": "def new_broken(:\n",
+                "binary.py": b"data\x00",
+                "probes.py": """
+                    def reflection(item):
+                        return getattr(item, "one", 0), getattr(item, "two", 0)
+                    def washed():
+                        try:
+                            work()
+                        except Exception:
+                            return {}
+                    def shadow(raw):
+                        value = raw or 1
+                        if value is None:
+                            return 0
+                    def coalesced(data):
+                        return data.get("first") or 1, data.get("second") or 2
+                    def discarded(old):
+                        _ = old
+                        return object()
+                    def packed(data, dep):
+                        data["service"] = dep
+                    def converted(item):
+                        return int(float(item))
+                    def locked():
+                        with lock:
+                            open(path)
+                """,
+                "service.py": """
+                    def uniform(flag=True):
+                        return bool(flag)
+                    def constant_stub():
+                        return []
+                    def test_only():
+                        return object()
+                """,
+                "calls.py": """
+                    from service import constant_stub, uniform
+                    uniform(False)
+                    uniform(False)
+                    constant_stub()
+                """,
+                "tests/test_service.py": """
+                    from service import test_only
+                    def test_behavior():
+                        test_only()
+                        assert client._legacy_value
+                """,
+            },
+            working_files={"untracked.py": 'hasattr(item, "untracked")\n'},
+        )
+        scope = {
+            "paths": ["--paths", "."],
+            "worktree": ["--base", base],
+            "commit": ["--base", base, "--tip", tip],
+        }[mode]
+        for output_format in ["json", "compact"]:
+            args = [*scope, "--format", output_format]
+            expected = self.cli(*args, "--jobs", "1")
+            if output_format == "json":
+                result = json.loads(expected)
+                rules = {item["rule"] for item in result["candidates"]}
+                assert {
+                    "PY01_reflect_default",
+                    "PY02_error_washing",
+                    "PY03_default_shadows_check",
+                    "PY04_lossy_falsy_coalesce",
+                    "PY05_dead_param_evasion",
+                    "PY07_state_smuggling",
+                    "PY08_roundtrip_and_copy",
+                    "PY09_io_or_tx_in_lock",
+                    "PY10b_test_smell",
+                    "PY10c_cross_test_reachability",
+                } <= rules
+                if mode != "paths":
+                    assert "PY10a_moved_defense" in rules
+                    assert any(
+                        error["error"].startswith("base:")
+                        for error in result["parse_errors"]
+                    )
+                assert {error["path"] for error in result["parse_errors"]} == (
+                    {"snapshot_error.py", "z_error.py"}
+                    | ({"base_error.py"} if mode != "paths" else set())
+                )
+            for jobs in [2, 4]:
+                assert (
+                    self.cli(*args, "--jobs", str(jobs)).encode() == expected.encode()
+                )
+            assert self.cli_subprocess(*args, "-j", "4").encode() == expected.encode()
+
+    @pytest.mark.parametrize("file_count", [0, 1])
+    def test_jobs_preserves_output_for_empty_and_single_file_scans(self, file_count):
+        if file_count:
+            self.put("only.py", 'hasattr(item, "value")\n')
+        assert self.cli("--paths", ".", "--jobs", "4") == self.cli("--paths", ".")
+
     def test_relative_non_git_paths_schema_and_non_execution(self):
         self.put(
             "src/model.py",
