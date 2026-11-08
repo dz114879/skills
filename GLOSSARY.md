@@ -73,3 +73,41 @@ _Avoid_: backward-compatibility layer (unless backed by a named external consume
 **Corruption Test**:
 A test that constructs impossible internal states, mutates read-only return values, patches the system under test itself, asserts raw source/doc text literals, or calls dead production methods solely to justify defensive or dead code.
 _Avoid_: negative test, boundary test
+
+### Documentation Audit
+
+**Documentation Maintenance Priority**:
+The evidence-backed order in which documents should be reviewed and considered for refactoring or improvement. Navigation structure and observed access inform this order; popularity alone does not establish document quality or defect severity.
+_Avoid_: agent preference, attention score
+
+**Document Review Queue**:
+An ordered set of documents awaiting review, prioritized by observed access and navigation importance to allocate review effort. An unreviewed document has unknown review outcomes, not an implied clean bill of health.
+_Avoid_: fix queue, document quality ranking
+
+**Documentation Improvement Queue**:
+An ordered set of confirmed documentation findings, prioritized by their consequences, with affected scope informing relative urgency. It guides subsequent maintenance without authorizing changes to the documents.
+_Avoid_: popularity ranking, review candidate queue
+
+**Maintained Development Documentation**:
+Documentation intended to remain useful across development tasks and to evolve with the codebase. Its role and expected lifetime distinguish it from task-local records, regardless of its directory name.
+_Avoid_: all Markdown, frequently read documentation
+
+**Task-Local Documentation**:
+Working records whose primary purpose is to support a particular task or bounded effort rather than provide continuing development guidance. Retaining these records does not by itself make them maintained development documentation.
+_Avoid_: useless documentation, dead documentation
+
+**Expected Context Entry**:
+A document expected to enter an agent's context under the selected tool's loading rules and applicable scope. This expectation is distinct from evidence that a particular historical session loaded it.
+_Avoid_: confirmed historical read, automatic preference
+
+**Navigation Entry**:
+A document explicitly selected as a starting point for exploring development guidance. Selection establishes a navigation root, not automatic context loading.
+_Avoid_: automatically loaded README
+
+**Exploration Trial**:
+A bounded, read-only investigation of a representative development task used to observe which files an agent accesses under the current environment. It measures implementation preparation, not historical usage or the entire implementation lifecycle.
+_Avoid_: historical session sample, full implementation simulation
+
+**Observed File Access**:
+A file access supported by an attributable tool invocation and result. An agent's claim to have read a file is not sufficient evidence of observed access.
+_Avoid_: self-reported reading, path mention
