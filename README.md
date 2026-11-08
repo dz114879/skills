@@ -19,7 +19,8 @@ engineering/
 │   └── tests/
 │       └── test_scan_python.py
 ├── code-review-lean/
-│   ├── SKILL.md            # Three-axis review: Standards, Spec, and Lean (anti-over-defense)
+│   ├── SKILL.md            # Three-axis review orchestrator: Standards, Spec, and Lean
+│   ├── STANDARDS.md        # Standards axis: documented rules + Fowler smell baseline
 │   └── agents/
 │       └── openai.yaml     # Interface metadata
 ├── implement-orchestrated/
@@ -39,9 +40,11 @@ engineering/
 
 ## Dependencies
 
+`code-review-lean` requires subagents and delegates its **Lean** axis to `anti-defensive-coding`.
+
 `implement-orchestrated` requires `code-review-lean`, and uses `tdd` or `diagnosing-bugs` when applicable:
 
-- `code-review-lean`
+- `code-review-lean` (with `anti-defensive-coding`)
 - `tdd` / `diagnosing-bugs` (when applicable)
 
 `plan-review` requires subagents; its Critic axis loads `codebase-design`.
