@@ -9,7 +9,7 @@ Three-axis, read-only review of changes since a baseline:
 - **Spec**: does the code faithfully implement the originating issue or spec?
 - **Lean**: does new complexity, defensive code, indirection, or test scaffolding earn its place against real trust boundaries and callers?
 
-Run the applicable axes as **parallel sub-agents** so they don't pollute each other's context, then aggregate their findings.
+Run the applicable axes as **parallel sub-agents** so they don't pollute each other's context, then aggregate their findings. Start every sub-agent with a fresh context window.
 
 ## Process
 
@@ -92,7 +92,7 @@ Spawn the applicable sub-agents in parallel with the shared scope packet (diff c
 **Spec sub-agent prompt** (skip if no spec is available):
 
 - Scope packet and the spec/ticket path or contents.
-- Brief: "Read-only review: do not modify files or spawn sub-agents. Compare the diff against the spec and report: (a) missing or partial requirements; (b) unrequested behavior or scope creep; (c) requirements implemented incorrectly. Cite the spec requirement and `file:line` for each finding."
+- Brief: "Read-only review: do not modify files or spawn sub-agents. Compare the diff against the spec and report: (a) missing or partial requirements; (b) unrequested behavior or scope creep; (c) requirements implemented incorrectly; (d) undecided behavior: edge cases the diff settles that the spec leaves open (missing/empty fields, fallbacks, ties, boundaries), including ones a test pins down. Cite the spec requirement and `file:line` for (a)–(c); for (d), cite the code or test `file:line` that settles it and mark it **needs a human decision**."
 
 **Lean sub-agent prompt**:
 
@@ -103,4 +103,4 @@ Spawn the applicable sub-agents in parallel with the shared scope packet (diff c
 
 Present the results under `## Standards`, `## Spec`, and `## Lean` headings (marking any unassessed axis explicitly).
 
-Preserve each axis's perspective, deduplicating findings where multiple axes flag the same underlying issue and calling out any direct conflict where two axes recommend opposite actions on the same code. End with a brief summary distinguishing substantive issues (`[Hard]` / spec gaps / standard breaches) from optional simplifications.
+Preserve each axis's perspective, deduplicating findings where multiple axes flag the same underlying issue and calling out any direct conflict where two axes recommend opposite actions on the same code. End with a brief summary distinguishing substantive issues (`[Hard]` / spec gaps / standard breaches), **needs a human decision** items (stating the behavior the diff currently picks), and optional simplifications.
