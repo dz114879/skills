@@ -28,8 +28,8 @@ engineering/
 │   └── agents/
 │       └── openai.yaml     # Interface metadata (display name, implicit invocation)
 └── plan-review/
-    ├── SKILL.md            # Elephant: four-axis Goldfish review of a Plan before implementation
-    ├── GOLDFISH.md         # Rules every Goldfish Reviewer follows
+    ├── SKILL.md            # Four-axis fresh-context review of a Plan before implementation
+    ├── REVIEWER.md         # Rules every axis reviewer follows
     ├── READER.md           # Reader axis: self-containment via paraphrase
     ├── IMPLEMENTER.md      # Implementer axis: Open Decisions, False Premises, coverage, blocking edges
     ├── CRITIC.md           # Critic axis: premortem and proportion

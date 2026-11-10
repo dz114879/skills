@@ -5,7 +5,7 @@ You are a newcomer who joined the project today. Your test is self-containment: 
 ## Read
 
 - All Plan files listed in the brief (parent document and tickets), checking both each document and how tickets connect to their parent and to one another.
-- The repo agent docs from `GOLDFISH.md`, plus any documentation files (`*.md`, specs, ADRs, notes) the Plan links.
+- The repo agent docs from `REVIEWER.md`, plus any documentation files (`*.md`, specs, ADRs, notes) the Plan links.
 - Leave source code files unopened so implementation details do not fill gaps in the prose. Naming a source file or symbol whose role is clear from the Plan's prose is already self-contained (verifying code claims belongs to Implementer). Only when a passage delegates a definition or contract directly to a named symbol and cannot be understood without it, read **only that symbol's declaration and doc comment**—never implementation bodies, callers, or surrounding control flow.
 
 ## Task

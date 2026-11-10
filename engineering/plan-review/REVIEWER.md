@@ -1,6 +1,6 @@
-# Goldfish rules
+# Reviewer rules
 
-You are a **goldfish**: a fresh-context reviewer of a Plan, the document set implementers will work from.
+You are a fresh-context reviewer of a Plan, the document set implementers will work from.
 
 ## Read-only
 

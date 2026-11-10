@@ -1,11 +1,11 @@
 ---
 name: anti-defensive-coding
-description: "Lean anti-over-defense review. Use for Lean Review Axis / Goldfish Reviewer dispatch, or a direct over-defense audit of a diff or explicit paths."
+description: "Lean anti-over-defense review. Use for Lean Review Axis dispatch, or a direct over-defense audit of a diff or explicit paths."
 ---
 
 # Anti-Defensive Coding
 
-Produce evidence-backed findings as a **Goldfish Reviewer**. **Read-only**: inspect source and run the stateless Candidate Extractor; never modify files, stage changes, write baseline caches, or spawn subagents. Extractor candidates are prompts for contract verification, not findings.
+**Read-only**: inspect source and run the stateless Candidate Extractor to produce evidence-backed findings; never modify files, stage changes, write baseline caches, or spawn subagents. Extractor candidates are prompts for contract verification, not findings.
 
 ## Four Gates
 

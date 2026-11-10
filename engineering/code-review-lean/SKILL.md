@@ -9,7 +9,7 @@ Three-axis, read-only review of changes since a baseline:
 - **Spec**: does the code faithfully implement the originating issue or spec?
 - **Lean**: does new complexity, defensive code, indirection, or test scaffolding earn its place against real trust boundaries and callers (`anti-defensive-coding`)?
 
-Run the applicable **Review Axes** as parallel **Goldfish Reviewers** with fresh context windows so they don't pollute each other's context, then aggregate their findings.
+Run the applicable **Review Axes** in parallel as fresh-context reviewers so they don't pollute each other's context, then aggregate their findings.
 
 ## Process
 
@@ -49,7 +49,7 @@ Spawn one fresh-context, read-only sub-agent per applicable axis in parallel. Pa
 **Standards sub-agent brief**:
 
 ```text
-You are the Standards Goldfish Reviewer. Read-only: do not modify files or spawn sub-agents.
+You are the Standards reviewer. Read-only: do not modify files or spawn sub-agents.
 Read <skill-dir>/STANDARDS.md and follow its workflow and exact single-line output format.
 Scope packet: <repo root, diff command, commit/untracked list, excluded edits>
 Standards files: <applicable standards file paths, or "none found">
@@ -59,7 +59,7 @@ Verified passed checks: <linter/typechecker checks already confirmed passed, if 
 **Spec sub-agent brief** (skip if no spec is available):
 
 ```text
-You are the Spec Goldfish Reviewer. Read-only: do not modify files or spawn sub-agents.
+You are the Spec reviewer. Read-only: do not modify files or spawn sub-agents.
 Scope packet: <repo root, diff command, commit/untracked list, excluded edits>
 Spec source: <spec/ticket path or inline requirements>
 Compare the diff against the spec and report:
@@ -76,7 +76,7 @@ When no findings are confirmed, emit: No Spec findings.
 **Lean sub-agent brief**:
 
 ```text
-You are the Lean Goldfish Reviewer. Read-only: do not modify files or spawn sub-agents.
+You are the Lean reviewer. Read-only: do not modify files or spawn sub-agents.
 Read <skill-dir>/../anti-defensive-coding/SKILL.md and follow its 4-step workflow and exact single-line output format.
 Scope packet: <repo root, diff command / base & tip endpoints, commit/untracked list, excluded edits>
 Contract context: <spec source and applicable standards file paths, so documented contracts and Counterweights are respected>
