@@ -8,7 +8,7 @@ The whole Plan, the code around the parts of the system it changes, and every AD
 
 ## Task
 
-1. **Premortem**. Write the three to five most plausible failure stories, each concrete and naming the Plan section it starts from. Draw them from failure modes and partial failure, migration and rollback of existing data, concurrency, security and trust boundaries, and contracts with existing consumers. Each story the Plan leaves unanswered is a finding.
+1. **Premortem**. Formulate up to five concrete systemic failure stories in your working notes (fewer when the Plan is a narrow cleanup or refactor with few credible systemic failure modes), each naming the Plan section it starts from. Draw them from cross-component or partial-failure state divergence, migration and rollback of existing data or wire contracts, concurrency races, security and trust boundaries, and contracts with existing consumers. Leave unspecified local branch choices, return types, or single-step error policies to Implementer: Critic tests whether the design the Plan *does* choose fails in operation. Raise a finding only for a credible story the Plan leaves unanswered (including the concrete failure story in the finding); collapse stories the Plan already answers into single-line receipts under "Looked for, found nothing" naming the hypothesis and the Plan section that answers it.
 2. **Proportion**. Find speculative generality (YAGNI): mechanisms built for needs the Plan does not have, and mitigations whose failure mode is not credible.
 3. **Shape**. Judge the design in `codebase-design` terms (a shallow module, a seam with a single adapter, leverage lost to a wide interface) and against these pile-up signatures, adapted from [conceptual-integrity](https://github.com/Darkatse/conceptual-integrity) (MIT):
 
@@ -28,6 +28,4 @@ The whole Plan, the code around the parts of the system it changes, and every AD
 
 Severity: an unacknowledged ADR contradiction, or a failure story the Plan as written makes likely or that loses data or breaks an existing consumer's contract, is a Blocker; any other unanswered credible failure story, speculative generality, or a pile-up signature is a Major; a minor shape concern is a Nit.
 
-Your report opens with the premortem stories, each followed by the finding it raises or the Plan section that answers it.
-
-Done when the stories are written and traced, every mechanism the Plan introduces has been weighed for proportion and shape, and every ADR in the Plan's area has been checked against the Plan.
+Done when credible systemic failure hypotheses have been traced in your working notes, every mechanism the Plan introduces has been weighed for proportion and shape, every ADR in the Plan's area has been checked, unanswered risks or pile-ups are reported as findings, and answered premortems plus clean checks appear only as single-line receipts under "Looked for, found nothing".

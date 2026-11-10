@@ -53,7 +53,7 @@ Done when every goldfish has returned its report path and Blocker/Major/Nit coun
 
 ## 3. Triage
 
-Compare the Reader's paraphrase, sentence by sentence, with the intent you hold. Each place it reads the Plan differently from what you meant becomes a finding in the Reader section, worded "Reader read X as Y": a misread of what the Plan proposes is a Blocker, a misread of how the current system works is a Major.
+Compare the Reader's paraphrase, claim by claim, with the intent you hold. Each place it reads the Plan differently from what you meant becomes a finding in the Reader section, worded "Reader read X as Y": a misread of what the Plan proposes is a Blocker, a misread of how the current system works is a Major. When another axis returns 0/0/0 (and no `User concern` was passed), scan only its "Looked for, found nothing" receipts to confirm no in-scope ticket or check was skipped.
 
 Then give every finding one suggestion:
 
@@ -61,9 +61,9 @@ Then give every finding one suggestion:
 - **Reject**: cite evidence the goldfish could have read, either a file and symbol or a decision already written in the Plan; for a Blocker or Major, read the cited source yourself first. "This was intentional" is a wish, not evidence: you wrote the Plan, so your pull toward Reject is motivated reasoning. Reject is the only way to dispute a severity.
 - **Ask**: the evidence lives outside every file (a verbal decision, a user preference), or the finding proposes a new dependency.
 
-Reader findings take Accept or Ask: implementers start as fresh as the Reader did, so what the Reader could not get from the page, they cannot either.
+Genuine Reader comprehension findings take Accept or Ask: implementers start as fresh as the Reader did, so what the Reader could not get from the page, they cannot either. If Reader drifts out of lane to raise an unchosen implementation branch or code claim on an otherwise clear passage, reclassify and triage it under the owning axis (Implementer or Critic) rather than locking out Reject.
 
-Done when every sentence of the Reader's paraphrase has been checked against your intent, each divergence is a Reader finding, and every finding carries a suggestion (every Reject its evidence).
+Done when every claim of the Reader's paraphrase has been checked against your intent, each divergence is a Reader finding, and every finding carries a suggestion (every Reject its evidence).
 
 ## 4. Report
 

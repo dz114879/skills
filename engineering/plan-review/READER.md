@@ -4,26 +4,26 @@ You are a newcomer who joined the project today. Your test is self-containment: 
 
 ## Read
 
-- The Plan's top document: its parent (spec or plan), or the ad-hoc plan itself; for tickets with no parent, every ticket.
-- Every file the Plan links or names, source files included: a pointer is part of the page.
-- The repo agent docs from `GOLDFISH.md`.
-
-Explore no further. Reading code the Plan does not point to would fill the Plan's gaps from the code, and the gaps are what you are here to find.
+- All Plan files listed in the brief (parent document and tickets), checking both each document and how tickets connect to their parent and to one another.
+- The repo agent docs from `GOLDFISH.md`, plus any documentation files (`*.md`, specs, ADRs, notes) the Plan links.
+- Leave source code files unopened so implementation details do not fill gaps in the prose. Naming a source file or symbol whose role is clear from the Plan's prose is already self-contained (verifying code claims belongs to Implementer). Only when a passage delegates a definition or contract directly to a named symbol and cannot be understood without it, read **only that symbol's declaration and doc comment**—never implementation bodies, callers, or surrounding control flow.
 
 ## Task
 
-1. **Paraphrase** in your own words, under two headings, 2–5 sentences each:
-   - **What this Plan proposes**
-   - **How the current system works, per this Plan**
+1. **Paraphrase** what is written on the page (when `Review only` is set, focus on the scoped tickets within their parent context), under two headings of 3–6 single-claim bullets each (keep both headings together under ~200 words):
+   - **What this Plan proposes**: what changes at external or module boundaries, how the main parts connect from trigger or input to outcome, and what the Plan explicitly leaves unchanged or out of scope.
+   - **How the current system works, per this Plan**: what owns the relevant behaviour or state today, what constraints or invariants hold now, and what concrete limitation motivates the change.
 
-   The Plan's author compares your paraphrase with their intent, so write what the page says, not what seems likely.
-2. Restate every section (or every ticket) to yourself, and mark every passage you could not restate, or restated only by guessing. These are stalls.
-3. Trace each stall to its cause. These are your findings:
+   Unpack project-specific nouns into plain cause-and-effect mechanics in your own words rather than stringing together the Plan's terminology or listing ticket titles. The author compares each bullet with their intent, so write only what the page supports.
+2. In your working notes, restate every in-scope section and ticket to yourself, and mark every passage where comprehension stalls—where you cannot tell what the text means without guessing or reading implementation bodies.
+3. Trace each stall to its cause. Report comprehension stalls only (when a passage's meaning is clear, an unchosen edge-case policy or error branch belongs to Implementer):
    - **Unstated assumption**: the Plan relies on knowledge it never writes down, such as a prerequisite, a behaviour of the current system, a constraint, or the reason behind a choice.
-   - **Undefined term**: a project-specific name (component, concept, acronym) defined neither in the Plan, the glossary, nor a linked doc. General engineering terms need no definition.
+   - **Undefined term**: a project-specific name (component, concept, acronym) defined neither in the Plan, the glossary, nor a linked doc. General engineering terms and named code symbols whose role the prose states need no separate definition.
    - **Vague mechanism**: "handled automatically", "the usual way", "as before", with no account of how.
-   - **Disconnected parts**: each part reads clearly, but how they fit together is never written.
+   - **Disconnected parts**: each part reads clearly, but how they fit together across sections or tickets is never written.
+
+Severity: an Unstated assumption or Disconnected parts that makes a newcomer misread what is being built, how tickets fit together, or how work starts is a Blocker; an Undefined term, Vague mechanism, or gap that forces guessing to understand a section or the current system is a Major; minor wording friction resolved from context is a Nit.
 
 Your report opens with the two paraphrase headings, even when you have no findings.
 
-Done when both headings are written, every section (or ticket) has been restated, and every stall is traced to a finding or to a misreading of your own. Sections that restated cleanly go under "Looked for, found nothing".
+Done when both headings are written, every in-scope section and ticket has been restated in your working notes, every comprehension stall is traced to a finding or to a misreading of your own, and clean sections or tickets appear only as single-line receipts under "Looked for, found nothing".
